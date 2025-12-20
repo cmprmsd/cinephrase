@@ -1,0 +1,250 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Video Phrase Extractor</title>
+    <link rel="stylesheet" type="text/css" href="static/style.css"/>
+
+</head>
+    <body>
+        <div class="app-shell">
+            <section class="timeline-horizontal">
+                <div class="card-header">
+                    <h2>Timeline</h2>
+                    <div class="card-actions">
+                        <button id="timelinePlayButton" class="ghost-button">Play timeline</button>
+                        <button id="timelineMergeButton">Merge timeline</button>
+                        <button id="timelineClearButton" class="ghost-button danger">Clear</button>
+                    </div>
+                </div>
+                <div class="timeline-scroll">
+                    <ul id="timelineList" class="timeline-list-horizontal"></ul>
+                </div>
+            </section>
+
+            <main class="app-main">
+                <aside class="sidebar">
+                    <section class="card">
+                        <div class="card-header">
+                            <h2>Project Picker</h2>
+                            <div class="card-actions">
+                                <button id="newProjectButton" class="ghost-button">New</button>
+                                <button id="duplicateProjectButton" class="ghost-button">Duplicate</button>
+                                <button id="deleteProjectButton" class="ghost-button danger">Delete</button>
+                            </div>
+                        </div>
+                        <div class="autosave-status" id="autosaveStatus">No project loaded</div>
+                        <label class="field">
+                            <span>Active project</span>
+                            <select id="projectSelect"></select>
+                        </label>
+                        <label class="field">
+                            <span>Project name</span>
+                            <input type="text" id="projectNameInput" placeholder="Untitled Project">
+                        </label>
+                    </section>
+
+
+                    <section class="card">
+                        <div class="card-header">
+                            <h2>Saved Sentences</h2>
+                            <button id="saveSentenceButton" class="ghost-button">Save current</button>
+                        </div>
+                        <p class="card-subtle">Keep frequently used sentences per project and reload them with one click.</p>
+                        <ul id="projectSentenceList" class="item-list"></ul>
+                    </section>
+
+                    <section class="card media-library-card">
+                        <div class="card-header">
+                            <h2>Media Library</h2>
+                            <div class="card-actions">
+                                <button id="refreshFilesButton" class="ghost-button">Refresh</button>
+                                <button id="loadSentencesButton" class="ghost-button">Load corpus</button>
+                            </div>
+                        </div>
+                        
+                        <div class="media-library-section">
+                            <label class="field">
+                                <span>Available files</span>
+                                <select id="availableFileSelector" multiple></select>
+                            </label>
+                            <div class="media-library-actions">
+                                <button id="selectAllAvailableButton" class="ghost-button">Select all</button>
+                                <button id="addToChosenButton">Add to project</button>
+                            </div>
+                        </div>
+
+                        <div class="media-library-divider"></div>
+                        
+                        <div class="media-library-section">
+                            <label class="field">
+                                <span>Project files</span>
+                                <select id="chosenFileSelector" multiple></select>
+                            </label>
+                            <div class="media-library-actions">
+                                <button id="removeFromChosenButton" class="ghost-button">Remove selected</button>
+                                <button id="clearChosenButton" class="ghost-button danger">Clear all</button>
+                            </div>
+                        </div>
+                    </section>
+
+                </aside>
+
+                <section class="workspace">
+                    <div class="workspace-grid">
+                        <div class="workspace-column workspace-column--primary">
+                            <section class="card">
+                                <div class="card-header">
+                                    <h2>Search Workspace</h2>
+                                    <button id="startOverButton" class="ghost-button">Clear results</button>
+                                </div>
+                                <div class="search-tabs">
+                                    <button class="search-tab active" data-tab="sentence">Sentence Search</button>
+                                    <button class="search-tab" data-tab="story">AI Story</button>
+                                </div>
+                                <div class="search-tab-content active" id="tab-sentence">
+                                    <div class="search-options-section">
+                                        <div class="options-header">
+                                            <span>Search Options</span>
+                                        </div>
+                                        <div class="options-grid">
+                                            <label class="checkbox-field">
+                                                <input type="checkbox" id="includePartialMatches">
+                                                <span>Include partial matches (sub-segments)</span>
+                                            </label>
+                                            <label class="checkbox-field">
+                                                <input type="checkbox" id="allPartialMatches">
+                                                <span>All partial matches (including very short ones)</span>
+                                            </label>
+                                            <label class="field">
+                                                <span>Max results per segment <span class="option-applies-to">(applies to both sentence & silence search)</span></span>
+                                                <input type="number" id="maxResultsPerSegment" value="25" min="1" max="1000">
+                                            </label>
+                                        </div>
+                                    </div>
+                                    
+                                    <div class="search-main-actions">
+                                        <label class="field field-wide">
+                                            <span>Sentence</span>
+                                            <div class="input-row">
+                                                <textarea id="sentenceInput" class="sentence-input" rows="2" placeholder="Type a sentence to match"></textarea>
+                                                <button id="searchLongestSegmentsButton" class="primary-action">Search sentence</button>
+                                            </div>
+                                        </label>
+                                        
+                                        <div class="search-divider">
+                                            <span>or</span>
+                                        </div>
+                                        
+                                        <div class="silence-search-section">
+                                            <div class="silence-search-header">
+                                                <span class="field-label">Search silence between words</span>
+                                                <button id="searchSilenceButton" class="primary-action">Search silence</button>
+                                            </div>
+                                            <div class="dual-range-control">
+                                                <div class="dual-range-labels">
+                                                    <span>From: <span id="silenceRangeMinLabel" class="range-value">0.0 s</span></span>
+                                                    <span>To: <span id="silenceRangeMaxLabel" class="range-value">2.0 s</span></span>
+                                                </div>
+                                                <div class="dual-range-slider">
+                                                    <div class="dual-range-track"></div>
+                                                    <div class="dual-range-fill" id="silenceRangeFill"></div>
+                                                    <input type="range" id="silenceRangeMinInput" class="dual-range-handle dual-range-handle-min" min="0" max="10000" step="100" value="0">
+                                                    <input type="range" id="silenceRangeMaxInput" class="dual-range-handle dual-range-handle-max" min="0" max="10000" step="100" value="2000">
+                                                </div>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+                                <div class="search-tab-content" id="tab-story">
+                                    <div class="search-options-section">
+                                        <div class="options-header">
+                                            <span>Story Options</span>
+                                        </div>
+                                        <div class="options-grid">
+                                            <label class="field">
+                                                <span>Max segments in story</span>
+                                                <input type="number" id="maxStorySegments" value="10" min="1" max="50">
+                                            </label>
+                                            <label class="checkbox-field">
+                                                <input type="checkbox" id="preferLongSegments" checked>
+                                                <span>Prefer long segments</span>
+                                            </label>
+                                            <label class="checkbox-field">
+                                                <input type="checkbox" id="debugMode">
+                                                <span>Debug mode (show LLM prompt, corpus, and response)</span>
+                                            </label>
+                                        </div>
+                                    </div>
+                                    
+                                    <div class="search-main-actions">
+                                        <label class="field field-wide">
+                                            <span>Story Prompt</span>
+                                            <div class="input-row">
+                                                <textarea id="storyPromptInput" class="sentence-input" rows="3" placeholder="e.g., Create a dramatic news story about climate change with urgency"></textarea>
+                                                <button id="generateStoryButton" class="primary-action">Generate Story</button>
+                                            </div>
+                                        </label>
+                                        
+                                        <div class="story-utility-buttons">
+                                            <button id="copyLLMPromptButton" class="ghost-button">Copy LLM Prompt</button>
+                                            <button id="insertResponseButton" class="ghost-button">Insert Response</button>
+                                        </div>
+                                        
+                                        <div id="insertResponseContainer" class="insert-response-container" style="display: none;">
+                                            <div class="insert-response-header">
+                                                <span class="field-label">Paste LLM Response (JSON)</span>
+                                            </div>
+                                            <textarea id="llmResponseInput" class="sentence-input" rows="5" placeholder='Paste JSON response here, e.g., {"explanation": "...", "sentences": [...]}'></textarea>
+                                            <div class="button-row">
+                                                <button id="processResponseButton" class="primary-action">Process Response</button>
+                                                <button id="cancelInsertResponseButton" class="ghost-button">Cancel</button>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+                            </section>
+                        </div>
+                        <div class="workspace-column workspace-column--secondary">
+                            <section class="card video-card">
+                                <h2>Preview</h2>
+                                <video id="videoPlayer" controls></video>
+                            </section>
+                            <section class="card">
+                                <h2>Silence Preferences</h2>
+                                <div class="form-grid">
+                                    <label class="field">
+                                        <span>Min silence (s)</span>
+                                        <input type="number" id="minSilenceInput" value="0" min="0" step="0.1">
+                                    </label>
+                                    <label class="field">
+                                        <span>Max silence (s)</span>
+                                        <input type="number" id="maxSilenceInput" value="10" min="0" step="0.1">
+                                    </label>
+                                    <label class="field">
+                                        <span>Silence checks up to (words)</span>
+                                        <input type="number" id="silenceWordThresholdInput" value="2" min="1" step="1">
+                                    </label>
+                                </div>
+                            </section>
+                        </div>
+                        <section class="card matches-full-width">
+                            <div class="card-header">
+                                <h2>Matches</h2>
+                                <div class="card-actions">
+                                    <button id="clearResultsButton" class="ghost-button">Clear results</button>
+                                    <button id="playAllButton" class="ghost-button">Play all matches</button>
+                                    <button id="addAllMatchesButton" class="ghost-button">Add all to timeline</button>
+                                </div>
+                            </div>
+                            <div id="resultsContainer" class="results-grid"></div>
+                        </section>
+                    </div>
+                </section>
+            </main>
+        </div>
+
+        <script src="static/frontend.js"></script>
+    </body>
+</html>
