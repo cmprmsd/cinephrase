@@ -7,7 +7,7 @@ cinephrase is a powerful Flask-based web application for searching, extracting, 
 
 
 ### Resulting Video
-![stupid](images/stupid_idea.mp4)
+https://github.com/user-attachments/assets/94a54a2e-90e5-4d38-8190-4676f20ced4e
 
 ## Overview
 
