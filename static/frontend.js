@@ -625,6 +625,9 @@ function cacheElements() {
     elements.removeFromChosenButton = document.getElementById('removeFromChosenButton');
     elements.clearChosenButton = document.getElementById('clearChosenButton');
     elements.refreshFilesButton = document.getElementById('refreshFilesButton');
+    elements.createCollectionButton = document.getElementById('createCollectionButton');
+    elements.collectionsList = document.getElementById('collectionsList');
+    elements.collectionsEmpty = document.getElementById('collectionsEmpty');
     elements.minSilenceInput = document.getElementById('minSilenceInput');
     elements.maxSilenceInput = document.getElementById('maxSilenceInput');
     elements.silenceWordThresholdInput = document.getElementById('silenceWordThresholdInput');
@@ -916,6 +919,10 @@ function bindEventListeners() {
     if (elements.refreshFilesButton) {
         elements.refreshFilesButton.addEventListener('click', fetchLibraryFiles);
     }
+    
+    if (elements.createCollectionButton) {
+        elements.createCollectionButton.addEventListener('click', handleCreateCollection);
+    }
 
     if (elements.minSilenceInput) {
         elements.minSilenceInput.addEventListener('input', handleSilencePreferenceChange);
@@ -1038,6 +1045,9 @@ async function bootstrapProjects() {
         const data = await response.json();
         projectList = Array.isArray(data) ? data.map(item => buildProjectSummary(item)) : [];
         renderProjectPicker();
+        
+        // Load collections
+        await fetchCollections();
 
         if (projectList.length) {
             // Try to restore the last selected project from localStorage
@@ -1707,6 +1717,205 @@ function getSelectedValues(selectElement) {
         return [];
     }
     return Array.from(selectElement.selectedOptions || []).map(option => option.value);
+}
+
+// Collections management
+let collections = [];
+
+async function fetchCollections() {
+    try {
+        const response = await fetch('/api/collections');
+        if (!response.ok) {
+            throw new Error(`Failed to fetch collections: ${response.status}`);
+        }
+        const data = await response.json();
+        collections = Array.isArray(data.collections) ? data.collections : [];
+        renderCollections();
+    } catch (error) {
+        console.error('Error fetching collections:', error);
+    }
+}
+
+function renderCollections() {
+    if (!elements.collectionsList || !elements.collectionsEmpty) {
+        return;
+    }
+    
+    elements.collectionsList.innerHTML = '';
+    
+    if (collections.length === 0) {
+        elements.collectionsEmpty.style.display = 'block';
+        return;
+    }
+    
+    elements.collectionsEmpty.style.display = 'none';
+    
+    collections.forEach(collection => {
+        const collectionItem = document.createElement('div');
+        collectionItem.className = 'collection-item';
+        collectionItem.dataset.collectionId = collection.id;
+        
+        const fileCount = Array.isArray(collection.files) ? collection.files.length : 0;
+        const createdDate = collection.createdAt ? new Date(collection.createdAt).toLocaleDateString() : '';
+        
+        collectionItem.innerHTML = `
+            <div class="collection-item-header">
+                <div class="collection-item-info">
+                    <div class="collection-item-name">${escapeHtml(collection.name)}</div>
+                    <div class="collection-item-meta">${fileCount} file${fileCount !== 1 ? 's' : ''} • ${createdDate}</div>
+                </div>
+                <div class="collection-item-actions">
+                    <button class="collection-load-button ghost-button" data-collection-id="${collection.id}" title="Load into project">
+                        Load
+                    </button>
+                    <button class="collection-delete-button ghost-button danger" data-collection-id="${collection.id}" title="Delete collection">
+                        Delete
+                    </button>
+                </div>
+            </div>
+        `;
+        
+        const loadButton = collectionItem.querySelector('.collection-load-button');
+        const deleteButton = collectionItem.querySelector('.collection-delete-button');
+        
+        loadButton.addEventListener('click', () => handleLoadCollection(collection.id));
+        deleteButton.addEventListener('click', () => handleDeleteCollection(collection.id));
+        
+        elements.collectionsList.appendChild(collectionItem);
+    });
+}
+
+function escapeHtml(text) {
+    const div = document.createElement('div');
+    div.textContent = text;
+    return div.innerHTML;
+}
+
+async function handleCreateCollection() {
+    if (!activeProject) {
+        alert('Please create or select a project first');
+        return;
+    }
+    
+    const projectFiles = Array.isArray(activeProject?.data?.selectedFiles) ? activeProject.data.selectedFiles : [];
+    
+    if (projectFiles.length === 0) {
+        alert('No files in current project. Add files to create a collection.');
+        return;
+    }
+    
+    const name = prompt('Enter collection name:');
+    if (!name || !name.trim()) {
+        return;
+    }
+    
+    const collectionName = name.trim();
+    
+    try {
+        const response = await fetch('/api/collections', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                name: collectionName,
+                files: projectFiles
+            })
+        });
+        
+        if (!response.ok) {
+            const error = await response.json();
+            alert(error.error || 'Failed to create collection');
+            return;
+        }
+        
+        await fetchCollections();
+    } catch (error) {
+        console.error('Error creating collection:', error);
+        alert('Failed to create collection');
+    }
+}
+
+async function handleLoadCollection(collectionId) {
+    if (!activeProject) {
+        alert('Please create or select a project first');
+        return;
+    }
+    
+    const collection = collections.find(c => c.id === collectionId);
+    if (!collection) {
+        alert('Collection not found');
+        return;
+    }
+    
+    const collectionFiles = Array.isArray(collection.files) ? collection.files : [];
+    
+    if (collectionFiles.length === 0) {
+        alert('Collection is empty');
+        return;
+    }
+    
+    const currentFiles = Array.isArray(activeProject?.data?.selectedFiles) ? activeProject.data.selectedFiles : [];
+    const currentCount = currentFiles.length;
+    
+    // Ask user if they want to replace or merge
+    const message = `Load collection "${collection.name}"?\n\n` +
+        `Collection contains: ${collectionFiles.length} file(s)\n` +
+        `Current project has: ${currentCount} file(s)\n\n` +
+        `Click OK to add collection files to existing files\n` +
+        `Click Cancel to replace all files with collection`;
+    
+    const shouldMerge = confirm(message);
+    
+    updateProjectData(data => {
+        if (shouldMerge) {
+            // Merge: add files that aren't already in the project
+            const current = Array.isArray(data.selectedFiles) ? data.selectedFiles : [];
+            const currentSet = new Set(current);
+            collectionFiles.forEach(file => {
+                if (!currentSet.has(file)) {
+                    current.push(file);
+                }
+            });
+            data.selectedFiles = current;
+        } else {
+            // Replace: set files to collection files
+            data.selectedFiles = [...collectionFiles];
+        }
+    });
+    
+    renderFilePickers();
+    resetCorpusState();
+    // Automatically reload corpus with new file list
+    handleLoadSentences();
+}
+
+async function handleDeleteCollection(collectionId) {
+    const collection = collections.find(c => c.id === collectionId);
+    if (!collection) {
+        return;
+    }
+    
+    if (!confirm(`Delete collection "${collection.name}"?`)) {
+        return;
+    }
+    
+    try {
+        const response = await fetch(`/api/collections/${collectionId}`, {
+            method: 'DELETE'
+        });
+        
+        if (!response.ok) {
+            const error = await response.json();
+            alert(error.error || 'Failed to delete collection');
+            return;
+        }
+        
+        await fetchCollections();
+    } catch (error) {
+        console.error('Error deleting collection:', error);
+        alert('Failed to delete collection');
+    }
 }
 
 function getSilencePreferences() {

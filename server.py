@@ -26,7 +26,9 @@ app = Flask(__name__)
 DATA_DIR = os.path.join(app.root_path, 'data')
 TEMP_DIR = os.path.join(app.root_path, 'temp')
 PROJECTS_FILE = os.path.join(DATA_DIR, 'projects.json')
+COLLECTIONS_FILE = os.path.join(DATA_DIR, 'collections.json')
 PROJECT_STORE_LOCK = Lock()
+COLLECTIONS_LOCK = Lock()
 
 # Track skipped segments per search session
 SKIP_SEGMENTS = {}  # Format: {search_id: set(segment_phrases)}
@@ -426,6 +428,82 @@ def delete_project(project_id):
         return jsonify({'error': 'Project not found'}), 404
     write_projects(updated_projects)
     return jsonify({'status': 'deleted', 'id': project_id})
+
+
+def read_collections():
+    """Read collections from file."""
+    os.makedirs(DATA_DIR, exist_ok=True)
+    if not os.path.exists(COLLECTIONS_FILE):
+        with open(COLLECTIONS_FILE, 'w', encoding='utf-8') as file:
+            json.dump({'collections': []}, file, indent=2)
+        return []
+    try:
+        with open(COLLECTIONS_FILE, 'r', encoding='utf-8') as file:
+            data = json.load(file)
+            return data.get('collections', [])
+    except (json.JSONDecodeError, FileNotFoundError):
+        return []
+
+
+def write_collections(collections):
+    """Write collections to file."""
+    os.makedirs(DATA_DIR, exist_ok=True)
+    with open(COLLECTIONS_FILE, 'w', encoding='utf-8') as file:
+        json.dump({'collections': collections}, file, indent=2)
+
+
+@app.route('/api/collections', methods=['GET'])
+def get_collections():
+    """Get all collections."""
+    with COLLECTIONS_LOCK:
+        collections = read_collections()
+    return jsonify({'collections': collections})
+
+
+@app.route('/api/collections', methods=['POST'])
+def save_collection():
+    """Save a new collection."""
+    data = request.json or {}
+    name = data.get('name', '').strip()
+    files = data.get('files', [])
+    
+    if not name:
+        return jsonify({'error': 'Collection name is required'}), 400
+    
+    if not files or not isinstance(files, list):
+        return jsonify({'error': 'Files list is required'}), 400
+    
+    with COLLECTIONS_LOCK:
+        collections = read_collections()
+        
+        # Check if name already exists
+        if any(c.get('name') == name for c in collections):
+            return jsonify({'error': 'Collection with this name already exists'}), 400
+        
+        collection = {
+            'id': str(uuid.uuid4()),
+            'name': name,
+            'files': files,
+            'createdAt': datetime.utcnow().isoformat() + 'Z',
+            'updatedAt': datetime.utcnow().isoformat() + 'Z'
+        }
+        
+        collections.append(collection)
+        write_collections(collections)
+    
+    return jsonify({'status': 'saved', 'collection': collection})
+
+
+@app.route('/api/collections/<collection_id>', methods=['DELETE'])
+def delete_collection(collection_id):
+    """Delete a collection."""
+    with COLLECTIONS_LOCK:
+        collections = read_collections()
+        updated_collections = [c for c in collections if c.get('id') != collection_id]
+        if len(updated_collections) == len(collections):
+            return jsonify({'error': 'Collection not found'}), 404
+        write_collections(updated_collections)
+    return jsonify({'status': 'deleted', 'id': collection_id})
 
 
 @app.route('/')
