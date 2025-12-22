@@ -1277,6 +1277,8 @@ def search_silences_stream():
                     'source_video': filename,
                     'silence_start': silence_start,
                     'silence_end': silence_end,
+                    'original_start': clip_start,  # Original segment start in seconds
+                    'original_end': clip_end,  # Original segment end in seconds
                     'word_before': entry['word_before'],
                     'word_after': entry['word_after'],
                 }
@@ -2631,12 +2633,37 @@ def find_and_export_longest_matches_incremental(
                         if success and final_path:
                             relative_path = clip_filename
                             match = item['match']  # Get match from item
+                            filename = item['file']
+                            
+                            # Calculate original clip boundaries (same as in render_single_clip)
+                            match_start = sanitize_float(match.get('start'), 0.0)
+                            match_end = sanitize_float(match.get('end'), match_start)
+                            if match_start is not None and match_end is not None:
+                                video_duration = get_video_duration(filename)
+                                if video_duration:
+                                    clip_start = max(match_start - DEFAULT_CLIP_START_PADDING, 0.0)
+                                    clip_end = match_end + DEFAULT_CLIP_END_PADDING
+                                    clip_start = min(clip_start, video_duration - 0.1)
+                                    clip_end = min(clip_end, video_duration)
+                                    if clip_end <= clip_start:
+                                        clip_duration = max(match_end - match_start, 0.0)
+                                        min_extension = DEFAULT_CLIP_START_PADDING + DEFAULT_CLIP_END_PADDING
+                                        clip_end = min(clip_start + max(clip_duration + min_extension, 0.1), video_duration)
+                                else:
+                                    clip_start = match_start
+                                    clip_end = match_end
+                            else:
+                                clip_start = match_start
+                                clip_end = match_end
+                            
                             segment_results.append({
                                 'file': os.path.join('temp', clip_output_dir_name, relative_path),
                                 'start': match.get('start'),
                                 'end': match.get('end'),
                                 'segment': match.get('segment', segment),
-                                'source_video': os.path.basename(item['file'])
+                                'source_video': filename,  # Use full path like sequential path
+                                'original_start': clip_start,  # Original segment start in seconds
+                                'original_end': clip_end  # Original segment end in seconds
                             })
                         else:
                             print(f"Failed to render clip {clip_idx+1}/{len(segment_matches)}: {error}")
@@ -2868,7 +2895,9 @@ def find_and_export_longest_matches_incremental(
             
             segment_result = {
                 'file': relative_path,
-                'source_video': filename
+                'source_video': filename,
+                'original_start': clip_start,  # Original segment start in seconds
+                'original_end': clip_end  # Original segment end in seconds
             }
             if clip_duration_ms is not None:
                 segment_result['duration_ms'] = clip_duration_ms
@@ -3581,6 +3610,135 @@ def get_waveform():
     
     except Exception as e:
         print(f"Error in get_waveform: {e}")
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/rerender_clip', methods=['POST'])
+def rerender_clip():
+    """Re-render a clip with new trim values for precise playback."""
+    try:
+        data = request.json
+        clip_path = data.get('clip_path', '')
+        source_video = data.get('source_video', '')
+        original_start = data.get('original_start', 0)  # Original segment start in seconds
+        original_end = data.get('original_end', 0)  # Original segment end in seconds
+        new_start_trim_ms = data.get('start_trim_ms', 0)  # New start trim in milliseconds
+        new_end_trim_ms = data.get('end_trim_ms', 0)  # New end trim in milliseconds
+        
+        if not clip_path or not source_video:
+            return jsonify({'error': 'Missing clip_path or source_video'}), 400
+        
+        # Find the source video file
+        source_path = None
+        for lib_root in LIBRARY_ROOTS:
+            potential_path = os.path.join(lib_root, source_video)
+            if os.path.exists(potential_path):
+                source_path = potential_path
+                break
+        
+        if not source_path:
+            return jsonify({'error': f'Source video not found: {source_video}'}), 404
+        
+        # Calculate new clip boundaries
+        # original_start/end are in seconds, new trims are in milliseconds
+        new_clip_start = original_start + (new_start_trim_ms / 1000)
+        new_clip_end = original_end - (new_end_trim_ms / 1000)
+        clip_duration = new_clip_end - new_clip_start
+        
+        if clip_duration <= 0:
+            return jsonify({'error': 'Invalid trim values result in zero or negative duration'}), 400
+        
+        # Get video duration to validate
+        video_duration = get_video_duration(source_path)
+        if video_duration is None:
+            return jsonify({'error': 'Could not determine video duration'}), 500
+        
+        # Validate clip boundaries
+        new_clip_start = max(0.0, min(new_clip_start, video_duration))
+        new_clip_end = max(new_clip_start + 0.1, min(new_clip_end, video_duration))
+        clip_duration = new_clip_end - new_clip_start
+        
+        # Generate unique output filename
+        # clip_path is relative (e.g., "temp/clip_group_00001.mp4")
+        # Construct full path to original clip
+        if clip_path.startswith('temp/'):
+            clip_full_path = os.path.join(app.root_path, clip_path)
+        else:
+            clip_full_path = os.path.join(app.root_path, 'temp', clip_path)
+        
+        # Ensure the directory exists
+        clip_dir = os.path.dirname(clip_full_path)
+        os.makedirs(clip_dir, exist_ok=True)
+        
+        clip_basename = os.path.basename(clip_path)
+        name_without_ext = os.path.splitext(clip_basename)[0]
+        
+        # Strip any existing _trimmed_* suffixes to prevent accumulation
+        # Match pattern: _trimmed_<number>_<number> (can repeat)
+        import re
+        name_without_ext = re.sub(r'_trimmed_\d+_\d+(?:_trimmed_\d+_\d+)*$', '', name_without_ext)
+        
+        output_filename = f"{name_without_ext}_trimmed_{int(new_start_trim_ms)}_{int(new_end_trim_ms)}.mp4"
+        output_path = os.path.join(clip_dir, output_filename)
+        
+        # Get video fps
+        video_fps = get_video_fps(source_path)
+        if video_fps is None:
+            video_fps = 25
+        
+        # Use ffmpeg to re-render with new trim values
+        ffmpeg_cmd = [
+            'ffmpeg', '-y',
+            '-ss', str(new_clip_start),
+            '-i', source_path,
+            '-t', str(clip_duration),
+            '-c:v', 'libx264',
+            '-preset', 'ultrafast',  # Fast rendering for responsiveness
+            '-c:a', 'aac',
+            '-ac', '2',
+            '-r', str(video_fps),
+            output_path
+        ]
+        
+        process = subprocess.run(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+        if process.returncode != 0:
+            stderr = process.stderr.decode(errors='ignore') if process.stderr else ''
+            return jsonify({'error': f'FFmpeg failed: {stderr}'}), 500
+        
+        if not os.path.exists(output_path):
+            return jsonify({'error': 'Rendered clip file was not created'}), 500
+        
+        # Return relative path (clips are always in temp/)
+        # Get the relative path from app.root_path
+        try:
+            relative_path = os.path.relpath(output_path, app.root_path).replace(os.sep, '/')
+            # Ensure it uses forward slashes and starts correctly
+            if not relative_path.startswith('temp/'):
+                # Extract temp/ part if it exists in the path
+                parts = relative_path.split('/')
+                if 'temp' in parts:
+                    temp_idx = parts.index('temp')
+                    relative_path = '/'.join(parts[temp_idx:])
+                else:
+                    # Fallback: construct manually
+                    relative_path = 'temp/' + os.path.basename(output_path)
+        except (ValueError, AttributeError):
+            # Fallback: construct path manually based on clip_path structure
+            if clip_path.startswith('temp/'):
+                # Extract the directory structure from original clip_path
+                clip_dir_part = os.path.dirname(clip_path).replace('\\', '/')
+                relative_path = f"{clip_dir_part}/{output_filename}".replace('\\', '/')
+            else:
+                relative_path = f"temp/{output_filename}"
+        
+        clip_duration_ms = get_video_duration_ms(output_path)
+        
+        return jsonify({
+            'clip_path': relative_path,
+            'duration_ms': clip_duration_ms
+        })
+    except Exception as e:
+        print(f"Error re-rendering clip: {e}")
         traceback.print_exc()
         return jsonify({'error': str(e)}), 500
 

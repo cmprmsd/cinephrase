@@ -2043,7 +2043,7 @@ function fetchWaveformData(videoPath, width = 800) {
 }
 
 // Waveform visualization component
-function createWaveformVisualization(container, initialStartTrim = 450, initialEndTrim = 450, maxTrim = 8000, onTrimChange = null, videoPath = null, initialSpeed = 1.0) {
+function createWaveformVisualization(container, initialStartTrim = 450, initialEndTrim = 450, maxTrim = 8000, onTrimChange = null, videoPath = null, initialSpeed = 1.0, onTrimRelease = null) {
     const waveformContainer = document.createElement('div');
     waveformContainer.className = 'waveform-container';
     
@@ -2347,9 +2347,11 @@ function createWaveformVisualization(container, initialStartTrim = 450, initialE
     }
     
     function stopDrag() {
-        // On mobile, trigger callback when drag ends
-        const isMobile = window.innerWidth <= 1024;
-        if (isMobile && isDragging && onTrimChange) {
+        // Always trigger trim release callback when drag ends (for re-rendering)
+        if (isDragging && onTrimRelease) {
+            onTrimRelease(startTrim, endTrim);
+        } else if (isDragging && onTrimChange) {
+            // Fallback to onTrimChange if onTrimRelease not provided
             onTrimChange(startTrim, endTrim);
         }
         isDragging = null;
@@ -3433,7 +3435,76 @@ function playVideoWithTrim(filePath, startTrim, endTrim, shouldLoop = false, pla
     };
 }
 
-function playTrimmedVideo(phraseContainer) {
+async function rerenderClipWithNewTrims(phraseContainer, startTrimMs, endTrimMs) {
+    if (!phraseContainer) {
+        console.warn('rerenderClipWithNewTrims: no container provided');
+        return null;
+    }
+    
+    const selectElement = phraseContainer.querySelector('select');
+    if (!selectElement) {
+        console.error('rerenderClipWithNewTrims: missing select element');
+        return null;
+    }
+    
+    // Ensure an option is selected (select first if none selected)
+    if (selectElement.selectedIndex < 0 && selectElement.options.length > 0) {
+        selectElement.selectedIndex = 0;
+    }
+    
+    const selectedOption = selectElement.options[selectElement.selectedIndex];
+    if (!selectedOption) {
+        console.error('rerenderClipWithNewTrims: no selected option');
+        return null;
+    }
+    
+    // Use original clip path for re-rendering to avoid filename accumulation
+    const originalClipPath = selectedOption.dataset.originalClipPath || selectElement.value;
+    const sourceVideo = selectedOption.title;
+    const originalStart = parseFloat(selectedOption.dataset.originalStart);
+    const originalEnd = parseFloat(selectedOption.dataset.originalEnd);
+    
+    if (!originalClipPath || !sourceVideo || isNaN(originalStart) || isNaN(originalEnd)) {
+        console.warn('rerenderClipWithNewTrims: missing required data', {
+            originalClipPath,
+            sourceVideo,
+            originalStart,
+            originalEnd
+        });
+        return null;
+    }
+    
+    try {
+        const response = await fetch('/rerender_clip', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                clip_path: originalClipPath,
+                source_video: sourceVideo,
+                original_start: originalStart,
+                original_end: originalEnd,
+                start_trim_ms: startTrimMs,
+                end_trim_ms: endTrimMs
+            })
+        });
+        
+        if (!response.ok) {
+            const error = await response.json();
+            console.error('rerenderClipWithNewTrims: server error', error);
+            return null;
+        }
+        
+        const result = await response.json();
+        return result.clip_path;
+    } catch (error) {
+        console.error('rerenderClipWithNewTrims: request failed', error);
+        return null;
+    }
+}
+
+async function playTrimmedVideo(phraseContainer) {
     if (!phraseContainer) {
         console.warn('playTrimmedVideo: no container provided');
         return;
@@ -3458,8 +3529,30 @@ function playTrimmedVideo(phraseContainer) {
     
     console.log('playTrimmedVideo:', { selectedVideo, startTrim, endTrim });
     
-    // Play in floating preview player instead of top-left player
-    playVideoWithTrimInFloatingPreview(selectedVideo, startTrim, endTrim, phraseContainer, selectElement);
+    // Check if this clip is already re-rendered
+    const selectedOption = selectElement.options[selectElement.selectedIndex];
+    const isRerendered = selectedOption?.dataset?.rerendered === 'true';
+    
+    if (!isRerendered) {
+        // Re-render with current trim values before first playback
+        const rerenderedPath = await rerenderClipWithNewTrims(phraseContainer, startTrim, endTrim);
+        if (rerenderedPath && rerenderedPath.trim() !== '') {
+            selectedOption.value = rerenderedPath;
+            selectElement.value = rerenderedPath;
+            selectedOption.dataset.rerendered = 'true';
+            // Play without trimming (already trimmed)
+            playVideoWithTrimInFloatingPreview(rerenderedPath, 0, 0, phraseContainer, selectElement);
+            return;
+        }
+    }
+    
+    // If already re-rendered, play without trimming (clip is already trimmed)
+    if (isRerendered) {
+        playVideoWithTrimInFloatingPreview(selectedVideo, 0, 0, phraseContainer, selectElement);
+    } else {
+        // If re-render failed, fallback to JavaScript trimming
+        playVideoWithTrimInFloatingPreview(selectedVideo, startTrim, endTrim, phraseContainer, selectElement);
+    }
 }
 
 function playAllVideos() {
@@ -3528,6 +3621,11 @@ function addSegmentResult(segmentData) {
     segmentData.files.forEach((file, fileIndex) => {
         const option = document.createElement('option');
         if (typeof file === 'object' && file !== null) {
+            // Debug: log file object to see what fields are present
+            if (fileIndex === 0) {
+                console.log('First file object in segment:', file);
+            }
+            
             option.value = file.file;
             const sourceVideo = file.source_video || 'Unknown';
             const videoName = sourceVideo.split('/').pop();
@@ -3551,6 +3649,20 @@ function addSegmentResult(segmentData) {
             // Always show the trimmed length, even if empty (format function returns empty string if invalid)
             option.text = `Match ${fileIndex + 1} (${trimmedLength}${videoName})`;
             option.title = sourceVideo;
+            // Store the original exported clip path for waveform (before any re-rendering)
+            option.dataset.originalClipPath = file.file;
+            // Store original segment boundaries for re-rendering
+            // Check for both null/undefined and ensure it's a valid number
+            if (file.original_start != null && (typeof file.original_start === 'number' || !isNaN(parseFloat(file.original_start)))) {
+                option.dataset.originalStart = String(file.original_start);
+            } else {
+                console.warn('Missing original_start in file data:', file);
+            }
+            if (file.original_end != null && (typeof file.original_end === 'number' || !isNaN(parseFloat(file.original_end)))) {
+                option.dataset.originalEnd = String(file.original_end);
+            } else {
+                console.warn('Missing original_end in file data:', file);
+            }
             // Store duration if provided (will be loaded later if not available)
             if (clipDurationMs != null && !isNaN(clipDurationMs) && clipDurationMs > 0) {
                 option.dataset.durationMs = String(clipDurationMs);
@@ -3579,6 +3691,11 @@ function addSegmentResult(segmentData) {
     });
 
     phraseContainer.appendChild(listbox);
+    
+    // Ensure first option is selected by default
+    if (listbox.options.length > 0) {
+        listbox.selectedIndex = 0;
+    }
 
     console.log(`Created listbox with ${segmentData.files.length} options for segment: ${segmentData.phrase}`);
 
@@ -3604,92 +3721,194 @@ function addSegmentResult(segmentData) {
     phraseContainer.appendChild(startSlider);
     phraseContainer.appendChild(endSlider);
 
-    // Create waveform visualization
-    const initialVideo = (typeof segmentData.files[0] === 'object') ? segmentData.files[0].file : segmentData.files[0];
+    // Get original source video and segment boundaries for re-rendering
+    // Use exported clip for waveform (faster), but track original segment for accurate trimming
+    const firstFile = segmentData.files[0];
+    let originalSourceVideo = null;
+    let originalStart = null;
+    let originalEnd = null;
+    let originalDurationMs = null;
+    const initialVideo = (typeof firstFile === 'object') ? firstFile.file : firstFile;
+    
+    if (typeof firstFile === 'object' && firstFile !== null) {
+        originalSourceVideo = firstFile.source_video;
+        originalStart = firstFile.original_start;
+        originalEnd = firstFile.original_end;
+        if (originalStart != null && originalEnd != null) {
+            originalDurationMs = (originalEnd - originalStart) * 1000; // Convert to milliseconds
+        }
+    }
+    
+    // Create waveform visualization using exported clip (fast, already trimmed)
+    // But use original segment duration for trim calculations (accurate)
     const waveform = createWaveformVisualization(
         phraseContainer,  // container - MUST be first parameter
         450,              // initialStartTrim
         450,              // initialEndTrim
-        5000,             // maxTrim
+        originalDurationMs || 5000,  // maxTrim - use original segment duration for accurate trimming
         (startTrim, endTrim) => {  // onTrimChange callback
             startSlider.value = startTrim;
             endSlider.value = endTrim;
-            // Auto-play when trim handles are moved for immediate feedback
-            playTrimmedVideo(phraseContainer);
+            // Don't autoplay during dragging - only on release
         },
-        initialVideo     // videoPath
+        initialVideo,     // videoPath - use exported clip for waveform (fast loading)
+        1.0,              // initialSpeed
+        async (startTrim, endTrim) => {  // onTrimRelease callback - re-render and play
+            startSlider.value = startTrim;
+            endSlider.value = endTrim;
+            
+            // Re-render clip with new trim values from original source
+            const newClipPath = await rerenderClipWithNewTrims(phraseContainer, startTrim, endTrim);
+            if (newClipPath && newClipPath.trim() !== '') {
+                // Update the select element with the new clip path
+                const selectedOption = listbox.options[listbox.selectedIndex];
+                if (selectedOption) {
+                    // Store the re-rendered clip path
+                    selectedOption.value = newClipPath;
+                    listbox.value = newClipPath;
+                    // Mark this option as re-rendered so we know not to apply trimming
+                    selectedOption.dataset.rerendered = 'true';
+                }
+                
+                // Don't update waveform - it should stay on the original exported clip
+                // The waveform represents the original segment, trims are just boundaries
+                
+                // Play the newly rendered clip (no trims needed, it's already trimmed)
+                playVideoWithTrimInFloatingPreview(newClipPath, 0, 0, phraseContainer, listbox);
+            } else {
+                // Fallback: play with JavaScript trimming if re-render failed
+                console.warn('Re-render failed or returned empty path, falling back to JavaScript trimming');
+                playTrimmedVideo(phraseContainer);
+            }
+        }
     );
+    
+    // Set the clip duration to the original segment duration for accurate trim calculations
+    if (originalDurationMs) {
+        waveform.setClipDuration(originalDurationMs);
+    }
     phraseContainer.appendChild(waveform);
     waveformRef = waveform;
 
     // Track the currently selected video to detect actual changes
-    let previousSelection = listbox.value;
+    // Use original clip path for comparison, not re-rendered paths
+    let previousOriginalClipPath = null;
+    if (listbox.options.length > 0 && listbox.selectedIndex >= 0) {
+        const currentOption = listbox.options[listbox.selectedIndex];
+        previousOriginalClipPath = currentOption?.dataset?.originalClipPath || currentOption?.value || listbox.value;
+    }
 
     // Add change listener for when user selects a different match
     listbox.addEventListener('change', async (event) => {
-        const selectedVideo = listbox.value;
+        const selectedOption = listbox.options[listbox.selectedIndex];
+        const originalClipPath = selectedOption?.dataset?.originalClipPath || selectedOption?.value || listbox.value;
         
-        console.log('Listbox change event fired:', selectedVideo);
-        console.log('Previous selection:', previousSelection);
+        console.log('Listbox change event fired:', listbox.value);
+        console.log('Original clip path:', originalClipPath);
+        console.log('Previous original clip path:', previousOriginalClipPath);
         
         // Update floating preview when selection changes
         updateFloatingPreview(phraseContainer, listbox, waveformRef, startSlider, endSlider);
         
-        // Only reset and reload if the selection actually changed
-        if (selectedVideo !== previousSelection) {
+        // Only reset and reload if the original clip path actually changed
+        if (originalClipPath !== previousOriginalClipPath) {
             console.log('Selection changed - resetting trim and loading new video');
             
             // Reset trim values to default when match changes
             startSlider.value = '450';
             endSlider.value = '450';
             
-            if (waveformRef && selectedVideo) {
+            if (waveformRef) {
                 console.log('Updating waveform for new selection...');
                 waveformRef.updateTrim(450, 450);
                 
-                // Load new video duration and waveform
-                // Use server-provided duration if available
-                const selectedOption = listbox.options[listbox.selectedIndex];
-                const serverDuration = selectedOption?.dataset?.durationMs ? parseInt(selectedOption.dataset.durationMs) : null;
+                // Get original source video and segment boundaries for trim calculations
+                const originalStart = parseFloat(selectedOption?.dataset?.originalStart);
+                const originalEnd = parseFloat(selectedOption?.dataset?.originalEnd);
                 
-                if (serverDuration) {
-                    console.log('Using server-provided duration:', serverDuration, 'ms');
-                    waveformRef.setClipDuration(serverDuration);
-                } else {
-                    try {
-                        const duration = await getVideoDuration(selectedVideo);
-                        console.log('Video duration from metadata:', duration);
-                        waveformRef.setClipDuration(duration);
-                    } catch (err) {
-                        console.warn('Could not load video duration on match change:', err);
-                    }
+                if (!isNaN(originalStart) && !isNaN(originalEnd)) {
+                    // Calculate original segment duration for accurate trim calculations
+                    const originalDurationMs = (originalEnd - originalStart) * 1000;
+                    waveformRef.setClipDuration(originalDurationMs);
                 }
                 
-                waveformRef.loadNewWaveform(selectedVideo);
+                // Load waveform from original exported clip (fast), not re-rendered version
+                try {
+                    const duration = await getVideoDuration(originalClipPath);
+                    if (duration && (isNaN(originalStart) || isNaN(originalEnd))) {
+                        // Use exported clip duration if original data not available
+                        waveformRef.setClipDuration(duration);
+                    }
+                    waveformRef.loadNewWaveform(originalClipPath);
+                } catch (err) {
+                    console.warn('Could not load video duration on match change:', err);
+                }
             }
             
-            // Update previous selection
-            previousSelection = selectedVideo;
+            // Update previous selection to track original clip path
+            previousOriginalClipPath = originalClipPath;
+            
+            // Re-render and play the selected match on first selection
+            // This ensures the clip is rendered with current trim values before first playback
+            console.log('Re-rendering and playing selected match...');
+            const currentStartTrim = parseInt(startSlider.value, 10);
+            const currentEndTrim = parseInt(endSlider.value, 10);
+            const rerenderedPath = await rerenderClipWithNewTrims(phraseContainer, currentStartTrim, currentEndTrim);
+            if (rerenderedPath && rerenderedPath.trim() !== '') {
+                const selectedOption = listbox.options[listbox.selectedIndex];
+                if (selectedOption) {
+                    selectedOption.value = rerenderedPath;
+                    listbox.value = rerenderedPath;
+                    selectedOption.dataset.rerendered = 'true';
+                }
+                // Play without trimming (already trimmed)
+                playVideoWithTrimInFloatingPreview(rerenderedPath, 0, 0, phraseContainer, listbox);
+            } else {
+                // Fallback: play with JavaScript trimming
+                playTrimmedVideo(phraseContainer);
+            }
         } else {
-            console.log('Same selection - skipping reset');
+            console.log('Same selection - skipping reset and re-render');
+            // Don't re-render or play again if same selection - let click handler handle it
         }
-        
-        // Always auto-play the selected match (even if same)
-        console.log('Auto-playing selected match...');
-        playTrimmedVideo(phraseContainer);
     });
     
     // Also add click listener as fallback (but don't trigger change if already selected)
-    listbox.addEventListener('click', (event) => {
+    listbox.addEventListener('click', async (event) => {
         if (event.target.tagName === 'OPTION') {
-            console.log('Option clicked:', event.target.value);
-            // Only trigger change event if it's actually different
-            if (event.target.value !== previousSelection) {
+            const clickedOption = event.target;
+            const clickedOriginalPath = clickedOption?.dataset?.originalClipPath || clickedOption?.value;
+            console.log('Option clicked:', clickedOption.value);
+            console.log('Clicked original path:', clickedOriginalPath);
+            console.log('Previous original path:', previousOriginalClipPath);
+            
+            // Only trigger change event if the original clip path is actually different
+            if (clickedOriginalPath !== previousOriginalClipPath) {
                 const changeEvent = new Event('change', { bubbles: true });
                 listbox.dispatchEvent(changeEvent);
             } else {
                 // Just play the video without resetting
-                playTrimmedVideo(phraseContainer);
+                // Check if it's already re-rendered
+                const selectedOption = listbox.options[listbox.selectedIndex];
+                const isRerendered = selectedOption?.dataset?.rerendered === 'true';
+                if (isRerendered) {
+                    // Play without trimming (already trimmed)
+                    playVideoWithTrimInFloatingPreview(listbox.value, 0, 0, phraseContainer, listbox);
+                } else {
+                    // Re-render with current trim values before first playback
+                    const currentStartTrim = parseInt(startSlider.value, 10);
+                    const currentEndTrim = parseInt(endSlider.value, 10);
+                    const rerenderedPath = await rerenderClipWithNewTrims(phraseContainer, currentStartTrim, currentEndTrim);
+                    if (rerenderedPath && rerenderedPath.trim() !== '') {
+                        selectedOption.value = rerenderedPath;
+                        listbox.value = rerenderedPath;
+                        selectedOption.dataset.rerendered = 'true';
+                        // Play without trimming (already trimmed)
+                        playVideoWithTrimInFloatingPreview(rerenderedPath, 0, 0, phraseContainer, listbox);
+                    } else {
+                        playTrimmedVideo(phraseContainer);
+                    }
+                }
             }
         }
         updateFloatingPreview(phraseContainer, listbox, waveformRef, startSlider, endSlider);
@@ -4295,6 +4514,17 @@ function updateDropdowns(data) {
                 }
 
                 option.title = sourceVideo; // Show full path on hover
+                // Store the original exported clip path for waveform (before any re-rendering)
+                if (file.file) {
+                    option.dataset.originalClipPath = file.file;
+                }
+                // Store original segment boundaries for re-rendering
+                if (file.original_start != null) {
+                    option.dataset.originalStart = String(file.original_start);
+                }
+                if (file.original_end != null) {
+                    option.dataset.originalEnd = String(file.original_end);
+                }
             } else {
             option.value = file;
             option.text = `Match ${fileIndex + 1}`;
@@ -4331,26 +4561,74 @@ function updateDropdowns(data) {
         phraseContainer.appendChild(endSlider);
         phraseContainer.appendChild(endSliderDisplay);
 
-        // Create waveform visualization
-        const initialVideo = phraseData.files && phraseData.files.length > 0 
-            ? (typeof phraseData.files[0] === 'object' ? phraseData.files[0].file : phraseData.files[0])
-            : null;
-            
+        // Get original source video and segment boundaries for re-rendering
+        // Use exported clip for waveform (faster), but track original segment for accurate trimming
+        const firstFile = phraseData.files && phraseData.files.length > 0 ? phraseData.files[0] : null;
+        let originalSourceVideo = null;
+        let originalStart = null;
+        let originalEnd = null;
+        let originalDurationMs = null;
+        const initialVideo = firstFile && typeof firstFile === 'object' ? firstFile.file : (firstFile || null);
+        
+        if (firstFile && typeof firstFile === 'object' && firstFile !== null) {
+            originalSourceVideo = firstFile.source_video;
+            originalStart = firstFile.original_start;
+            originalEnd = firstFile.original_end;
+            if (originalStart != null && originalEnd != null) {
+                originalDurationMs = (originalEnd - originalStart) * 1000; // Convert to milliseconds
+            }
+        }
+        
+        // Create waveform visualization using exported clip (fast, already trimmed)
+        // But use original segment duration for trim calculations (accurate)
         const waveform = createWaveformVisualization(
             phraseContainer,
             450, // initial start trim
             450, // initial end trim
-            8000, // max trim
+            originalDurationMs || 8000, // max trim - use original segment duration for accurate trimming
             (startTrim, endTrim) => {
                 // Update sliders when waveform changes
                 startSlider.value = startTrim;
                 startSliderDisplay.textContent = `start trim ${startTrim} ms`;
                 endSlider.value = endTrim;
                 endSliderDisplay.textContent = `end trim ${endTrim} ms`;
-                playTrimmedVideo(phraseContainer);
+                // Don't autoplay during dragging - only on release
             },
-            initialVideo // Pass initial video path for duration loading
+            initialVideo, // Use exported clip for waveform (fast loading)
+            1.0, // initialSpeed
+            async (startTrim, endTrim) => {  // onTrimRelease callback - re-render and play
+                startSlider.value = startTrim;
+                startSliderDisplay.textContent = `start trim ${startTrim} ms`;
+                endSlider.value = endTrim;
+                endSliderDisplay.textContent = `end trim ${endTrim} ms`;
+                
+                // Re-render clip with new trim values from original source
+                const newClipPath = await rerenderClipWithNewTrims(phraseContainer, startTrim, endTrim);
+                if (newClipPath && newClipPath.trim() !== '') {
+                    // Update the select element with the new clip path
+                    const selectedOption = listbox.options[listbox.selectedIndex];
+                    if (selectedOption) {
+                        selectedOption.value = newClipPath;
+                        listbox.value = newClipPath;
+                        selectedOption.dataset.rerendered = 'true';
+                    }
+                    
+                    // Don't update waveform - it should stay on the original exported clip
+                    // The waveform represents the original segment, trims are just boundaries
+                    
+                    // Play the newly rendered clip (no trims needed, it's already trimmed)
+                    playVideoWithTrimInFloatingPreview(newClipPath, 0, 0, phraseContainer, listbox);
+                } else {
+                    // Fallback: play with JavaScript trimming if re-render failed
+                    playTrimmedVideo(phraseContainer);
+                }
+            }
         );
+        
+        // Set the clip duration to the original segment duration for accurate trim calculations
+        if (originalDurationMs) {
+            waveform.setClipDuration(originalDurationMs);
+        }
         waveformRef = waveform; // Store reference for match change updates
         phraseContainer.appendChild(waveform);
 
