@@ -7,6 +7,7 @@ import posixpath
 import re
 import shutil
 import subprocess
+import sys
 import traceback
 import unicodedata
 import uuid
@@ -3692,6 +3693,12 @@ if __name__ == '__main__':
         default=[],
         help='Additional library search path (can be specified multiple times)'
     )
+    parser.add_argument(
+        '--listen',
+        type=str,
+        default='127.0.0.1:5000',
+        help='Server listener address in format HOST:PORT (default: 127.0.0.1:5000, example: 0.0.0.0:8080)'
+    )
     args = parser.parse_args()
     
     # Set global GPU streams limit
@@ -3724,4 +3731,18 @@ if __name__ == '__main__':
     cpu_cores = get_max_workers()
     print(f"[Startup] Using {cpu_cores} CPU cores for parallel processing")
     
-    app.run(debug=True)
+    # Parse listener address
+    try:
+        if ':' in args.listen:
+            host, port = args.listen.rsplit(':', 1)
+            port = int(port)
+        else:
+            # If no port specified, assume default port 5000
+            host = args.listen
+            port = 5000
+    except ValueError:
+        print(f"[Startup] Error: Invalid listener format '{args.listen}'. Expected HOST:PORT (e.g., 0.0.0.0:8080)")
+        sys.exit(1)
+    
+    print(f"[Startup] Starting server on {host}:{port}")
+    app.run(debug=True, host=host, port=port)
