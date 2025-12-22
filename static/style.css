@@ -1864,4 +1864,15 @@ textarea {
         flex: 1;
         min-width: 0;
     }
+
+    /* Floating preview mobile - position at top */
+    .floating-preview {
+        width: calc(100% - 32px);
+        max-width: 100%;
+        left: 16px !important;
+        right: 16px;
+        top: 16px !important;
+        bottom: auto !important;
+        max-height: calc(100vh - 100px);
+    }
 }

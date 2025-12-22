@@ -3795,40 +3795,53 @@ function updateFloatingPreview(phraseContainer, listbox, waveformRef, startSlide
         return;
     }
     
-    // Get card position
-    const cardRect = phraseContainer.getBoundingClientRect();
-    const containerRect = elements.resultsContainer.getBoundingClientRect();
+    // Check if mobile (using same breakpoint as CSS: 1024px)
+    const isMobile = window.innerWidth <= 1024;
     
-    // Position preview to the right of the card
-    const previewWidth = 400; // Fixed width for preview
-    const gap = 20; // Gap between card and preview
-    let left = cardRect.right + gap;
-    let top = cardRect.top;
-    
-    // Check if preview would go off screen to the right
-    if (left + previewWidth > window.innerWidth) {
-        // Position to the left instead
-        left = cardRect.left - previewWidth - gap;
+    if (isMobile) {
+        // On mobile, position at top with padding
+        floatingPreviewContainer.style.left = '16px';
+        floatingPreviewContainer.style.right = '16px';
+        floatingPreviewContainer.style.top = '16px';
+        floatingPreviewContainer.style.width = 'calc(100% - 32px)';
+    } else {
+        // Desktop positioning - get card position
+        const cardRect = phraseContainer.getBoundingClientRect();
+        const containerRect = elements.resultsContainer.getBoundingClientRect();
+        
+        // Position preview to the right of the card
+        const previewWidth = 400; // Fixed width for preview
+        const gap = 20; // Gap between card and preview
+        let left = cardRect.right + gap;
+        let top = cardRect.top;
+        
+        // Check if preview would go off screen to the right
+        if (left + previewWidth > window.innerWidth) {
+            // Position to the left instead
+            left = cardRect.left - previewWidth - gap;
+        }
+        
+        // Check if preview would go off screen to the left
+        if (left < 0) {
+            left = gap;
+        }
+        
+        // Check if preview would go off screen at the bottom
+        const previewHeight = 500; // Estimated height
+        if (top + previewHeight > window.innerHeight) {
+            top = window.innerHeight - previewHeight - gap;
+        }
+        
+        // Check if preview would go off screen at the top
+        if (top < 0) {
+            top = gap;
+        }
+        
+        floatingPreviewContainer.style.left = `${left}px`;
+        floatingPreviewContainer.style.top = `${top}px`;
+        floatingPreviewContainer.style.right = 'auto';
+        floatingPreviewContainer.style.width = '400px';
     }
-    
-    // Check if preview would go off screen to the left
-    if (left < 0) {
-        left = gap;
-    }
-    
-    // Check if preview would go off screen at the bottom
-    const previewHeight = 500; // Estimated height
-    if (top + previewHeight > window.innerHeight) {
-        top = window.innerHeight - previewHeight - gap;
-    }
-    
-    // Check if preview would go off screen at the top
-    if (top < 0) {
-        top = gap;
-    }
-    
-    floatingPreviewContainer.style.left = `${left}px`;
-    floatingPreviewContainer.style.top = `${top}px`;
     floatingPreviewContainer.style.display = 'block';
     floatingPreviewContainer.style.pointerEvents = 'auto'; // Ensure pointer events are enabled when showing
     
