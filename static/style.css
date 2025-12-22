@@ -1206,6 +1206,14 @@ textarea {
     letter-spacing: 0.01em;
 }
 
+.match-number-tooltip {
+    cursor: help;
+    text-decoration: underline;
+    text-decoration-style: dotted;
+    text-underline-offset: 3px;
+    position: relative;
+}
+
 .floating-preview-video {
     width: 100%;
     border-radius: 14px;
@@ -1475,4 +1483,385 @@ textarea {
 .checkbox-field span {
     font-size: 14px;
     color: var(--text);
+}
+
+/* Mobile Bottom Navigation */
+.mobile-bottom-nav {
+    display: none; /* Hidden by default on desktop */
+    position: fixed;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    background: var(--bg-card);
+    border-top: 1px solid var(--border);
+    padding: 8px 0;
+    padding-bottom: calc(8px + env(safe-area-inset-bottom));
+    z-index: 1000;
+    box-shadow: 0 -4px 12px rgba(0, 0, 0, 0.3);
+    justify-content: space-around;
+    align-items: center;
+}
+
+.mobile-nav-button {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 4px;
+    flex: 1;
+    padding: 8px 8px;
+    background: transparent;
+    border: none;
+    color: var(--text-muted);
+    cursor: pointer;
+    transition: color 0.2s ease, background 0.2s ease;
+    min-height: 60px;
+    min-width: 50px;
+    border-radius: 8px;
+    font-size: 12px;
+}
+
+.mobile-nav-button:active {
+    background: rgba(255, 255, 255, 0.06);
+}
+
+.mobile-nav-button.active {
+    color: var(--accent);
+}
+
+.mobile-nav-icon {
+    font-size: 20px;
+    line-height: 1;
+}
+
+.mobile-nav-label {
+    font-size: 11px;
+    font-weight: 500;
+    letter-spacing: 0.01em;
+}
+
+/* Mobile Layout - max-width 1024px */
+@media (max-width: 1024px) {
+    body {
+        padding-bottom: 80px; /* Space for bottom nav */
+    }
+
+    .mobile-bottom-nav {
+        display: flex;
+    }
+
+    /* Hide desktop layout elements */
+    .app-main {
+        grid-template-columns: 1fr;
+        display: block;
+    }
+
+    /* Mobile section visibility - show only active section */
+    [data-mobile-section]:not(.mobile-active) {
+        display: none !important;
+    }
+
+    [data-mobile-section].mobile-active {
+        display: block;
+    }
+    
+    /* Ensure workspace and sidebar display correctly when active */
+    .workspace.mobile-active {
+        display: flex;
+        flex-direction: column;
+    }
+    
+    .sidebar.mobile-active {
+        display: flex;
+        flex-direction: column;
+    }
+    
+    /* Hide sidebar by default on mobile */
+    .sidebar:not(.mobile-active) {
+        display: none;
+    }
+    
+    /* Special handling for nested results section */
+    /* Override general rule - workspace should be visible when showing results */
+    .workspace.mobile-showing-results {
+        display: flex !important;
+        flex-direction: column;
+    }
+    
+    /* When showing search, hide results */
+    .workspace[data-mobile-section="search"].mobile-active [data-mobile-section="results"] {
+        display: none !important;
+    }
+    
+    /* When showing results, hide search content but show results */
+    .workspace.mobile-showing-results .workspace-grid > *:not([data-mobile-section="results"]) {
+        display: none !important;
+    }
+    
+    .workspace.mobile-showing-results .workspace-grid {
+        display: block;
+    }
+    
+    .workspace.mobile-showing-results [data-mobile-section="results"] {
+        display: block !important;
+    }
+    
+    /* Viewer section - show video card when viewer is active */
+    [data-mobile-section="viewer"]:not(.mobile-active) {
+        display: none !important;
+    }
+    
+    [data-mobile-section="viewer"].mobile-active {
+        display: block !important;
+    }
+    
+    /* When showing viewer, show the workspace column container */
+    .workspace.mobile-showing-viewer {
+        display: flex !important;
+        flex-direction: column;
+    }
+    
+    .workspace.mobile-showing-viewer .workspace-grid {
+        display: block;
+    }
+    
+    .workspace.mobile-showing-viewer .workspace-grid > *:not(.workspace-column--secondary) {
+        display: none !important;
+    }
+    
+    .workspace.mobile-showing-viewer .workspace-column--secondary {
+        display: flex !important;
+        flex-direction: column;
+        width: 100%;
+        max-width: 100%;
+    }
+    
+    /* Hide silence preferences when showing viewer */
+    .workspace.mobile-showing-viewer .workspace-column--secondary > .card:not([data-mobile-section="viewer"]) {
+        display: none !important;
+    }
+    
+    .workspace.mobile-showing-viewer [data-mobile-section="viewer"] {
+        display: block !important;
+    }
+
+    .workspace-grid {
+        grid-template-columns: 1fr;
+    }
+
+    .workspace-column--secondary {
+        max-width: 100%;
+    }
+
+    /* Timeline mobile layout - stack vertically */
+    .timeline-horizontal {
+        margin-bottom: 0;
+    }
+
+    .timeline-list-horizontal {
+        flex-direction: column;
+        min-height: auto;
+    }
+
+    .timeline-list-horizontal .timeline-item {
+        flex: 1 1 auto;
+        width: 100%;
+        max-width: 100%;
+    }
+
+    .timeline-scroll {
+        overflow-x: visible;
+        overflow-y: visible;
+    }
+
+    /* Card adjustments for mobile */
+    .card {
+        padding: 16px;
+        gap: 14px;
+    }
+
+    .card-header {
+        flex-wrap: wrap;
+        gap: 8px;
+    }
+
+    .card-header h2 {
+        font-size: 16px;
+    }
+
+    .card-actions {
+        gap: 4px;
+    }
+
+    .card-actions button {
+        font-size: 11px;
+        padding: 6px 8px;
+        min-height: 44px; /* Touch target */
+    }
+
+    /* Touch-optimized buttons */
+    button,
+    .button {
+        min-height: 44px;
+        padding: 12px 18px;
+    }
+
+    .ghost-button {
+        min-height: 44px;
+        padding: 10px 16px;
+    }
+
+    .primary-action {
+        min-height: 44px;
+        padding: 12px 24px;
+        width: 100%;
+    }
+
+    /* Search workspace mobile */
+    .search-tabs {
+        gap: 4px;
+        margin-bottom: 16px;
+    }
+
+    .search-tab {
+        padding: 8px 16px;
+        font-size: 13px;
+        flex: 1;
+    }
+
+    .field-wide .input-row {
+        grid-template-columns: 1fr;
+        gap: 12px;
+    }
+
+    .field-wide .input-row button {
+        width: 100%;
+    }
+
+    .options-grid {
+        grid-template-columns: 1fr;
+    }
+
+    .silence-search-header {
+        flex-direction: column;
+        align-items: stretch;
+        gap: 12px;
+    }
+
+    .silence-search-header .primary-action {
+        width: 100%;
+    }
+
+    /* Video player mobile */
+    .video-card video {
+        min-height: 200px;
+    }
+
+    /* Results grid mobile - single column */
+    .results-grid {
+        grid-template-columns: 1fr;
+        gap: 16px;
+    }
+
+    /* Form inputs mobile */
+    input,
+    select,
+    textarea {
+        font-size: 16px; /* Prevents zoom on iOS */
+        padding: 12px 14px;
+    }
+
+    /* Increased spacing for touch */
+    .form-grid {
+        gap: 20px;
+    }
+
+    .item-list {
+        gap: 12px;
+    }
+
+    .item-list li {
+        padding: 14px 16px;
+        min-height: 44px;
+    }
+
+    /* Timeline actions mobile */
+    .timeline-actions {
+        flex-direction: column;
+        gap: 8px;
+    }
+
+    .timeline-actions button {
+        width: 100%;
+        min-height: 44px;
+    }
+
+    /* Media library mobile */
+    .media-library-actions {
+        grid-template-columns: 1fr;
+        gap: 10px;
+    }
+
+    .media-library-actions button {
+        width: 100%;
+        min-height: 44px;
+    }
+
+    /* Prevent horizontal scroll */
+    body {
+        overflow-x: hidden;
+    }
+
+    .app-shell {
+        max-width: 100%;
+        overflow-x: hidden;
+    }
+
+    /* Story utility buttons */
+    .story-utility-buttons {
+        flex-direction: column;
+        gap: 10px;
+    }
+
+    .story-utility-buttons button {
+        width: 100%;
+        min-height: 44px;
+    }
+
+    .button-row {
+        flex-direction: column;
+        gap: 10px;
+    }
+
+    .button-row button {
+        width: 100%;
+        min-height: 44px;
+    }
+
+    /* Waveform mobile adjustments */
+    .waveform-container {
+        height: 120px;
+        padding-top: 25px;
+        padding-bottom: 20px;
+    }
+
+    .waveform-canvas {
+        height: 70px;
+    }
+
+    /* Timeline horizontal mobile - make it vertical */
+    .timeline-horizontal .card-header {
+        margin-bottom: 16px;
+    }
+
+    .timeline-horizontal .card-actions {
+        width: 100%;
+        justify-content: flex-start;
+        margin-top: 8px;
+    }
+
+    .timeline-horizontal .card-actions button {
+        flex: 1;
+        min-width: 0;
+    }
 }

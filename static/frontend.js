@@ -49,6 +49,32 @@ function getVideoUrl(filePath) {
     return '/static/' + filePath;
 }
 
+// Helper function to format trimmed play length
+// Calculates actual playable duration by subtracting default trim values
+function formatTrimmedLength(clipDurationMs, startTrimMs = 450, endTrimMs = 450) {
+    // Handle null, undefined, or invalid values
+    if (clipDurationMs == null || clipDurationMs === '') {
+        return '';
+    }
+    // Convert string to number if needed
+    const clipDuration = typeof clipDurationMs === 'string' ? parseFloat(clipDurationMs) : clipDurationMs;
+    // Check if it's a valid positive number
+    if (typeof clipDuration !== 'number' || isNaN(clipDuration) || clipDuration <= 0) {
+        return '';
+    }
+    // Calculate actual playable duration by subtracting default trims
+    const playableDuration = Math.max(0, clipDuration - startTrimMs - endTrimMs);
+    if (playableDuration <= 0) {
+        return '';
+    }
+    // If >= 1 second, show as seconds with 1 decimal place, otherwise show as milliseconds
+    if (playableDuration >= 1000) {
+        return `${(playableDuration / 1000).toFixed(1)}s `;
+    } else {
+        return `${Math.round(playableDuration)}ms `;
+    }
+}
+
 // Trigger a sentence search configured for a specific silence duration range
 // selected via the "Search silence" slider.
 function handleSearchSilence() {
@@ -107,10 +133,10 @@ function handleSearchSilence() {
         }
     }
 
-    // // Clear previous results
-    // if (elements.resultsContainer) {
-    //     elements.resultsContainer.innerHTML = '';
-    // }
+    // Clear previous results before starting new search
+    if (elements.resultsContainer) {
+        elements.resultsContainer.innerHTML = '';
+    }
 
     // Show loading state with cancel option
     let abortController = new AbortController();
@@ -229,7 +255,11 @@ function handleSearchSilence() {
                                                 option.value = filePath;
                                                 if (typeof fileObj === 'object' && fileObj.source_video) {
                                                     const videoName = fileObj.source_video.split('/').pop();
-                                                    option.text = `Match ${listbox.options.length} (${videoName})`;
+                                                    // For silence searches, clips have 0/0 trims, so use full duration
+                                                    const defaultStartTrim = (typeof fileObj.silence_start === 'number' && typeof fileObj.silence_end === 'number') ? 0 : 450;
+                                                    const defaultEndTrim = (typeof fileObj.silence_start === 'number' && typeof fileObj.silence_end === 'number') ? 0 : 450;
+                                                    const trimmedLength = formatTrimmedLength(fileObj.duration_ms, defaultStartTrim, defaultEndTrim);
+                                                    option.text = `Match ${listbox.options.length} (${trimmedLength}${videoName})`;
                                                     if (fileObj.duration_ms) {
                                                         option.dataset.durationMs = String(fileObj.duration_ms);
                                                     }
@@ -272,6 +302,126 @@ function generateId(prefix = 'id') {
     return `${prefix}_${Math.random().toString(36).slice(2, 10)}_${Date.now()}`;
 }
 
+// Mobile Navigation Functions
+function isMobileLayout() {
+    return window.innerWidth <= 1024;
+}
+
+function switchMobileSection(sectionName) {
+    if (!isMobileLayout()) {
+        return;
+    }
+
+    // Get workspace reference
+    const workspace = document.querySelector('.workspace[data-mobile-section="search"]');
+    
+    // Remove mobile-showing classes from workspace (will be re-added if needed)
+    if (workspace) {
+        workspace.classList.remove('mobile-showing-results');
+        workspace.classList.remove('mobile-showing-viewer');
+    }
+
+    // Hide all mobile sections
+    document.querySelectorAll('[data-mobile-section]').forEach(section => {
+        section.classList.remove('mobile-active');
+    });
+
+    // Special handling for results section (nested inside workspace)
+    if (sectionName === 'results') {
+        // Show workspace and mark it as showing results (but don't mark workspace as mobile-active)
+        if (workspace) {
+            workspace.classList.add('mobile-showing-results');
+        }
+        // Mark results section as active
+        const resultsSection = document.querySelector('[data-mobile-section="results"]');
+        if (resultsSection) {
+            resultsSection.classList.add('mobile-active');
+        }
+    } else if (sectionName === 'viewer') {
+        // Show workspace and mark it as showing viewer
+        if (workspace) {
+            workspace.classList.add('mobile-showing-viewer');
+        }
+        // Mark viewer section as active
+        const viewerSection = document.querySelector('[data-mobile-section="viewer"]');
+        if (viewerSection) {
+            viewerSection.classList.add('mobile-active');
+        }
+    } else {
+        // Show selected section normally
+        const targetSection = document.querySelector(`[data-mobile-section="${sectionName}"]`);
+        if (targetSection) {
+            targetSection.classList.add('mobile-active');
+        }
+    }
+
+    // Update nav buttons
+    document.querySelectorAll('.mobile-nav-button').forEach(button => {
+        button.classList.remove('active');
+    });
+    const activeButton = document.querySelector(`[data-mobile-nav="${sectionName}"]`);
+    if (activeButton) {
+        activeButton.classList.add('active');
+    }
+
+    // Scroll to top
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+
+    // Store active section
+    try {
+        sessionStorage.setItem('mobileActiveSection', sectionName);
+    } catch (e) {
+        // Ignore storage errors
+    }
+}
+
+function initializeMobileNavigation() {
+    const bottomNav = document.getElementById('mobileBottomNav');
+    if (!bottomNav) {
+        return;
+    }
+
+    // Bind click handlers to nav buttons
+    document.querySelectorAll('.mobile-nav-button').forEach(button => {
+        button.addEventListener('click', () => {
+            const section = button.dataset.mobileNav;
+            if (section) {
+                switchMobileSection(section);
+            }
+        });
+    });
+
+    // Handle window resize
+    let resizeTimeout;
+    window.addEventListener('resize', () => {
+        clearTimeout(resizeTimeout);
+        resizeTimeout = setTimeout(() => {
+            if (isMobileLayout()) {
+                // Ensure mobile layout is active
+                const currentSection = document.querySelector('[data-mobile-section].mobile-active');
+                if (!currentSection) {
+                    // Restore from sessionStorage or default to search
+                    const savedSection = sessionStorage.getItem('mobileActiveSection') || 'search';
+                    switchMobileSection(savedSection);
+                }
+            } else {
+                // Desktop layout - remove mobile-active classes (CSS handles visibility)
+                document.querySelectorAll('[data-mobile-section]').forEach(section => {
+                    section.classList.remove('mobile-active');
+                });
+            }
+        }, 100);
+    });
+
+    // Initialize on load
+    if (isMobileLayout()) {
+        // Restore saved section or default to search
+        const savedSection = sessionStorage.getItem('mobileActiveSection') || 'search';
+        switchMobileSection(savedSection);
+    }
+    // Desktop layout doesn't need mobile-active classes - CSS handles it
+}
+
 document.addEventListener('DOMContentLoaded', () => {
     cacheElements();
     bindEventListeners();
@@ -279,6 +429,7 @@ document.addEventListener('DOMContentLoaded', () => {
     initializeSearchTabs();
     fetchLibraryFiles();
     bootstrapProjects();
+    initializeMobileNavigation();
 });
 
 function initializeSearchTabs() {
@@ -488,6 +639,7 @@ function cacheElements() {
     elements.timelinePlayButton = document.getElementById('timelinePlayButton');
     elements.timelineMergeButton = document.getElementById('timelineMergeButton');
     elements.timelineClearButton = document.getElementById('timelineClearButton');
+    elements.loopMergedVideo = document.getElementById('loopMergedVideo');
     elements.resultsContainer = document.getElementById('resultsContainer');
     elements.videoPlayer = document.getElementById('videoPlayer');
 }
@@ -677,10 +829,12 @@ function bindEventListeners() {
                         textToInsert = textToInsert.substring(selectedEntry.prevContext.length).trimStart();
                     }
                     selectSentenceSuggestion(textToInsert);
+                    // After selecting suggestion, trigger search
+                    handleSentenceSearch();
                 } else {
-                handleSentenceSearch();
-                    hideSentenceAutocomplete();
+                    handleSentenceSearch();
                 }
+                hideSentenceAutocomplete();
             } else if (event.key === 'Tab') {
                 event.preventDefault();
                 // If autocomplete not visible, try to show it first
@@ -1503,6 +1657,8 @@ function handleAddFiles() {
     });
     renderFilePickers();
     resetCorpusState();
+    // Automatically reload corpus with new file list
+    handleLoadSentences();
 }
 
 function handleRemoveFiles() {
@@ -1520,6 +1676,8 @@ function handleRemoveFiles() {
     });
     renderFilePickers();
     resetCorpusState();
+    // Automatically reload corpus with updated file list
+    handleLoadSentences();
 }
 
 function handleClearFiles() {
@@ -1531,6 +1689,8 @@ function handleClearFiles() {
     });
     renderFilePickers();
     resetCorpusState();
+    // Automatically reload corpus (will be empty after clearing files)
+    handleLoadSentences();
 }
 
 function handleSelectAllAvailable() {
@@ -1620,6 +1780,18 @@ function hideSearchLoading() {
     const loadingDiv = document.getElementById('searchLoadingIndicator');
     if (loadingDiv) {
         loadingDiv.remove();
+    }
+    
+    // Auto-jump to results on mobile after search completes
+    if (isMobileLayout()) {
+        // Check if there are any results
+        const hasResults = elements.resultsContainer && elements.resultsContainer.children.length > 0;
+        if (hasResults) {
+            // Small delay to ensure results are rendered
+            setTimeout(() => {
+                switchMobileSection('results');
+            }, 300);
+        }
     }
 }
 
@@ -2107,7 +2279,7 @@ function createWaveformVisualization(container, initialStartTrim = 450, initialE
         }
     }
     
-    function updateTrim(newStartTrim, newEndTrim) {
+    function updateTrim(newStartTrim, newEndTrim, skipCallback = false) {
         // Use actual clip duration if available, otherwise use maxTrim
         const effectiveMax = clipDuration || maxTrim;
         
@@ -2127,7 +2299,9 @@ function createWaveformVisualization(container, initialStartTrim = 450, initialE
         }
         
         updateSelection();
-        if (onTrimChange) {
+        // On mobile, only trigger callback when not dragging (skipCallback is false)
+        // On desktop, always trigger immediately
+        if (onTrimChange && !skipCallback) {
             onTrimChange(startTrim, endTrim);
         }
     }
@@ -2159,16 +2333,25 @@ function createWaveformVisualization(container, initialStartTrim = 450, initialE
         const rect = canvas.getBoundingClientRect();
         const x = clientX - rect.left - dragOffset;
         
+        // On mobile, skip callback during drag to prevent autoplay blocking
+        const isMobile = window.innerWidth <= 1024;
+        const skipCallback = isMobile;
+        
         if (isDragging === startHandle) {
             const newTrim = pixelToTrim(rect.left + x, false);
-            updateTrim(newTrim, endTrim);
+            updateTrim(newTrim, endTrim, skipCallback);
         } else {
             const newTrim = pixelToTrim(rect.left + x, true);
-            updateTrim(startTrim, newTrim);
+            updateTrim(startTrim, newTrim, skipCallback);
         }
     }
     
     function stopDrag() {
+        // On mobile, trigger callback when drag ends
+        const isMobile = window.innerWidth <= 1024;
+        if (isMobile && isDragging && onTrimChange) {
+            onTrimChange(startTrim, endTrim);
+        }
         isDragging = null;
     }
     
@@ -2423,6 +2606,16 @@ function handleSentenceSearch() {
     if (!selectedFiles.length) {
         return;
     }
+    
+    // Clear previous results before starting new search
+    if (elements.resultsContainer) {
+        elements.resultsContainer.innerHTML = '';
+    }
+    
+    // Immediately jump to results on mobile when search is initiated
+    if (isMobileLayout()) {
+        switchMobileSection('results');
+    }
 
     // Get the checkbox values for partial matches
     const includePartialMatchesCheckbox = document.getElementById('includePartialMatches');
@@ -2627,6 +2820,11 @@ function handleGenerateStory() {
     const debugModeCheckbox = document.getElementById('debugMode');
     const debugMode = debugModeCheckbox ? debugModeCheckbox.checked : false;
 
+    // Clear previous results before generating new story
+    if (elements.resultsContainer) {
+        elements.resultsContainer.innerHTML = '';
+    }
+    
     // Save to project data
     updateProjectData(data => {
         data.storyPrompt = prompt;
@@ -3163,6 +3361,10 @@ function playVideoWithTrim(filePath, startTrim, endTrim, shouldLoop = false, pla
     elements.videoPlayer.playbackRate = playbackRate;
     elements.videoPlayer.load();
 
+    // Remove any existing event listeners to prevent multiple handlers
+    elements.videoPlayer.onloadedmetadata = null;
+    elements.videoPlayer.onseeked = null;
+    
     elements.videoPlayer.onloadedmetadata = () => {
         const duration = elements.videoPlayer.duration;
         const startSeconds = startTrim / 1000;
@@ -3172,27 +3374,62 @@ function playVideoWithTrim(filePath, startTrim, endTrim, shouldLoop = false, pla
         if (startSeconds + endSeconds >= duration) {
             console.error(`Trim values (start: ${startTrim}ms, end: ${endTrim}ms) exceed clip duration (${(duration * 1000).toFixed(0)}ms). Nothing to play.`);
             alert(`Cannot play: trim values exceed clip duration.\nClip: ${(duration * 1000).toFixed(0)}ms\nStart trim: ${startTrim}ms\nEnd trim: ${endTrim}ms\nRemaining: ${((duration * 1000) - startTrim - endTrim).toFixed(0)}ms`);
-                return;
-            }
-
-        elements.videoPlayer.currentTime = startSeconds;
-        elements.videoPlayer.playbackRate = playbackRate;
-
-        if (endTrim > 0) {
-            const endTime = duration - endSeconds;
-            // Adjust timeout based on playback rate
-            const playDuration = (endTime - startSeconds) / playbackRate;
-            videoTimeoutId = setTimeout(() => {
-                if (shouldLoop) {
-                    elements.videoPlayer.currentTime = startSeconds;
-                    elements.videoPlayer.play();
-                } else {
-                    elements.videoPlayer.pause();
-                }
-            }, playDuration * 1000);
+            return;
         }
 
-        elements.videoPlayer.play().catch(error => console.error('Error playing the video:', error));
+        // Set playback rate before seeking
+        elements.videoPlayer.playbackRate = playbackRate;
+        
+        // Set up seeked handler to ensure seek completes before playing
+        let seekTimeoutId = null;
+        let playbackStarted = false;
+        
+        const startPlayback = () => {
+            if (playbackStarted) return;
+            playbackStarted = true;
+            
+            // Clear seek timeout if it exists
+            if (seekTimeoutId) {
+                clearTimeout(seekTimeoutId);
+                seekTimeoutId = null;
+            }
+            
+            // Set up end trim timeout if needed
+            if (endTrim > 0) {
+                const endTime = duration - endSeconds;
+                // Adjust timeout based on playback rate
+                const playDuration = (endTime - startSeconds) / playbackRate;
+                videoTimeoutId = setTimeout(() => {
+                    if (shouldLoop) {
+                        elements.videoPlayer.currentTime = startSeconds;
+                        elements.videoPlayer.play();
+                    } else {
+                        elements.videoPlayer.pause();
+                    }
+                }, playDuration * 1000);
+            }
+            
+            // Start playback only after seek completes
+            elements.videoPlayer.play().catch(error => console.error('Error playing the video:', error));
+        };
+        
+        elements.videoPlayer.onseeked = () => {
+            // Clear the seeked handler to prevent it from firing multiple times
+            elements.videoPlayer.onseeked = null;
+            startPlayback();
+        };
+        
+        // Set currentTime - this will trigger the seeked event
+        elements.videoPlayer.currentTime = startSeconds;
+        
+        // Fallback: if seeked doesn't fire within 200ms, start playback anyway
+        // This handles edge cases where seeked might not fire (e.g., if already at target time)
+        seekTimeoutId = setTimeout(() => {
+            if (!playbackStarted) {
+                elements.videoPlayer.onseeked = null;
+                startPlayback();
+            }
+        }, 200);
     };
 }
 
@@ -3294,8 +3531,46 @@ function addSegmentResult(segmentData) {
             option.value = file.file;
             const sourceVideo = file.source_video || 'Unknown';
             const videoName = sourceVideo.split('/').pop();
-            option.text = `Match ${fileIndex + 1} (${videoName})`;
+            // Get duration_ms from server - this is the exported clip duration (not full video)
+            // file.file points to the exported clip in temp/, so duration_ms is the clip length
+            // We need to subtract default trim values (450ms start + 450ms end) to get actual playable length
+            let clipDurationMs = file.duration_ms;
+            // Handle string numbers
+            if (clipDurationMs != null && typeof clipDurationMs === 'string') {
+                clipDurationMs = parseFloat(clipDurationMs);
+            }
+            // Fallback: calculate from silence times if available (for silence searches)
+            // For silence searches, clips are exported with 0/0 trims, so use full duration
+            const defaultStartTrim = (typeof file.silence_start === 'number' && typeof file.silence_end === 'number') ? 0 : 450;
+            const defaultEndTrim = (typeof file.silence_start === 'number' && typeof file.silence_end === 'number') ? 0 : 450;
+            
+            if ((!clipDurationMs || isNaN(clipDurationMs) || clipDurationMs <= 0) && typeof file.silence_start === 'number' && typeof file.silence_end === 'number') {
+                clipDurationMs = (file.silence_end - file.silence_start) * 1000;
+            }
+            const trimmedLength = formatTrimmedLength(clipDurationMs, defaultStartTrim, defaultEndTrim);
+            // Always show the trimmed length, even if empty (format function returns empty string if invalid)
+            option.text = `Match ${fileIndex + 1} (${trimmedLength}${videoName})`;
             option.title = sourceVideo;
+            // Store duration if provided (will be loaded later if not available)
+            if (clipDurationMs != null && !isNaN(clipDurationMs) && clipDurationMs > 0) {
+                option.dataset.durationMs = String(clipDurationMs);
+            } else {
+                // Try to load duration asynchronously from exported clip metadata
+                // file.file points to the exported clip (temp/...), not the source video
+                const clipPath = file.file;
+                if (clipPath) {
+                    getVideoDuration(clipPath).then(duration => {
+                        if (duration && duration > 0) {
+                            // This is the exported clip duration, subtract default trims for playable length
+                            option.dataset.durationMs = String(duration);
+                            const updatedTrimmedLength = formatTrimmedLength(duration, defaultStartTrim, defaultEndTrim);
+                            option.text = `Match ${fileIndex + 1} (${updatedTrimmedLength}${videoName})`;
+                        }
+                    }).catch(() => {
+                        // Ignore errors - duration will remain unknown
+                    });
+                }
+            }
         } else {
             option.value = file;
             option.text = `Match ${fileIndex + 1}`;
@@ -3590,10 +3865,13 @@ function updateFloatingPreview(phraseContainer, listbox, waveformRef, startSlide
             }
         }
         
-        // Build title with matched text if available
-        let titleHtml = `Match ${matchNumber}: ${escapeHtml(phraseText)}`;
+        // Build title with matched text in hover tooltip
+        let titleHtml = '';
         if (matchedText) {
-            titleHtml += `<br><br><span style="font-size: 0.9em; color: var(--text-muted); font-weight: normal;">Matched: "${escapeHtml(matchedText)}"</span>`;
+            // Wrap "Match N:" in a span with tooltip containing the matched text
+            titleHtml = `<span class="match-number-tooltip" title="Matched: &quot;${escapeHtml(matchedText)}&quot;">Match ${matchNumber}:</span> ${escapeHtml(phraseText)}`;
+        } else {
+            titleHtml = `Match ${matchNumber}: ${escapeHtml(phraseText)}`;
         }
         previewTitle.innerHTML = titleHtml;
     }
@@ -3632,6 +3910,10 @@ function playVideoWithTrimInFloatingPreview(filePath, startTrim, endTrim, phrase
     previewVideo.src = videoUrl;
     previewVideo.load();
     
+    // Remove any existing event listeners to prevent multiple handlers
+    previewVideo.onloadedmetadata = null;
+    previewVideo.onseeked = null;
+    
     previewVideo.onloadedmetadata = () => {
         const duration = previewVideo.duration;
         const startSeconds = startTrim / 1000;
@@ -3644,16 +3926,49 @@ function playVideoWithTrimInFloatingPreview(filePath, startTrim, endTrim, phrase
             return;
         }
         
+        // Set up seeked handler to ensure seek completes before playing
+        let seekTimeoutId = null;
+        let playbackStarted = false;
+        
+        const startPlayback = () => {
+            if (playbackStarted) return;
+            playbackStarted = true;
+            
+            // Clear seek timeout if it exists
+            if (seekTimeoutId) {
+                clearTimeout(seekTimeoutId);
+                seekTimeoutId = null;
+            }
+            
+            // Set up end trim timeout if needed
+            if (endTrim > 0) {
+                const endTime = duration - endSeconds;
+                videoTimeoutId = setTimeout(() => {
+                    previewVideo.pause();
+                }, (endTime - startSeconds) * 1000);
+            }
+            
+            // Start playback only after seek completes
+            previewVideo.play().catch(error => console.error('Error playing the video:', error));
+        };
+        
+        previewVideo.onseeked = () => {
+            // Clear the seeked handler to prevent it from firing multiple times
+            previewVideo.onseeked = null;
+            startPlayback();
+        };
+        
+        // Set currentTime - this will trigger the seeked event
         previewVideo.currentTime = startSeconds;
         
-        if (endTrim > 0) {
-            const endTime = duration - endSeconds;
-            videoTimeoutId = setTimeout(() => {
-                previewVideo.pause();
-            }, (endTime - startSeconds) * 1000);
-        }
-        
-        previewVideo.play().catch(error => console.error('Error playing the video:', error));
+        // Fallback: if seeked doesn't fire within 200ms, start playback anyway
+        // This handles edge cases where seeked might not fire (e.g., if already at target time)
+        seekTimeoutId = setTimeout(() => {
+            if (!playbackStarted) {
+                previewVideo.onseeked = null;
+                startPlayback();
+            }
+        }, 200);
     };
 }
 
@@ -3894,6 +4209,24 @@ function updateDropdowns(data) {
                 const sourceVideo = file.source_video || 'Unknown';
                 const videoName = sourceVideo.split('/').pop(); // Get filename from path
 
+                // Get duration_ms from server - this is the exported clip duration
+                // We need to subtract default trim values to get actual playable length
+                let clipDurationMs = file.duration_ms;
+                // Handle string numbers
+                if (clipDurationMs != null && typeof clipDurationMs === 'string') {
+                    clipDurationMs = parseFloat(clipDurationMs);
+                }
+                // For silence searches, clips are exported with 0/0 trims, so use full duration
+                // For regular searches, default trims are 450ms start + 450ms end
+                const defaultStartTrim = (typeof file.silence_start === 'number' && typeof file.silence_end === 'number') ? 0 : 450;
+                const defaultEndTrim = (typeof file.silence_start === 'number' && typeof file.silence_end === 'number') ? 0 : 450;
+                
+                // Fallback: calculate from silence times if available
+                if ((!clipDurationMs || isNaN(clipDurationMs) || clipDurationMs <= 0) && typeof file.silence_start === 'number' && typeof file.silence_end === 'number') {
+                    clipDurationMs = (file.silence_end - file.silence_start) * 1000;
+                }
+                const trimmedLength = formatTrimmedLength(clipDurationMs, defaultStartTrim, defaultEndTrim);
+                
                 // If this is a silence entry, show a more descriptive label
                 if (typeof file.silence_start === 'number' && typeof file.silence_end === 'number') {
                     const durationSec = Math.max(0, file.silence_end - file.silence_start);
@@ -3902,7 +4235,7 @@ function updateDropdowns(data) {
                     const context = before || after
                         ? ` between "${before || '…'}" and "${after || '…'}"`
                         : '';
-                    option.text = `Silence ${durationSec.toFixed(2)}s (${videoName})${context}`;
+                    option.text = `Silence ${durationSec.toFixed(2)}s (${trimmedLength}${videoName})${context}`;
 
                     // Store metadata for potential future trim/playback logic
                     option.dataset.silenceStart = String(file.silence_start);
@@ -3910,7 +4243,37 @@ function updateDropdowns(data) {
                     if (before) option.dataset.wordBefore = before;
                     if (after) option.dataset.wordAfter = after;
                 } else {
-                    option.text = `Match ${fileIndex + 1} (${videoName})`;
+                    option.text = `Match ${fileIndex + 1} (${trimmedLength}${videoName})`;
+                }
+                
+                // Store duration if provided, or try to load it asynchronously
+                if (clipDurationMs != null && !isNaN(clipDurationMs) && clipDurationMs > 0) {
+                    option.dataset.durationMs = String(clipDurationMs);
+                } else {
+                    // Try to load duration asynchronously from video metadata
+                    const videoPath = file.file;
+                    if (videoPath) {
+                        getVideoDuration(videoPath).then(duration => {
+                            if (duration && duration > 0) {
+                                option.dataset.durationMs = String(duration);
+                                const updatedTrimmedLength = formatTrimmedLength(duration, defaultStartTrim, defaultEndTrim);
+                                // Update the option text with the loaded duration
+                                if (typeof file.silence_start === 'number' && typeof file.silence_end === 'number') {
+                                    const durationSec = Math.max(0, file.silence_end - file.silence_start);
+                                    const before = file.word_before || '';
+                                    const after = file.word_after || '';
+                                    const context = before || after
+                                        ? ` between "${before || '…'}" and "${after || '…'}"`
+                                        : '';
+                                    option.text = `Silence ${durationSec.toFixed(2)}s (${updatedTrimmedLength}${videoName})${context}`;
+                                } else {
+                                    option.text = `Match ${fileIndex + 1} (${updatedTrimmedLength}${videoName})`;
+                                }
+                            }
+                        }).catch(() => {
+                            // Ignore errors - duration will remain unknown
+                        });
+                    }
                 }
 
                 // Store duration if provided by server
@@ -3979,19 +4342,39 @@ function updateDropdowns(data) {
         phraseContainer.appendChild(waveform);
 
         // Connect sliders to waveform (for programmatic updates)
-        startSlider.addEventListener('input', function () {
+        const isMobile = window.innerWidth <= 1024;
+        
+        // On mobile, use 'change' event (fires on release), on desktop use 'input' (fires during drag)
+        const sliderEvent = isMobile ? 'change' : 'input';
+        
+        startSlider.addEventListener(sliderEvent, function () {
             const value = parseInt(this.value, 10);
             startSliderDisplay.textContent = `start trim ${value} ms`;
             waveform.updateTrim(value, parseInt(endSlider.value, 10));
             playTrimmedVideo(phraseContainer);
         });
 
-        endSlider.addEventListener('input', function () {
+        endSlider.addEventListener(sliderEvent, function () {
             const value = parseInt(this.value, 10);
             endSliderDisplay.textContent = `end trim ${value} ms`;
             waveform.updateTrim(parseInt(startSlider.value, 10), value);
             playTrimmedVideo(phraseContainer);
         });
+        
+        // On mobile, also update display during input (but don't play)
+        if (isMobile) {
+            startSlider.addEventListener('input', function () {
+                const value = parseInt(this.value, 10);
+                startSliderDisplay.textContent = `start trim ${value} ms`;
+                waveform.updateTrim(value, parseInt(endSlider.value, 10), true); // Skip callback
+            });
+
+            endSlider.addEventListener('input', function () {
+                const value = parseInt(this.value, 10);
+                endSliderDisplay.textContent = `end trim ${value} ms`;
+                waveform.updateTrim(parseInt(startSlider.value, 10), value, true); // Skip callback
+            });
+        }
 
         const controls = document.createElement('div');
         controls.classList.add('phrase-controls');
@@ -6000,7 +6383,16 @@ function mergeTimeline() {
                                     }
                                     
                                     if (data.merged_video) {
-                                        playVideoWithTrim(data.merged_video, 0, 0, true);
+                                        // Get loop preference from checkbox (defaults to false if not found)
+                                        const shouldLoop = elements.loopMergedVideo ? elements.loopMergedVideo.checked : false;
+                                        playVideoWithTrim(data.merged_video, 0, 0, shouldLoop);
+
+                                        // Switch to viewer on mobile after merge completes
+                                        if (isMobileLayout()) {
+                                            setTimeout(() => {
+                                                switchMobileSection('viewer');
+                                            }, 500);
+                                        }
 
                                         const downloadId = 'mergedDownloadLink';
                                         const existingDownload = document.getElementById(downloadId);

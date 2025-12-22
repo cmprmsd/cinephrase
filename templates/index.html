@@ -9,7 +9,7 @@
 </head>
     <body>
         <div class="app-shell">
-            <section class="timeline-horizontal">
+            <section class="timeline-horizontal" data-mobile-section="timeline">
                 <div class="card-header">
                     <h2>Timeline</h2>
                     <div class="card-actions">
@@ -18,13 +18,19 @@
                         <button id="timelineClearButton" class="ghost-button danger">Clear</button>
                     </div>
                 </div>
+                <div style="padding: 0 20px 12px 20px;">
+                    <label class="checkbox-field">
+                        <input type="checkbox" id="loopMergedVideo">
+                        <span>Loop merged video</span>
+                    </label>
+                </div>
                 <div class="timeline-scroll">
                     <ul id="timelineList" class="timeline-list-horizontal"></ul>
                 </div>
             </section>
 
             <main class="app-main">
-                <aside class="sidebar">
+                <aside class="sidebar" data-mobile-section="projects">
                     <section class="card">
                         <div class="card-header">
                             <h2>Project Picker</h2>
@@ -91,7 +97,7 @@
 
                 </aside>
 
-                <section class="workspace">
+                <section class="workspace" data-mobile-section="search">
                     <div class="workspace-grid">
                         <div class="workspace-column workspace-column--primary">
                             <section class="card">
@@ -207,7 +213,7 @@
                             </section>
                         </div>
                         <div class="workspace-column workspace-column--secondary">
-                            <section class="card video-card">
+                            <section class="card video-card" data-mobile-section="viewer">
                                 <h2>Preview</h2>
                                 <video id="videoPlayer" controls></video>
                             </section>
@@ -229,7 +235,7 @@
                                 </div>
                             </section>
                         </div>
-                        <section class="card matches-full-width">
+                        <section class="card matches-full-width" data-mobile-section="results">
                             <div class="card-header">
                                 <h2>Matches</h2>
                                 <div class="card-actions">
@@ -244,6 +250,30 @@
                 </section>
             </main>
         </div>
+
+        <!-- Mobile Bottom Navigation -->
+        <nav class="mobile-bottom-nav" id="mobileBottomNav">
+            <button class="mobile-nav-button" data-mobile-nav="projects" aria-label="Projects">
+                <span class="mobile-nav-icon">📁</span>
+                <span class="mobile-nav-label">Projects</span>
+            </button>
+            <button class="mobile-nav-button active" data-mobile-nav="search" aria-label="Search">
+                <span class="mobile-nav-icon">🔍</span>
+                <span class="mobile-nav-label">Search</span>
+            </button>
+            <button class="mobile-nav-button" data-mobile-nav="results" aria-label="Results">
+                <span class="mobile-nav-icon">📊</span>
+                <span class="mobile-nav-label">Results</span>
+            </button>
+            <button class="mobile-nav-button" data-mobile-nav="timeline" aria-label="Timeline">
+                <span class="mobile-nav-icon">⏱️</span>
+                <span class="mobile-nav-label">Timeline</span>
+            </button>
+            <button class="mobile-nav-button" data-mobile-nav="viewer" aria-label="Viewer">
+                <span class="mobile-nav-icon">🎬</span>
+                <span class="mobile-nav-label">Viewer</span>
+            </button>
+        </nav>
 
         <script src="static/frontend.js"></script>
     </body>
