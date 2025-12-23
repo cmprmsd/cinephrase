@@ -1165,7 +1165,8 @@ def search_longest_segments_stream():
                 print(f"[SSE] ❌ Error in search for '{sentence}': {e}")
                 traceback.print_exc()
                 try:
-                    yield f'data: {json.dumps({"error": f"Error searching for '{sentence}': {str(e)}", "group_index": group_index, "total_groups": len(sentence_groups)})}\n\n'
+                    error_msg = f"Error searching for '{sentence}': {str(e)}"
+                    yield f'data: {json.dumps({"error": error_msg, "group_index": group_index, "total_groups": len(sentence_groups)})}\n\n'
                 except (GeneratorExit, BrokenPipeError, ConnectionError):
                     print(f"[SSE] ❌ Client disconnected while sending error")
                     return
