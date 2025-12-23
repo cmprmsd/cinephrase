@@ -3707,13 +3707,37 @@ def rerender_clip():
         if not clip_path or not source_video:
             return jsonify({'error': 'Missing clip_path or source_video'}), 400
         
-        # Find the source video file
-        source_path = None
+        # Find the source video file (support absolute, relative, and already-prefixed Library paths)
+        candidates = []
+        
+        # Exact path as provided
+        candidates.append(source_video)
+        
+        # If path is absolute, also try it normalized
+        if os.path.isabs(source_video):
+            candidates.append(os.path.normpath(source_video))
+        else:
+            # Relative to app root
+            candidates.append(os.path.join(app.root_path, source_video))
+        
+        # Try under each library root
         for lib_root in LIBRARY_ROOTS:
-            potential_path = os.path.join(lib_root, source_video)
-            if os.path.exists(potential_path):
-                source_path = potential_path
-                break
+            candidates.append(os.path.join(lib_root, source_video.lstrip('/')))
+            # If the source already includes "Library/...", also try without that prefix once
+            if source_video.startswith(os.path.basename(lib_root)):
+                stripped = source_video[len(os.path.basename(lib_root)):].lstrip('/\\')
+                candidates.append(os.path.join(lib_root, stripped))
+        
+        # Deduplicate while preserving order
+        seen = set()
+        ordered_candidates = []
+        for path in candidates:
+            norm = os.path.normpath(path)
+            if norm not in seen:
+                seen.add(norm)
+                ordered_candidates.append(norm)
+        
+        source_path = next((p for p in ordered_candidates if os.path.exists(p)), None)
         
         if not source_path:
             return jsonify({'error': f'Source video not found: {source_video}'}), 404
