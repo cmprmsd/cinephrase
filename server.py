@@ -551,6 +551,10 @@ def get_sentences():
         sentence_texts = extract_sentences_from_segments(sentences)
         if not sentence_texts:
             continue
+        
+        # Log success message
+        filename = os.path.basename(file_path)
+        print(f"{filename}: {len(sentence_texts)} sentences extracted")
 
         for index, sentence in enumerate(sentence_texts):
             prev_sentence = sentence_texts[index - 1] if index > 0 else ""
@@ -1575,14 +1579,22 @@ def _find_related_files(video_path: str, extensions: Sequence[str]) -> List[Path
     unique: List[Path] = []
     seen = set()
     for candidate in candidates:
+        # Check if file exists first (more reliable than strict resolve)
+        if not candidate.exists():
+            continue
         try:
-            resolved = candidate.resolve(strict=True)
-        except FileNotFoundError:
+            resolved = candidate.resolve()
+        except (OSError, RuntimeError) as e:
+            # Still add it if it exists, even if resolve fails
+            if candidate not in seen:
+                seen.add(candidate)
+                unique.append(candidate)
             continue
         if resolved in seen:
             continue
         seen.add(resolved)
         unique.append(candidate)
+    
     return unique
 
 
@@ -1599,20 +1611,26 @@ def _load_json_transcript(path: Path) -> Optional[List[dict]]:
 
 
 def load_transcript_sentences(video_path: str) -> Optional[List[dict]]:
-    try:
-        sentences = parse_transcript(video_path)
-        if sentences:
-            return sentences
-    except FileNotFoundError:
-        pass
-    except Exception as exc:
-        print(f"Failed to parse transcript via videogrep for '{video_path}': {exc}")
-
+    # First, try to find and load JSON files (preferred format)
     json_candidates = _find_related_files(video_path, ['.json'])
     for json_path in json_candidates:
         sentences = _load_json_transcript(json_path)
         if sentences:
             return sentences
+    
+    # If no JSON found, try parse_transcript, but validate the format
+    try:
+        sentences = parse_transcript(video_path)
+        if sentences:
+            # Validate that these sentences can be extracted
+            # If they can't be extracted, they're not useful, so continue to subtitle conversion
+            test_extraction = extract_sentences_from_segments(sentences)
+            if test_extraction:
+                return sentences
+    except FileNotFoundError:
+        pass
+    except Exception as exc:
+        print(f"Failed to parse transcript via videogrep for '{video_path}': {exc}")
 
     subtitle_candidates = _find_related_files(video_path, ['.vtt', '.srt'])
     for subtitle_path in subtitle_candidates:

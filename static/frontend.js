@@ -2532,7 +2532,7 @@ function createWaveformVisualization(container, initialStartTrim = 450, initialE
                 updateSelection();
             }
         } else {
-            updateSelection(); // Refresh display with new duration
+        updateSelection(); // Refresh display with new duration
         }
     };
     
@@ -3572,9 +3572,9 @@ function playVideo(filePath, shouldLoop = false, playbackRate = 1.0) {
             if (playbackRate !== 1.0) {
                 elements.videoPlayer.playbackRate = playbackRate;
             }
-            elements.videoPlayer.play().catch(error => {
-                console.error('Error playing the video:', error);
-            });
+        elements.videoPlayer.play().catch(error => {
+            console.error('Error playing the video:', error);
+        });
         };
         
         // Also set playback rate immediately (some browsers need this)
@@ -3797,7 +3797,7 @@ async function playTrimmedVideo(phraseContainer) {
         playVideoWithTrimInFloatingPreview(selectedVideo, 0, 0, phraseContainer, selectElement);
     } else {
         // If re-render failed, fallback to JavaScript trimming
-        playVideoWithTrimInFloatingPreview(selectedVideo, startTrim, endTrim, phraseContainer, selectElement);
+    //playVideoWithTrimInFloatingPreview(selectedVideo, startTrim, endTrim, phraseContainer, selectElement);
     }
 }
 
@@ -4081,18 +4081,18 @@ function addSegmentResult(segmentData) {
                 }
                 
                 // Load waveform from original exported clip (fast), not re-rendered version
-                try {
+                    try {
                     const duration = await getVideoDuration(originalClipPath);
                     if (duration && (isNaN(originalStart) || isNaN(originalEnd))) {
                         // Use exported clip duration if original data not available
                         waveformRef.setClipDuration(duration);
                     }
                     waveformRef.loadNewWaveform(originalClipPath);
-                } catch (err) {
-                    console.warn('Could not load video duration on match change:', err);
+                    } catch (err) {
+                        console.warn('Could not load video duration on match change:', err);
+                    }
                 }
-            }
-            
+                
             // Update previous selection to track original clip path
             previousOriginalClipPath = originalClipPath;
             
@@ -4113,7 +4113,7 @@ function addSegmentResult(segmentData) {
                 playVideoWithTrimInFloatingPreview(rerenderedPath, 0, 0, phraseContainer, listbox);
             } else {
                 // Fallback: play with JavaScript trimming
-                playTrimmedVideo(phraseContainer);
+        playTrimmedVideo(phraseContainer);
             }
         } else {
             console.log('Same selection - skipping reset and re-render');
@@ -4121,7 +4121,7 @@ function addSegmentResult(segmentData) {
         }
     });
     
-    // Also add click listener as fallback (but don't trigger change if already selected)
+    // Also add click listener only to trigger change when a different option is clicked
     listbox.addEventListener('click', async (event) => {
         if (event.target.tagName === 'OPTION') {
             const clickedOption = event.target;
@@ -4130,33 +4130,10 @@ function addSegmentResult(segmentData) {
             console.log('Clicked original path:', clickedOriginalPath);
             console.log('Previous original path:', previousOriginalClipPath);
             
-            // Only trigger change event if the original clip path is actually different
+            // If different selection, let change handler manage playback; otherwise do nothing to avoid double plays
             if (clickedOriginalPath !== previousOriginalClipPath) {
                 const changeEvent = new Event('change', { bubbles: true });
                 listbox.dispatchEvent(changeEvent);
-            } else {
-                // Just play the video without resetting
-                // Check if it's already re-rendered
-                const selectedOption = listbox.options[listbox.selectedIndex];
-                const isRerendered = selectedOption?.dataset?.rerendered === 'true';
-                if (isRerendered) {
-                    // Play without trimming (already trimmed)
-                    playVideoWithTrimInFloatingPreview(listbox.value, 0, 0, phraseContainer, listbox);
-                } else {
-                    // Re-render with current trim values before first playback
-                    const currentStartTrim = parseInt(startSlider.value, 10);
-                    const currentEndTrim = parseInt(endSlider.value, 10);
-                    const rerenderedPath = await rerenderClipWithNewTrims(phraseContainer, currentStartTrim, currentEndTrim);
-                    if (rerenderedPath && rerenderedPath.trim() !== '') {
-                        selectedOption.value = rerenderedPath;
-                        listbox.value = rerenderedPath;
-                        selectedOption.dataset.rerendered = 'true';
-                        // Play without trimming (already trimmed)
-                        playVideoWithTrimInFloatingPreview(rerenderedPath, 0, 0, phraseContainer, listbox);
-                    } else {
-                        playTrimmedVideo(phraseContainer);
-                    }
-                }
             }
         }
         updateFloatingPreview(phraseContainer, listbox, waveformRef, startSlider, endSlider);
@@ -4273,39 +4250,39 @@ function updateFloatingPreview(phraseContainer, listbox, waveformRef, startSlide
         floatingPreviewContainer.style.width = 'calc(100% - 32px)';
     } else {
         // Desktop positioning - get card position
-        const cardRect = phraseContainer.getBoundingClientRect();
-        const containerRect = elements.resultsContainer.getBoundingClientRect();
-        
-        // Position preview to the right of the card
-        const previewWidth = 400; // Fixed width for preview
-        const gap = 20; // Gap between card and preview
-        let left = cardRect.right + gap;
-        let top = cardRect.top;
-        
-        // Check if preview would go off screen to the right
-        if (left + previewWidth > window.innerWidth) {
-            // Position to the left instead
-            left = cardRect.left - previewWidth - gap;
-        }
-        
-        // Check if preview would go off screen to the left
-        if (left < 0) {
-            left = gap;
-        }
-        
-        // Check if preview would go off screen at the bottom
-        const previewHeight = 500; // Estimated height
-        if (top + previewHeight > window.innerHeight) {
-            top = window.innerHeight - previewHeight - gap;
-        }
-        
-        // Check if preview would go off screen at the top
-        if (top < 0) {
-            top = gap;
-        }
-        
-        floatingPreviewContainer.style.left = `${left}px`;
-        floatingPreviewContainer.style.top = `${top}px`;
+    const cardRect = phraseContainer.getBoundingClientRect();
+    const containerRect = elements.resultsContainer.getBoundingClientRect();
+    
+    // Position preview to the right of the card
+    const previewWidth = 400; // Fixed width for preview
+    const gap = 20; // Gap between card and preview
+    let left = cardRect.right + gap;
+    let top = cardRect.top;
+    
+    // Check if preview would go off screen to the right
+    if (left + previewWidth > window.innerWidth) {
+        // Position to the left instead
+        left = cardRect.left - previewWidth - gap;
+    }
+    
+    // Check if preview would go off screen to the left
+    if (left < 0) {
+        left = gap;
+    }
+    
+    // Check if preview would go off screen at the bottom
+    const previewHeight = 500; // Estimated height
+    if (top + previewHeight > window.innerHeight) {
+        top = window.innerHeight - previewHeight - gap;
+    }
+    
+    // Check if preview would go off screen at the top
+    if (top < 0) {
+        top = gap;
+    }
+    
+    floatingPreviewContainer.style.left = `${left}px`;
+    floatingPreviewContainer.style.top = `${top}px`;
         floatingPreviewContainer.style.right = 'auto';
         floatingPreviewContainer.style.width = '400px';
     }
@@ -4356,13 +4333,13 @@ function updateFloatingPreview(phraseContainer, listbox, waveformRef, startSlide
         previewTitle.innerHTML = titleHtml;
     }
     
-    // Update video (but don't auto-play, let user control it)
-    if (previewVideo) {
-        const videoUrl = getVideoUrl(selectedVideo);
-        if (previewVideo.src !== videoUrl) {
-            previewVideo.src = videoUrl;
-        }
-    }
+    //Update video (but don't auto-play, let user control it)
+    // if (previewVideo) {
+    //     const videoUrl = getVideoUrl(selectedVideo);
+    //     if (previewVideo.src !== videoUrl) {
+    //         previewVideo.src = videoUrl;
+    //     }
+    // }
     
     // Store reference to current selected card
     currentSelectedCard = phraseContainer;
@@ -4610,6 +4587,11 @@ function updateDropdowns(data) {
             const selectedVideo = listbox.value;
             const selectedOption = listbox.options[listbox.selectedIndex];
 
+            // New re-render flow handles playback; skip legacy behavior to avoid double play
+            if (selectedOption?.dataset?.originalClipPath) {
+                return;
+            }
+
             // Default trims
             let startTrimMs = 450;
             let endTrimMs = 450;
@@ -4676,6 +4658,11 @@ function updateDropdowns(data) {
             }
         });
         listbox.addEventListener('click', () => {
+            // New re-render flow handles playback; skip legacy behavior to avoid double play
+            const selectedOption = listbox.options[listbox.selectedIndex];
+            if (selectedOption?.dataset?.originalClipPath) {
+                return;
+            }
             playTrimmedVideo(phraseContainer);
             updateFloatingPreview(phraseContainer, listbox, waveformRef, startSlider, endSlider);
         });
@@ -6425,7 +6412,7 @@ function setTimelineTrimValue(entryId, field, value) {
         // For file paths and boolean flags, use the value as-is
         safeValue = value;
     } else {
-        const parsedValue = Number.parseInt(value, 10);
+    const parsedValue = Number.parseInt(value, 10);
         safeValue = Number.isFinite(parsedValue) && parsedValue >= 0 ? parsedValue : 0;
     }
     updateProjectData(data => {
@@ -6992,7 +6979,7 @@ function playTimelineItem(itemId) {
     } else {
         // Play with trimming logic
         console.log(`[Timeline] Playing with trims: ${entry.file}, start=${entry.startTrim || 0}ms, end=${entry.endTrim || 0}ms`);
-        playVideoWithTrim(entry.file, entry.startTrim || 0, entry.endTrim || 0, false, speed);
+    playVideoWithTrim(entry.file, entry.startTrim || 0, entry.endTrim || 0, false, speed);
     }
 }
 
@@ -7062,7 +7049,7 @@ function playTimeline() {
         } else {
             // Play with trimming logic
             console.log(`[Timeline] Playing with trims in sequence: ${entry.file}, start=${entry.startTrim || 0}ms, end=${entry.endTrim || 0}ms`);
-            playVideoWithTrim(entry.file, entry.startTrim || 0, entry.endTrim || 0, false, speed);
+        playVideoWithTrim(entry.file, entry.startTrim || 0, entry.endTrim || 0, false, speed);
         }
     };
 
@@ -7126,8 +7113,8 @@ function mergeTimeline() {
         // If the video is already re-rendered with trims, don't apply trims again
         const isRerendered = entry.rerendered === true;
         const videoData = {
-            title: (entry.phrase || 'Clip').replace(/\s+/g, '_'),
-            video: entry.file,
+        title: (entry.phrase || 'Clip').replace(/\s+/g, '_'),
+        video: entry.file,
             startTrim: isRerendered ? 0 : (parseInt(entry.startTrim, 10) || 0),
             endTrim: isRerendered ? 0 : (parseInt(entry.endTrim, 10) || 0),
             speed: entry.speed !== undefined ? entry.speed : 1.0
