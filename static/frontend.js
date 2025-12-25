@@ -642,6 +642,7 @@ function cacheElements() {
     elements.timelinePlayButton = document.getElementById('timelinePlayButton');
     elements.timelineMergeButton = document.getElementById('timelineMergeButton');
     elements.timelineClearButton = document.getElementById('timelineClearButton');
+    elements.timelineRerenderButton = document.getElementById('timelineRerenderButton');
     elements.loopMergedVideo = document.getElementById('loopMergedVideo');
     elements.resultsContainer = document.getElementById('resultsContainer');
     elements.videoPlayer = document.getElementById('videoPlayer');
@@ -958,6 +959,10 @@ function bindEventListeners() {
 
     if (elements.timelineClearButton) {
         elements.timelineClearButton.addEventListener('click', clearTimeline);
+    }
+
+    if (elements.timelineRerenderButton) {
+        elements.timelineRerenderButton.addEventListener('click', rerenderAllTimelineVideos);
     }
 
     if (elements.timelineList) {
@@ -1685,9 +1690,6 @@ function handleRemoveFiles() {
         data.selectedFiles = current.filter(file => !removeSet.has(file));
     });
     renderFilePickers();
-    resetCorpusState();
-    // Automatically reload corpus with updated file list
-    handleLoadSentences();
 }
 
 function handleClearFiles() {
@@ -5918,6 +5920,11 @@ function buildTimelineEntryFromContainer(container) {
     const originalEnd = selectedOption?.dataset?.originalEnd ? parseFloat(selectedOption.dataset.originalEnd) : null;
     const sourceVideo = selectedOption?.title || '';
     
+    // Check if this is a silence entry
+    const silenceStart = selectedOption?.dataset?.silenceStart ? parseFloat(selectedOption.dataset.silenceStart) : null;
+    const silenceEnd = selectedOption?.dataset?.silenceEnd ? parseFloat(selectedOption.dataset.silenceEnd) : null;
+    const isSilenceEntry = silenceStart !== null && silenceEnd !== null;
+    
     // Get trim values from sliders
     let startTrim = startSlider ? parseInt(startSlider.value, 10) || 0 : 0;
     let endTrim = endSlider ? parseInt(endSlider.value, 10) || 0 : 0;
@@ -5949,6 +5956,7 @@ function buildTimelineEntryFromContainer(container) {
         datasetFlag: selectedOption?.dataset?.rerendered,
         containsTemp: fileValue.includes('temp/'),
         containsTrimmed: fileValue.includes('_trimmed_'),
+        isSilenceEntry: isSilenceEntry,
         isRerendered: isRerendered
     });
     
@@ -5958,8 +5966,9 @@ function buildTimelineEntryFromContainer(container) {
     
     // For re-rendered videos, use 0 for playback but preserve original trims for display
     // For non-re-rendered videos, keep the trim values for processing during merge
-    if (isRerendered) {
-        console.log(`[Timeline] Video is re-rendered, setting trims to 0: ${fileValue}`);
+    // For silence entries, use 0 trims since they're already precise clips
+    if (isRerendered || isSilenceEntry) {
+        console.log(`[Timeline] Video is ${isRerendered ? 're-rendered' : 'silence entry'}, setting trims to 0: ${fileValue}`);
         startTrim = 0;
         endTrim = 0;
     } else {
@@ -5978,7 +5987,11 @@ function buildTimelineEntryFromContainer(container) {
         originalClipPath: originalClipPath,
         originalStart: originalStart,
         originalEnd: originalEnd,
-        sourceVideo: sourceVideo
+        sourceVideo: sourceVideo,
+        // Add silence-specific data
+        silenceStart: silenceStart,
+        silenceEnd: silenceEnd,
+        isSilenceEntry: isSilenceEntry
     };
 }
 
@@ -6002,7 +6015,11 @@ function createTimelineEntry(baseEntry) {
         originalClipPath: baseEntry.originalClipPath || baseEntry.file,
         originalStart: baseEntry.originalStart,
         originalEnd: baseEntry.originalEnd,
-        sourceVideo: baseEntry.sourceVideo || ''
+        sourceVideo: baseEntry.sourceVideo || '',
+        // Preserve silence-specific data
+        silenceStart: baseEntry.silenceStart,
+        silenceEnd: baseEntry.silenceEnd,
+        isSilenceEntry: baseEntry.isSilenceEntry || false
     };
 }
 
@@ -7456,4 +7473,204 @@ function clearTimeline() {
     updateTimeline(entries => {
         entries.length = 0;
     });
+}
+
+async function rerenderAllTimelineVideos() {
+    if (!activeProject) {
+        console.warn('[Timeline] No active project for re-rendering');
+        return;
+    }
+    
+    const entries = getTimelineEntries();
+    if (!entries.length) {
+        console.warn('[Timeline] No timeline entries to re-render');
+        return;
+    }
+    
+    console.log(`[Timeline] Starting re-render of ${entries.length} timeline videos`);
+    
+    // Disable button during re-rendering
+    if (elements.timelineRerenderButton) {
+        elements.timelineRerenderButton.disabled = true;
+        elements.timelineRerenderButton.textContent = 'Re-rendering...';
+    }
+    
+    let successCount = 0;
+    let failCount = 0;
+    
+    for (let i = 0; i < entries.length; i++) {
+        const entry = entries[i];
+        
+        try {
+            console.log(`[Timeline] Checking entry ${i+1}/${entries.length}: ${entry.phrase}`);
+            
+            // Check if video file exists
+            const videoPath = entry.file;
+            if (!videoPath) {
+                console.warn(`[Timeline] Entry ${i+1} has no file path, skipping`);
+                failCount++;
+                continue;
+            }
+            
+            // Check if file exists (this will fail for deleted temp files)
+            try {
+                const response = await fetch(videoPath, { method: 'HEAD' });
+                if (!response.ok) {
+                    throw new Error('File not found');
+                }
+                // File exists, no re-rendering needed
+                successCount++;
+                console.log(`[Timeline] Entry ${i+1} file exists, skipping: ${videoPath}`);
+            } catch (err) {
+                console.log(`[Timeline] Entry ${i+1} file missing, re-rendering needed: ${videoPath}`);
+                
+                // Re-render the video if we have original data
+                if (entry.originalClipPath && entry.sourceVideo && 
+                    entry.originalStart != null && entry.originalEnd != null) {
+                    
+                    const rerenderedPath = await rerenderTimelineClip(
+                        entry, 
+                        entry.displayStartTrim || 450, 
+                        entry.displayEndTrim || 450
+                    );
+                    
+                    if (rerenderedPath && rerenderedPath.trim() !== '') {
+                        console.log(`[Timeline] Successfully re-rendered entry ${i+1}: ${rerenderedPath}`);
+                        
+                        // Update entry with new path
+                        entry.file = rerenderedPath;
+                        entry.rerendered = true;
+                        entry.startTrim = 0;
+                        entry.endTrim = 0;
+                        
+                        // Update project data
+                        setTimelineTrimValue(entry.id, 'file', rerenderedPath);
+                        setTimelineTrimValue(entry.id, 'rerendered', true);
+                        setTimelineTrimValue(entry.id, 'startTrim', 0);
+                        setTimelineTrimValue(entry.id, 'endTrim', 0);
+                        
+                        successCount++;
+                    } else {
+                        console.error(`[Timeline] Failed to re-render entry ${i+1}`);
+                        failCount++;
+                    }
+                } else {
+                    console.warn(`[Timeline] Entry ${i+1} missing original data, cannot re-render`);
+                    failCount++;
+                }
+            }
+        } catch (err) {
+            console.error(`[Timeline] Error re-rendering entry ${i+1}:`, err);
+            failCount++;
+        }
+    }
+    
+    // Re-render timeline to show updated paths
+    renderTimeline();
+    
+    // First, ensure all original files exist by re-rendering them if needed
+    console.log('[Timeline] Ensuring original files exist for waveform generation...');
+    for (let i = 0; i < entries.length; i++) {
+        const entry = entries[i];
+        if (entry.originalClipPath) {
+            try {
+                const response = await fetch(entry.originalClipPath, { method: 'HEAD' });
+                if (!response.ok) {
+                    console.log(`[Timeline] Original file missing, re-rendering first: ${entry.originalClipPath}`);
+                    
+                    // Re-render the original file (without trims) to restore it
+                    const rerenderedPath = await rerenderTimelineClip(entry, 0, 0);
+                    if (rerenderedPath && rerenderedPath.trim() !== '') {
+                        console.log(`[Timeline] Restored original file: ${rerenderedPath}`);
+                        // Update the original clip path to the restored file
+                        entry.originalClipPath = rerenderedPath;
+                        setTimelineTrimValue(entry.id, 'originalClipPath', rerenderedPath);
+                    }
+                }
+            } catch (err) {
+                console.warn(`[Timeline] Could not check original file ${entry.originalClipPath}:`, err);
+            }
+        }
+    }
+    
+    // Rebuild waveforms for all entries to use the restored original files
+    console.log('[Timeline] Rebuilding waveforms for re-rendered videos...');
+    setTimeout(() => {
+        const timelineItems = document.querySelectorAll('.timeline-item');
+        timelineItems.forEach(item => {
+            const entryId = item.dataset.id;
+            const entry = entries.find(e => e.id === entryId);
+            if (entry && entry.originalClipPath) {
+                // Find and rebuild the waveform for this entry
+                const waveformContainer = item.querySelector('.waveform-container');
+                if (waveformContainer) {
+                    console.log(`[Timeline] Rebuilding waveform for ${entry.phrase} using original: ${entry.originalClipPath}`);
+                    // Clear existing waveform
+                    waveformContainer.innerHTML = '';
+                    
+                    // Use original untrimmed file for waveform (so trimming sliders work)
+                    // Get the current display trim values
+                    const startValue = Number.isFinite(entry.displayStartTrim) && entry.displayStartTrim >= 0 ? entry.displayStartTrim : 
+                                     (Number.isFinite(entry.startTrim) && entry.startTrim >= 0 ? entry.startTrim : 450);
+                    const endValue = Number.isFinite(entry.displayEndTrim) && entry.displayEndTrim >= 0 ? entry.displayEndTrim : 
+                                   (Number.isFinite(entry.endTrim) && entry.endTrim >= 0 ? entry.endTrim : 450);
+                    
+                    // Get original segment duration for accurate trimming
+                    let originalDurationMs = null;
+                    if (entry.originalStart != null && entry.originalEnd != null) {
+                        originalDurationMs = (entry.originalEnd - entry.originalStart) * 1000;
+                    }
+                    
+                    // Create new waveform with original untrimmed file
+                    const timelineWaveform = createWaveformVisualization(
+                        waveformContainer,
+                        startValue,
+                        endValue,
+                        originalDurationMs || TIMELINE_TRIM_MAX,
+                        (startTrim, endTrim) => {
+                            // Update entry immediately when trim values change
+                            entry.displayStartTrim = startTrim;
+                            entry.displayEndTrim = endTrim;
+                            setTimelineTrimValue(entry.id, 'displayStartTrim', startTrim);
+                            setTimelineTrimValue(entry.id, 'displayEndTrim', endTrim);
+                        },
+                        entry.originalClipPath, // Use original untrimmed file for waveform
+                        entry.speed !== undefined ? entry.speed : 1.0,
+                        async (startTrim, endTrim) => {
+                            // Re-render with new trims
+                            const rerenderedPath = await rerenderTimelineClip(entry, startTrim, endTrim);
+                            if (rerenderedPath && rerenderedPath.trim() !== '') {
+                                // Update entry with re-rendered path
+                                entry.file = rerenderedPath;
+                                entry.rerendered = true;
+                                entry.startTrim = 0;
+                                entry.endTrim = 0;
+                                // Update project data
+                                setTimelineTrimValue(entry.id, 'file', rerenderedPath);
+                                setTimelineTrimValue(entry.id, 'rerendered', true);
+                                setTimelineTrimValue(entry.id, 'startTrim', 0);
+                                setTimelineTrimValue(entry.id, 'endTrim', 0);
+                                // Play the re-rendered clip
+                                playTimelineItem(entry.id);
+                            }
+                        }
+                    );
+                }
+            }
+        });
+    }, 1000); // Increased delay to allow original files to be restored
+    
+    // Re-enable button
+    if (elements.timelineRerenderButton) {
+        elements.timelineRerenderButton.disabled = false;
+        elements.timelineRerenderButton.textContent = 'Re-render All Videos';
+    }
+    
+    console.log(`[Timeline] Re-render complete: ${successCount} successful, ${failCount} failed`);
+    
+    if (failCount > 0) {
+        alert(`Re-rendering complete. ${successCount} videos restored, ${failCount} failed. Check console for details.`);
+    } else {
+        console.log('[Timeline] All videos are available, no re-rendering needed');
+    }
 }
