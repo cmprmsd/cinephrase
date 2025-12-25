@@ -121,6 +121,21 @@ body {
     min-height: 200px;
 }
 
+.timeline-title {
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+}
+.info-icon {
+    cursor: help;
+    font-size: 0.8em;
+    opacity: 0.6;
+    transition: opacity 0.2s;
+}
+.info-icon:hover {
+    opacity: 1;
+}
+
 /* Prevent scroll anchoring during drag - stops auto-scroll when items shift */
 .timeline-list-horizontal.drag-active {
     overflow-anchor: none;

@@ -2613,11 +2613,6 @@ function createWaveformVisualization(container, initialStartTrim = 450, initialE
     
     // Mouse events on canvas (for clicking between handles)
     canvas.addEventListener('mousedown', (e) => {
-        console.log('[Waveform] Canvas mousedown fired', { 
-            target: e.target, 
-            className: e.target.className,
-            isTimeline: e.target.closest('.timeline-item') !== null
-        });
         const effectiveMax = clipDuration || maxTrim;
         const rect = canvas.getBoundingClientRect();
         const x = e.clientX - rect.left;
@@ -2625,21 +2620,14 @@ function createWaveformVisualization(container, initialStartTrim = 450, initialE
         const endHandleX = (1 - (endTrim / effectiveMax)) * rect.width; // End is from right
         
         if (Math.abs(x - startHandleX) < Math.abs(x - endHandleX)) {
-            console.log('[Waveform] Starting drag on start handle');
             startDrag(startHandle, e.clientX);
         } else {
-            console.log('[Waveform] Starting drag on end handle');
             startDrag(endHandle, e.clientX);
         }
     });
     
     // Mouse events on selection overlay (for clicking between handles - same as canvas)
     selectionOverlay.addEventListener('mousedown', (e) => {
-        console.log('[Waveform] Selection overlay mousedown fired', { 
-            target: e.target, 
-            className: e.target.className,
-            isTimeline: e.target.closest('.timeline-item') !== null
-        });
         const effectiveMax = clipDuration || maxTrim;
         const rect = canvas.getBoundingClientRect(); // Use canvas rect for consistent positioning
         const x = e.clientX - rect.left;
@@ -2647,10 +2635,8 @@ function createWaveformVisualization(container, initialStartTrim = 450, initialE
         const endHandleX = (1 - (endTrim / effectiveMax)) * rect.width; // End is from right
         
         if (Math.abs(x - startHandleX) < Math.abs(x - endHandleX)) {
-            console.log('[Waveform] Selection: Starting drag on start handle');
             startDrag(startHandle, e.clientX);
         } else {
-            console.log('[Waveform] Selection: Starting drag on end handle');
             startDrag(endHandle, e.clientX);
         }
     });
@@ -6041,21 +6027,12 @@ function registerTimelineItemDrag(item, entry) {
     const waveformContainer = item.querySelector('.waveform-container');
     if (waveformContainer) {
         waveformContainer.addEventListener('mousedown', event => {
-            console.log('[Timeline] Waveform container mousedown', { 
-                target: event.target, 
-                className: event.target.className,
-                isCanvas: event.target === waveformContainer.querySelector('canvas'),
-                isSelection: event.target === waveformContainer.querySelector('.waveform-selection')
-            });
             // Allow propagation for canvas and waveform-selection clicks (to enable blue area resizing)
             const isCanvasClick = event.target === waveformContainer.querySelector('canvas');
             const isSelectionClick = event.target === waveformContainer.querySelector('.waveform-selection');
             
             if (!isCanvasClick && !isSelectionClick) {
-                console.log('[Timeline] Stopping propagation (not canvas or selection)');
                 event.stopPropagation();
-            } else {
-                console.log('[Timeline] Allowing propagation (canvas or selection click)');
             }
             item.setAttribute('draggable', 'false');
         });
@@ -6579,8 +6556,52 @@ function renderTimeline(entriesParam) {
         const meta = document.createElement('div');
         meta.className = 'timeline-meta';
 
-        const title = document.createElement('strong');
-        title.textContent = entry.phrase || `Clip ${index + 1}`;
+        const title = document.createElement('div');
+        title.className = 'timeline-title';
+        title.style.display = 'flex';
+        title.style.alignItems = 'center';
+        title.style.gap = '6px';
+        const titleText = document.createElement('strong');
+        titleText.textContent = entry.phrase || `Clip ${index + 1}`;
+        title.appendChild(titleText);
+        // Add info icon with tooltip
+        if (entry.file) {
+            const infoIcon = document.createElement('span');
+            infoIcon.className = 'info-icon';
+            infoIcon.title = `Original Source: ${entry.sourceVideo || entry.originalSource || 'Unknown'}\n` +
+                `Current Clip: ${entry.file}\n` +
+                `Start: ${entry.originalStart?.toFixed(2) || '0.00'}s\n` +
+                `End: ${entry.originalEnd?.toFixed(2) || 'N/A'}s`;
+            infoIcon.textContent = 'ⓘ';
+            infoIcon.style.cursor = 'pointer';
+            infoIcon.style.fontSize = '0.8em';
+            infoIcon.style.opacity = '0.6';
+            infoIcon.addEventListener('click', async (e) => {
+                e.stopPropagation();
+                const sourcePath = entry.sourceVideo || entry.originalSource || 'Unknown';
+                if (sourcePath !== 'Unknown') {
+                    try {
+                        await navigator.clipboard.writeText(sourcePath);
+                        // Visual feedback
+                        infoIcon.style.opacity = '1';
+                        infoIcon.style.backgroundColor = '#4CAF50';
+                        infoIcon.style.color = 'white';
+                        infoIcon.style.padding = '2px 4px';
+                        infoIcon.style.borderRadius = '3px';
+                        setTimeout(() => {
+                            infoIcon.style.opacity = '0.6';
+                            infoIcon.style.backgroundColor = '';
+                            infoIcon.style.color = '';
+                            infoIcon.style.padding = '';
+                            infoIcon.style.borderRadius = '';
+                        }, 1000);
+                    } catch (err) {
+                        console.error('Failed to copy to clipboard:', err);
+                    }
+                }
+            });
+            title.appendChild(infoIcon);
+        }
         meta.appendChild(title);
 
         body.appendChild(meta);

@@ -2051,9 +2051,12 @@ def merge_videos_with_progress(videos, output_path):
         '-c:a', 'aac',
         '-ac', '2',  # Force stereo output (fixes mono and 5.1 issues)
         '-b:a', '192k',  # Higher audio bitrate for quality
-        '-vsync', 'cfr',  # Constant frame rate for all segments
-        '-r', '30',  # 30fps for smoother playback
+        '-fps_mode', 'vfr',  # Variable frame rate to avoid frozen frames at segment boundaries
         '-pix_fmt', 'yuv420p',  # Ensure compatible pixel format
+        # Avoid frame duplication at segment boundaries
+        '-avoid_negative_ts', 'make_zero',
+        # Ensure smooth transitions without frame duplication
+        '-movflags', '+faststart'
     ])
     
     # Add video encoder (GPU or CPU) with high quality settings
