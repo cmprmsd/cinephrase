@@ -6072,10 +6072,31 @@ function registerTimelineItemDrag(item, entry) {
         });
     }
     
+    // Find move controls and prevent drag initiation from them
+    const moveControls = item.querySelector('.timeline-move-controls');
+    if (moveControls) {
+        moveControls.addEventListener('mousedown', event => {
+            event.stopPropagation();
+            item.setAttribute('draggable', 'false');
+        });
+        moveControls.addEventListener('mouseup', () => {
+            item.setAttribute('draggable', 'true');
+        });
+        moveControls.addEventListener('click', event => {
+            event.stopPropagation();
+            item.setAttribute('draggable', 'false');
+            // Re-enable draggable after a short delay to allow move functionality
+            setTimeout(() => {
+                item.setAttribute('draggable', 'true');
+            }, 100);
+        });
+    }
+    
     item.addEventListener('dragstart', event => {
-        // Check if we're trying to drag from a waveform element
+        // Check if we're trying to drag from a waveform element or move controls
         const isWaveform = event.target.closest('.waveform-container');
-        if (isWaveform) {
+        const isMoveControls = event.target.closest('.timeline-move-controls');
+        if (isWaveform || isMoveControls) {
             event.preventDefault();
             return false;
         }
@@ -6581,6 +6602,44 @@ function renderTimeline(entriesParam) {
         indexBadge.className = 'timeline-index';
         indexBadge.textContent = String(index + 1);
 
+        // Add move up/down buttons for mobile reordering
+        const moveControls = document.createElement('div');
+        moveControls.className = 'timeline-move-controls';
+        moveControls.draggable = false;
+        
+        const moveUpBtn = document.createElement('button');
+        moveUpBtn.className = 'timeline-move-btn timeline-move-up';
+        moveUpBtn.innerHTML = '↑';
+        moveUpBtn.title = 'Move up';
+        moveUpBtn.draggable = false;
+        moveUpBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            e.preventDefault();
+            moveTimelineItem(entry.id, 'up');
+        });
+        
+        const moveDownBtn = document.createElement('button');
+        moveDownBtn.className = 'timeline-move-btn timeline-move-down';
+        moveDownBtn.innerHTML = '↓';
+        moveDownBtn.title = 'Move down';
+        moveDownBtn.draggable = false;
+        moveDownBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            e.preventDefault();
+            moveTimelineItem(entry.id, 'down');
+        });
+        
+        // Disable up button for first item, down button for last item
+        if (index === 0) {
+            moveUpBtn.disabled = true;
+        }
+        if (index === entries.length - 1) {
+            moveDownBtn.disabled = true;
+        }
+        
+        moveControls.appendChild(moveUpBtn);
+        moveControls.appendChild(moveDownBtn);
+
         const body = document.createElement('div');
         body.className = 'timeline-body';
 
@@ -6870,6 +6929,7 @@ function renderTimeline(entriesParam) {
         actions.appendChild(buttonRow);
 
         item.appendChild(indexBadge);
+        item.appendChild(moveControls);
         item.appendChild(body);
         item.appendChild(actions);
         item.dataset.index = String(index);
@@ -7473,6 +7533,45 @@ function clearTimeline() {
     updateTimeline(entries => {
         entries.length = 0;
     });
+}
+
+function moveTimelineItem(entryId, direction) {
+    if (!activeProject) {
+        return;
+    }
+    
+    const entries = getTimelineEntries();
+    const currentIndex = entries.findIndex(entry => entry.id === entryId);
+    
+    if (currentIndex === -1) {
+        console.warn(`[Timeline] Entry ${entryId} not found for moving`);
+        return;
+    }
+    
+    let newIndex = currentIndex;
+    if (direction === 'up' && currentIndex > 0) {
+        newIndex = currentIndex - 1;
+    } else if (direction === 'down' && currentIndex < entries.length - 1) {
+        newIndex = currentIndex + 1;
+    } else {
+        // Can't move in this direction
+        return;
+    }
+    
+    // Swap the entries
+    const newEntries = [...entries];
+    const [movedEntry] = newEntries.splice(currentIndex, 1);
+    newEntries.splice(newIndex, 0, movedEntry);
+    
+    // Update the timeline
+    updateTimeline(currentEntries => {
+        currentEntries.splice(0, currentEntries.length, ...newEntries);
+    });
+    
+    // Re-render to update button states
+    renderTimeline();
+    
+    console.log(`[Timeline] Moved entry ${entryId} from position ${currentIndex + 1} to ${newIndex + 1}`);
 }
 
 async function rerenderAllTimelineVideos() {

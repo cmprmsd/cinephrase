@@ -1022,6 +1022,92 @@ textarea {
     text-align: center;
 }
 
+/* Mobile timeline move controls */
+.timeline-move-controls {
+    position: absolute;
+    top: 8px;
+    right: 8px;
+    display: none;
+    flex-direction: column;
+    gap: 2px;
+    z-index: 15;
+    pointer-events: auto;
+    -webkit-user-drag: none;
+    user-select: none;
+}
+
+.timeline-move-btn {
+    width: 24px;
+    height: 24px;
+    border: none;
+    background: var(--bg-tertiary, #2a2a2a);
+    color: var(--text-secondary, #ccc);
+    border-radius: 4px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 12px;
+    font-weight: bold;
+    transition: all 0.2s ease;
+    pointer-events: auto;
+    -webkit-user-drag: none;
+    user-select: none;
+}
+
+.timeline-move-btn:hover:not(:disabled) {
+    background: var(--accent, #3fa9f5);
+    color: white;
+    transform: scale(1.1);
+}
+
+.timeline-move-btn:disabled {
+    opacity: 0.3;
+    cursor: not-allowed;
+    background: var(--bg-secondary, #1a1a1a);
+    color: var(--text-muted, #666);
+}
+
+.timeline-move-btn:active:not(:disabled) {
+    transform: scale(0.95);
+}
+
+/* Show move controls on mobile and tablet */
+@media (max-width: 1024px) {
+    .timeline-move-controls {
+        display: flex;
+    }
+}
+
+/* Hide move controls on desktop with larger screens */
+@media (min-width: 1025px) {
+    .timeline-move-controls {
+        display: none;
+    }
+}
+
+/* Extra subtle button styling for less prominent actions */
+.ghost-button.subtle {
+    opacity: 0.6;
+    font-size: 11px;
+    padding: 4px 8px;
+    border: 1px solid transparent;
+    background: transparent;
+    color: var(--text-muted, #666);
+    transition: all 0.2s ease;
+}
+
+.ghost-button.subtle:hover {
+    opacity: 0.8;
+    color: var(--text-secondary, #ccc);
+    background: var(--bg-tertiary, #2a2a2a);
+}
+
+.ghost-button.subtle:active {
+    opacity: 1;
+    transform: scale(0.98);
+}
+
 .timeline-body {
     display: flex;
     flex-direction: column;
