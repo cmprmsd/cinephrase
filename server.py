@@ -1724,38 +1724,6 @@ def process_videos(selected_files, phrases, counter, min_silence=0.0, max_silenc
     return results
 
 
-@app.route('/merge_videos', methods=['POST'])
-def merge_videos_route():
-    data = request.json
-    video_info = data['videos']
-    # 'video_info' should be a list of dictionaries with 'video', 'startTrim', and 'endTrim'
-
-    print(f"[Merge] Received {len(video_info)} videos to merge")
-    for idx, video in enumerate(video_info):
-        print(f"[Merge]   [{idx+1}] {video.get('title', 'Unknown')}: {video.get('video', 'No file')} (trim: {video.get('startTrim', 0)}ms - {video.get('endTrim', 0)}ms)")
-
-    # Generate filename: timestamp + first 5 words (to avoid "File name too long" error)
-    from datetime import datetime
-    timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M')
-    
-    # Get all titles and join them, then take first 5 words
-    all_titles = " ".join([video['title'] for video in video_info])
-    words = all_titles.split()[:5]  # Take only first 5 words
-    name_part = "_".join(words).replace(" ", "_").replace("/", "_").replace("\\", "_")
-    
-    # Limit name part length to 100 chars (additional safety)
-    if len(name_part) > 100:
-        name_part = name_part[:100]
-    
-    filename = f"{timestamp}_{name_part}.mp4"
-    output_path = os.path.join(TEMP_DIR, filename)
-
-    # Use the progress version but consume all updates
-    for _ in merge_videos_with_progress(video_info, output_path):
-        pass  # Consume all progress updates
-    return jsonify({'merged_video': os.path.join('temp', filename)})
-
-
 @app.route('/merge_videos_stream', methods=['POST'])
 def merge_videos_stream():
     """SSE endpoint that streams merge progress updates."""
@@ -1767,11 +1735,25 @@ def merge_videos_stream():
     # Generate filename
     from datetime import datetime
     timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M')
+    
+    # Get all titles and join them, then take first 5 words
     all_titles = " ".join([video['title'] for video in video_info])
-    words = all_titles.split()[:5]
-    name_part = "_".join(words).replace(" ", "_").replace("/", "_").replace("\\", "_")
+    words = all_titles.split()[:5]  # Take only first 5 words
+    name_part = "_".join(words)
+    
+    # Sanitize filename by removing/replacing problematic characters
+    import re
+    # Replace any character that's not alphanumeric, underscore, or hyphen with underscore
+    name_part = re.sub(r'[^a-zA-Z0-9_-]', '_', name_part)
+    # Replace multiple underscores with single underscore
+    name_part = re.sub(r'_+', '_', name_part)
+    # Remove leading/trailing underscores
+    name_part = name_part.strip('_')
+    
+    # Limit name part length to 100 chars (additional safety)
     if len(name_part) > 100:
         name_part = name_part[:100]
+    
     filename = f"{timestamp}_{name_part}.mp4"
     output_path = os.path.join(TEMP_DIR, filename)
     
@@ -1863,7 +1845,10 @@ def merge_videos_with_progress(videos, output_path):
         start_trim = video['startTrim'] / 1000  # Convert ms to seconds
         end_trim = video['endTrim'] / 1000
         
-        print(f"[Merge] Video {i+1}: {video_path}, start_trim={start_trim}s, end_trim={end_trim}s")
+        # Check if video is already pre-rendered (both trims are 0)
+        is_prerendered = (video['startTrim'] == 0 and video['endTrim'] == 0)
+        
+        print(f"[Merge] Video {i+1}: {video_path}, start_trim={start_trim}s, end_trim={end_trim}s, prerendered={is_prerendered}")
         
         # Yield progress update
         video_title = video.get('title', f'Video {i+1}')
@@ -1897,18 +1882,22 @@ def merge_videos_with_progress(videos, output_path):
         total_duration = float(duration_str)
 
         # Calculate the duration after applying both trims
-        # Duration = total_duration - start_trim - end_trim
-        output_duration = total_duration - start_trim - end_trim
+        # For pre-rendered videos, no trimming is applied
+        if is_prerendered:
+            output_duration = total_duration
+            print(f"[Merge] Video {i+1}: pre-rendered, using full duration={total_duration}s")
+        else:
+            # Duration = total_duration - start_trim - end_trim
+            output_duration = total_duration - start_trim - end_trim
+            print(f"[Merge] Video {i+1}: total_duration={total_duration}s, output_duration={output_duration}s")
         
-        print(f"[Merge] Video {i+1}: total_duration={total_duration}s, output_duration={output_duration}s")
-        
-        # Ensure duration is positive
-        if output_duration <= 0:
+        # Ensure duration is positive (only check for non-pre-rendered videos)
+        if not is_prerendered and output_duration <= 0:
             raise ValueError(f"Invalid trim values: start_trim={start_trim}, end_trim={end_trim}, total_duration={total_duration}")
         
         # Ensure minimum duration for proper encoding (ffmpeg needs at least ~0.1s for video)
         MIN_DURATION = 0.1
-        if output_duration < MIN_DURATION:
+        if not is_prerendered and output_duration < MIN_DURATION:
             print(f"[Merge] Warning: Video {i+1} output duration ({output_duration}s) is very short. Adjusting to minimum {MIN_DURATION}s")
             # Adjust start_trim to allow minimum duration if possible
             if total_duration >= start_trim + MIN_DURATION:
@@ -1949,12 +1938,16 @@ def merge_videos_with_progress(videos, output_path):
         # Use -t before -i to limit INPUT duration (allows speed filter to extend output)
         # Add -vsync cfr and -r to ensure consistent frame rate for short segments
         # Scale to target resolution if needed
-        trim_command = [
-            'ffmpeg', '-y',
-            '-ss', str(start_trim),
-            '-t', str(output_duration),  # Limit INPUT duration (before -i)
-            '-i', input_path,
-        ]
+        trim_command = ['ffmpeg', '-y']
+        
+        # Only add trimming parameters for non-pre-rendered videos
+        if not is_prerendered:
+            trim_command.extend([
+                '-ss', str(start_trim),
+                '-t', str(output_duration),  # Limit INPUT duration (before -i)
+            ])
+        
+        trim_command.extend(['-i', input_path])
         
         # Build video filter chain
         video_filters = []
@@ -2000,11 +1993,11 @@ def merge_videos_with_progress(videos, output_path):
         ])
         trim_result = subprocess.run(trim_command, capture_output=True, text=True)
         if trim_result.returncode != 0:
-            raise RuntimeError(f"Failed to trim video segment {i+1}: {trim_result.stderr}")
+            raise RuntimeError(f"Failed to process video segment {i+1}: {trim_result.stderr}")
         
         # Verify the output file exists and has valid video/audio
         if not os.path.exists(temp_file):
-            raise FileNotFoundError(f"Trimmed video file was not created: {temp_file}")
+            raise FileNotFoundError(f"Video file was not created: {temp_file}")
         
         # Check if file has video stream using ffprobe
         probe_command = [
@@ -2016,9 +2009,9 @@ def merge_videos_with_progress(videos, output_path):
         ]
         probe_result = subprocess.run(probe_command, capture_output=True, text=True)
         if probe_result.returncode != 0 or 'video' not in probe_result.stdout.lower():
-            raise RuntimeError(f"Trimmed video {i+1} does not contain a valid video stream. FFmpeg output: {trim_result.stderr}")
+            raise RuntimeError(f"Video {i+1} does not contain a valid video stream. FFmpeg output: {trim_result.stderr}")
         
-        print(f"[Merge] ✓ Video {i+1} trimmed successfully: {temp_file} ({output_duration}s)")
+        print(f"[Merge] ✓ Video {i+1} {'processed' if is_prerendered else 'trimmed'} successfully: {temp_file} ({output_duration}s)")
         
         # Yield progress after each video is processed
         yield {

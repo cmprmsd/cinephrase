@@ -3750,9 +3750,30 @@ async function rerenderClipWithNewTrims(phraseContainer, startTrimMs, endTrimMs)
     }
 }
 
-async function playTrimmedVideo(phraseContainer) {
+async function playVideoFile(filePath, startTrim = 0, endTrim = 0, shouldLoop = false, playbackRate = 1.0) {
+    if (!elements.videoPlayer) {
+        console.warn('playVideoFile: video player not found');
+        return;
+    }
+    
+    // Check if this is a re-rendered video (contains "_trimmed_" in filename)
+    const isRerendered = filePath && filePath.includes('_trimmed_');
+    
+    if (isRerendered) {
+        // Play re-rendered video directly without trimming
+        console.log(`[playVideoFile] Playing re-rendered video: ${filePath}`);
+        playVideoWithTrim(filePath, 0, 0, shouldLoop, playbackRate);
+    } else {
+        // For non-re-rendered videos, we need to create a temporary container structure
+        // or use the existing playVideoWithTrim function
+        console.log(`[playVideoFile] Playing video with trims: ${filePath}, start=${startTrim}ms, end=${endTrim}ms`);
+        playVideoWithTrim(filePath, startTrim, endTrim, shouldLoop, playbackRate);
+    }
+}
+
+async function playVideo(phraseContainer) {
     if (!phraseContainer) {
-        console.warn('playTrimmedVideo: no container provided');
+        console.warn('playVideo: no container provided');
         return;
     }
     
@@ -3761,7 +3782,7 @@ async function playTrimmedVideo(phraseContainer) {
     const endSlider = phraseContainer.querySelector('.end-trim-slider');
     
     if (!selectElement || !startSlider || !endSlider) {
-        console.error('playTrimmedVideo: missing required elements', {
+        console.error('playVideo: missing required elements', {
             hasSelect: !!selectElement,
             hasStartSlider: !!startSlider,
             hasEndSlider: !!endSlider
@@ -3773,32 +3794,28 @@ async function playTrimmedVideo(phraseContainer) {
     const startTrim = parseInt(startSlider.value, 10);
     const endTrim = parseInt(endSlider.value, 10);
     
-    console.log('playTrimmedVideo:', { selectedVideo, startTrim, endTrim });
+    console.log('playVideo:', { selectedVideo, startTrim, endTrim });
     
-    // Check if this clip is already re-rendered
+    // Check if this video is already re-rendered
     const selectedOption = selectElement.options[selectElement.selectedIndex];
-    const isRerendered = selectedOption?.dataset?.rerendered === 'true';
+    const isRerendered = selectedOption?.dataset?.rerendered === 'true' || selectedVideo.includes('_trimmed_');
     
-    if (!isRerendered) {
-        // Re-render with current trim values before first playback
+    if (!isRerendered && (startTrim > 0 || endTrim > 0)) {
+        // Re-render the video with current trim values
+        console.log('playVideo: re-rendering with trims', { startTrim, endTrim });
         const rerenderedPath = await rerenderClipWithNewTrims(phraseContainer, startTrim, endTrim);
         if (rerenderedPath && rerenderedPath.trim() !== '') {
-            selectedOption.value = rerenderedPath;
-            selectElement.value = rerenderedPath;
+            // Update the option to mark as re-rendered
             selectedOption.dataset.rerendered = 'true';
-            // Play without trimming (already trimmed)
+            selectedOption.value = rerenderedPath;
+            // Play the re-rendered video without trimming
             playVideoWithTrimInFloatingPreview(rerenderedPath, 0, 0, phraseContainer, selectElement);
             return;
         }
     }
     
-    // If already re-rendered, play without trimming (clip is already trimmed)
-    if (isRerendered) {
-        playVideoWithTrimInFloatingPreview(selectedVideo, 0, 0, phraseContainer, selectElement);
-    } else {
-        // If re-render failed, fallback to JavaScript trimming
-    //playVideoWithTrimInFloatingPreview(selectedVideo, startTrim, endTrim, phraseContainer, selectElement);
-    }
+    // Play the video (either already re-rendered or no trims needed)
+    playVideoWithTrimInFloatingPreview(selectedVideo, 0, 0, phraseContainer, selectElement);
 }
 
 function playAllVideos() {
@@ -3811,7 +3828,7 @@ function playAllVideos() {
 
     function playNextVideo() {
         if (currentIndex < containers.length) {
-            playTrimmedVideo(containers[currentIndex]);
+            playVideo(containers[currentIndex]);
             currentIndex += 1;
         } else {
             elements.videoPlayer.onpause = null;
@@ -4026,7 +4043,7 @@ function addSegmentResult(segmentData) {
             } else {
                 // Fallback: play with JavaScript trimming if re-render failed
                 console.warn('Re-render failed or returned empty path, falling back to JavaScript trimming');
-                playTrimmedVideo(phraseContainer);
+                playVideo(phraseContainer);
             }
         }
     );
@@ -4058,52 +4075,75 @@ function addSegmentResult(segmentData) {
         // Update floating preview when selection changes
         updateFloatingPreview(phraseContainer, listbox, waveformRef, startSlider, endSlider);
         
-        // Only reset and reload if the original clip path actually changed
-        if (originalClipPath !== previousOriginalClipPath) {
-            console.log('Selection changed - resetting trim and loading new video');
-            
-            // Reset trim values to default when match changes
-            startSlider.value = '450';
-            endSlider.value = '450';
-            
-            if (waveformRef) {
-                console.log('Updating waveform for new selection...');
-                waveformRef.updateTrim(450, 450);
+        // Always allow playback - let the smart re-rendering logic handle efficiency
+        console.log('Processing selection for playback');
+        
+        // Reset trim values to default when match changes
+        startSlider.value = '450';
+        endSlider.value = '450';
+        
+        if (waveformRef) {
+            console.log('Updating waveform for new selection...');
+            waveformRef.updateTrim(450, 450);
                 
                 // Get original source video and segment boundaries for trim calculations
-                const originalStart = parseFloat(selectedOption?.dataset?.originalStart);
-                const originalEnd = parseFloat(selectedOption?.dataset?.originalEnd);
-                
-                if (!isNaN(originalStart) && !isNaN(originalEnd)) {
-                    // Calculate original segment duration for accurate trim calculations
-                    const originalDurationMs = (originalEnd - originalStart) * 1000;
-                    waveformRef.setClipDuration(originalDurationMs);
-                }
-                
-                // Load waveform from original exported clip (fast), not re-rendered version
-                    try {
-                    const duration = await getVideoDuration(originalClipPath);
-                    if (duration && (isNaN(originalStart) || isNaN(originalEnd))) {
-                        // Use exported clip duration if original data not available
-                        waveformRef.setClipDuration(duration);
-                    }
-                    waveformRef.loadNewWaveform(originalClipPath);
-                    } catch (err) {
-                        console.warn('Could not load video duration on match change:', err);
-                    }
-                }
-                
-            // Update previous selection to track original clip path
-            previousOriginalClipPath = originalClipPath;
+            const originalStart = parseFloat(selectedOption?.dataset?.originalStart);
+            const originalEnd = parseFloat(selectedOption?.dataset?.originalEnd);
             
-            // Re-render and play the selected match on first selection
-            // This ensures the clip is rendered with current trim values before first playback
-            console.log('Re-rendering and playing selected match...');
-            const currentStartTrim = parseInt(startSlider.value, 10);
-            const currentEndTrim = parseInt(endSlider.value, 10);
+            if (!isNaN(originalStart) && !isNaN(originalEnd)) {
+                // Calculate original segment duration for accurate trim calculations
+                const originalDurationMs = (originalEnd - originalStart) * 1000;
+                waveformRef.setClipDuration(originalDurationMs);
+            }
+            
+            // Load waveform from original exported clip (fast), not re-rendered version
+            try {
+                const duration = await getVideoDuration(originalClipPath);
+                if (duration && (isNaN(originalStart) || isNaN(originalEnd))) {
+                    // Use exported clip duration if original data not available
+                    waveformRef.setClipDuration(duration);
+                }
+                waveformRef.loadNewWaveform(originalClipPath);
+            } catch (err) {
+                console.warn('Could not load video duration on match change:', err);
+            }
+        }
+        
+        // Update previous selection to track original clip path
+        previousOriginalClipPath = originalClipPath;
+        
+        // Re-render and play the selected match on first selection
+        // This ensures the clip is rendered with current trim values before first playback
+        const currentStartTrim = parseInt(startSlider.value, 10);
+        const currentEndTrim = parseInt(endSlider.value, 10);
+        
+        // Check if video is already re-rendered with the exact same trim values
+        const isAlreadyRerendered = selectedOption?.dataset?.rerendered === 'true';
+        const currentVideoPath = selectedOption?.value || listbox.value;
+        
+        // Extract trim values from existing re-rendered filename if available
+        let existingStartTrim = null;
+        let existingEndTrim = null;
+        if (isAlreadyRerendered && currentVideoPath.includes('_trimmed_')) {
+            const match = currentVideoPath.match(/_trimmed_(\d+)_(\d+)\.mp4$/);
+            if (match) {
+                existingStartTrim = parseInt(match[1], 10);
+                existingEndTrim = parseInt(match[2], 10);
+            }
+        }
+        
+        // Only re-render if not already re-rendered with exact same trim values
+        if (!isAlreadyRerendered || existingStartTrim !== currentStartTrim || existingEndTrim !== currentEndTrim) {
+            console.log('Re-rendering and playing selected match...', { 
+                currentStartTrim, 
+                currentEndTrim, 
+                existingStartTrim, 
+                existingEndTrim,
+                reason: !isAlreadyRerendered ? 'not re-rendered' : 'trim values changed'
+            });
+            
             const rerenderedPath = await rerenderClipWithNewTrims(phraseContainer, currentStartTrim, currentEndTrim);
             if (rerenderedPath && rerenderedPath.trim() !== '') {
-                const selectedOption = listbox.options[listbox.selectedIndex];
                 if (selectedOption) {
                     selectedOption.value = rerenderedPath;
                     listbox.value = rerenderedPath;
@@ -4113,11 +4153,12 @@ function addSegmentResult(segmentData) {
                 playVideoWithTrimInFloatingPreview(rerenderedPath, 0, 0, phraseContainer, listbox);
             } else {
                 // Fallback: play with JavaScript trimming
-        playTrimmedVideo(phraseContainer);
+                playVideo(phraseContainer);
             }
         } else {
-            console.log('Same selection - skipping reset and re-render');
-            // Don't re-render or play again if same selection - let click handler handle it
+            console.log('Video already re-rendered with same trim values - playing directly');
+            // Play the existing re-rendered video without re-rendering
+            playVideoWithTrimInFloatingPreview(currentVideoPath, 0, 0, phraseContainer, listbox);
         }
     });
     
@@ -4130,11 +4171,12 @@ function addSegmentResult(segmentData) {
             console.log('Clicked original path:', clickedOriginalPath);
             console.log('Previous original path:', previousOriginalClipPath);
             
-            // If different selection, let change handler manage playback; otherwise do nothing to avoid double plays
-            if (clickedOriginalPath !== previousOriginalClipPath) {
-                const changeEvent = new Event('change', { bubbles: true });
-                listbox.dispatchEvent(changeEvent);
-            }
+            // If different selection, let change handler manage playback
+            // For single results, also allow playback even if same selection
+            //if (clickedOriginalPath !== previousOriginalClipPath || listbox.options.length === 1) {
+            const changeEvent = new Event('change', { bubbles: true });
+            listbox.dispatchEvent(changeEvent);
+            //}
         }
         updateFloatingPreview(phraseContainer, listbox, waveformRef, startSlider, endSlider);
     });
@@ -4167,7 +4209,7 @@ function addSegmentResult(segmentData) {
     const playButton = document.createElement('button');
     playButton.textContent = 'Play';
     playButton.classList.add('play-button');
-    playButton.addEventListener('click', () => playTrimmedVideo(phraseContainer));
+    playButton.addEventListener('click', () => playVideo(phraseContainer));
     controls.appendChild(playButton);
 
     const addButton = document.createElement('button');
@@ -4633,7 +4675,7 @@ function updateDropdowns(data) {
                     startSlider.value = String(startTrimMs);
                     endSlider.value = String(endTrimMs);
                     waveformRef.updateTrim(startTrimMs, endTrimMs);
-                    playTrimmedVideo(phraseContainer);
+                    playVideo(phraseContainer);
                     updateFloatingPreview(phraseContainer, listbox, waveformRef, startSlider, endSlider);
                 }).catch(err => {
                     console.warn('Could not load video duration on match change:', err);
@@ -4643,7 +4685,7 @@ function updateDropdowns(data) {
                     if (waveformRef) {
                         waveformRef.updateTrim(startTrimMs, endTrimMs);
                     }
-                    playTrimmedVideo(phraseContainer);
+                    playVideo(phraseContainer);
                     updateFloatingPreview(phraseContainer, listbox, waveformRef, startSlider, endSlider);
                 });
 
@@ -4653,7 +4695,7 @@ function updateDropdowns(data) {
                 // No waveform available; still keep basic behavior
                 startSlider.value = String(startTrimMs);
                 endSlider.value = String(endTrimMs);
-                playTrimmedVideo(phraseContainer);
+                playVideo(phraseContainer);
                 updateFloatingPreview(phraseContainer, listbox, waveformRef, startSlider, endSlider);
             }
         });
@@ -4663,7 +4705,7 @@ function updateDropdowns(data) {
             if (selectedOption?.dataset?.originalClipPath) {
                 return;
             }
-            playTrimmedVideo(phraseContainer);
+            playVideo(phraseContainer);
             updateFloatingPreview(phraseContainer, listbox, waveformRef, startSlider, endSlider);
         });
 
@@ -4855,7 +4897,7 @@ function updateDropdowns(data) {
                     playVideoWithTrimInFloatingPreview(newClipPath, 0, 0, phraseContainer, listbox);
                 } else {
                     // Fallback: play with JavaScript trimming if re-render failed
-                    playTrimmedVideo(phraseContainer);
+                    playVideo(phraseContainer);
                 }
             }
         );
@@ -4877,14 +4919,14 @@ function updateDropdowns(data) {
             const value = parseInt(this.value, 10);
             startSliderDisplay.textContent = `start trim ${value} ms`;
             waveform.updateTrim(value, parseInt(endSlider.value, 10));
-            playTrimmedVideo(phraseContainer);
+            playVideo(phraseContainer);
         });
 
         endSlider.addEventListener(sliderEvent, function () {
             const value = parseInt(this.value, 10);
             endSliderDisplay.textContent = `end trim ${value} ms`;
             waveform.updateTrim(parseInt(startSlider.value, 10), value);
-            playTrimmedVideo(phraseContainer);
+            playVideo(phraseContainer);
         });
         
         // On mobile, also update display during input (but don't play)
@@ -4909,7 +4951,7 @@ function updateDropdowns(data) {
         playButton.type = 'button';
         playButton.textContent = 'Play';
         playButton.classList.add('play-button');
-        playButton.addEventListener('click', () => playTrimmedVideo(phraseContainer));
+        playButton.addEventListener('click', () => playVideo(phraseContainer));
         controls.appendChild(playButton);
 
         const addToTimelineButton = document.createElement('button');
@@ -5882,12 +5924,28 @@ function buildTimelineEntryFromContainer(container) {
         }
     }
     
+    // Check if this video is already re-rendered
+    const isRerendered = selectedOption?.dataset?.rerendered === 'true' || fileValue.includes('_trimmed_');
+    
+    // Store original trim values for timeline display
+    const originalStartTrim = startTrim;
+    const originalEndTrim = endTrim;
+    
+    // For re-rendered videos, use 0 for playback but preserve original trims for display
+    if (isRerendered) {
+        startTrim = 0;
+        endTrim = 0;
+    }
+    
     return {
         phrase: phrase || 'Clip',
         file: fileValue,
         matchLabel: selectedOption ? selectedOption.text : '',
-        startTrim: startTrim,
-        endTrim: endTrim,
+        startTrim: startTrim,  // Playback trims (0 for re-rendered)
+        endTrim: endTrim,    // Playback trims (0 for re-rendered)
+        displayStartTrim: originalStartTrim,  // Original trims for display
+        displayEndTrim: originalEndTrim,      // Original trims for display
+        rerendered: isRerendered,
         originalClipPath: originalClipPath,
         originalStart: originalStart,
         originalEnd: originalEnd,
@@ -5904,10 +5962,13 @@ function createTimelineEntry(baseEntry) {
         phrase: baseEntry.phrase || 'Clip',
         file: baseEntry.file,
         matchLabel: baseEntry.matchLabel || '',
-        startTrim: parseInt(baseEntry.startTrim, 10) || 0,
-        endTrim: parseInt(baseEntry.endTrim, 10) || 0,
+        startTrim: parseInt(baseEntry.startTrim, 10) || 0,  // Playback trims
+        endTrim: parseInt(baseEntry.endTrim, 10) || 0,    // Playback trims
+        displayStartTrim: parseInt(baseEntry.displayStartTrim, 10) || parseInt(baseEntry.startTrim, 10) || 0,  // Display trims
+        displayEndTrim: parseInt(baseEntry.displayEndTrim, 10) || parseInt(baseEntry.endTrim, 10) || 0,      // Display trims
         enabled: baseEntry.enabled !== undefined ? baseEntry.enabled : true,
         addedAt: new Date().toISOString(),
+        rerendered: baseEntry.rerendered || false,
         // Store original clip path and segment boundaries for re-rendering
         originalClipPath: baseEntry.originalClipPath || baseEntry.file,
         originalStart: baseEntry.originalStart,
@@ -6483,8 +6544,10 @@ function renderTimeline(entriesParam) {
         const trimControls = document.createElement('div');
         trimControls.className = 'timeline-trim-controls';
 
-        const startValue = Number.isFinite(entry.startTrim) && entry.startTrim >= 0 ? entry.startTrim : 450;
-        const endValue = Number.isFinite(entry.endTrim) && entry.endTrim >= 0 ? entry.endTrim : 450;
+        const startValue = Number.isFinite(entry.displayStartTrim) && entry.displayStartTrim >= 0 ? entry.displayStartTrim : 
+                     (Number.isFinite(entry.startTrim) && entry.startTrim >= 0 ? entry.startTrim : 450);
+        const endValue = Number.isFinite(entry.displayEndTrim) && entry.displayEndTrim >= 0 ? entry.displayEndTrim : 
+                   (Number.isFinite(entry.endTrim) && entry.endTrim >= 0 ? entry.endTrim : 450);
 
         // Get current speed for waveform display
         const currentSpeed = entry.speed !== undefined ? entry.speed : 1.0;
@@ -6507,10 +6570,10 @@ function renderTimeline(entriesParam) {
             originalDurationMs || TIMELINE_TRIM_MAX, // Use original segment duration for accurate trimming
             (startTrim, endTrim) => {
                 // Update entry immediately when trim values change (including when duration loads and adjusts them)
-                entry.startTrim = startTrim;
-                entry.endTrim = endTrim;
-                setTimelineTrimValue(entry.id, 'startTrim', startTrim);
-                setTimelineTrimValue(entry.id, 'endTrim', endTrim);
+                entry.displayStartTrim = startTrim;
+                entry.displayEndTrim = endTrim;
+                setTimelineTrimValue(entry.id, 'displayStartTrim', startTrim);
+                setTimelineTrimValue(entry.id, 'displayEndTrim', endTrim);
                 console.log(`[Timeline] Trim values updated for entry ${entry.id}: start=${startTrim}ms, end=${endTrim}ms`);
                 // Don't autoplay during dragging - only on release
             },
@@ -6530,10 +6593,10 @@ function renderTimeline(entriesParam) {
                 });
                 
                 // Update entry and project data AFTER we've captured the values
-                entry.startTrim = currentStartTrim;
-                entry.endTrim = currentEndTrim;
-                setTimelineTrimValue(entry.id, 'startTrim', currentStartTrim);
-                setTimelineTrimValue(entry.id, 'endTrim', currentEndTrim);
+                entry.displayStartTrim = currentStartTrim;
+                entry.displayEndTrim = currentEndTrim;
+                setTimelineTrimValue(entry.id, 'displayStartTrim', currentStartTrim);
+                setTimelineTrimValue(entry.id, 'displayEndTrim', currentEndTrim);
                 
                 // Re-render clip with new trim values from original source
                 // Use the captured values, not entry values (in case entry was updated elsewhere)
@@ -6975,11 +7038,13 @@ function playTimelineItem(itemId) {
             setTimelineTrimValue(entry.id, 'endTrim', 0);
         }
         console.log(`[Timeline] Playing re-rendered clip (no trims): ${entry.file}`);
-        playVideo(entry.file, false, speed);
+        playVideoFile(entry.file, 0, 0, false, speed);
     } else {
-        // Play with trimming logic
-        console.log(`[Timeline] Playing with trims: ${entry.file}, start=${entry.startTrim || 0}ms, end=${entry.endTrim || 0}ms`);
-    playVideoWithTrim(entry.file, entry.startTrim || 0, entry.endTrim || 0, false, speed);
+        // Play with trimming logic - use display trims for non-re-rendered videos
+        const displayStartTrim = entry.displayStartTrim !== undefined ? entry.displayStartTrim : entry.startTrim;
+        const displayEndTrim = entry.displayEndTrim !== undefined ? entry.displayEndTrim : entry.endTrim;
+        console.log(`[Timeline] Playing with trims: ${entry.file}, start=${displayStartTrim || 0}ms, end=${displayEndTrim || 0}ms`);
+    playVideoFile(entry.file, displayStartTrim || 0, displayEndTrim || 0, false, speed);
     }
 }
 
@@ -7045,11 +7110,13 @@ function playTimeline() {
                 setTimelineTrimValue(entry.id, 'endTrim', 0);
             }
             console.log(`[Timeline] Playing re-rendered clip in sequence (no trims): ${entry.file}`);
-            playVideo(entry.file, false, speed);
+            playVideoFile(entry.file, 0, 0, false, speed);
         } else {
-            // Play with trimming logic
-            console.log(`[Timeline] Playing with trims in sequence: ${entry.file}, start=${entry.startTrim || 0}ms, end=${entry.endTrim || 0}ms`);
-        playVideoWithTrim(entry.file, entry.startTrim || 0, entry.endTrim || 0, false, speed);
+            // Play with trimming logic - use display trims for non-re-rendered videos
+            const displayStartTrim = entry.displayStartTrim !== undefined ? entry.displayStartTrim : entry.startTrim;
+            const displayEndTrim = entry.displayEndTrim !== undefined ? entry.displayEndTrim : entry.endTrim;
+            console.log(`[Timeline] Playing with trims in sequence: ${entry.file}, start=${displayStartTrim || 0}ms, end=${displayEndTrim || 0}ms`);
+        playVideoFile(entry.file, displayStartTrim || 0, displayEndTrim || 0, false, speed);
         }
     };
 
@@ -7063,7 +7130,7 @@ function mergeTimeline() {
     console.log(`[Merge] Total timeline entries: ${allEntries.length}`);
     
     // Filter out invalid entries and disabled entries, log any that are removed
-    const entries = allEntries.filter((entry, index) => {
+    let entries = allEntries.filter((entry, index) => {
         if (!entry) {
             console.warn(`[Merge] Entry at index ${index} is null/undefined`);
             return false;
@@ -7092,22 +7159,6 @@ function mergeTimeline() {
         endTrim: e.endTrim,
         id: e.id
     })));
-
-    // Check for duplicate files
-    const fileCounts = {};
-    entries.forEach((entry, index) => {
-        const fileKey = `${entry.file}_${entry.startTrim}_${entry.endTrim}`;
-        if (!fileCounts[fileKey]) {
-            fileCounts[fileKey] = [];
-        }
-        fileCounts[fileKey].push(index + 1);
-    });
-    
-    Object.entries(fileCounts).forEach(([fileKey, indices]) => {
-        if (indices.length > 1) {
-            console.warn(`[Merge] Duplicate entry detected at positions: ${indices.join(', ')} (file: ${fileKey})`);
-        }
-    });
 
     const videosToMerge = entries.map((entry, index) => {
         // If the video is already re-rendered with trims, don't apply trims again
@@ -7180,7 +7231,7 @@ function mergeTimeline() {
                                     if (data.merged_video) {
                                         // Get loop preference from checkbox (defaults to false if not found)
                                         const shouldLoop = elements.loopMergedVideo ? elements.loopMergedVideo.checked : false;
-                                        playVideoWithTrim(data.merged_video, 0, 0, shouldLoop);
+                                        playVideoFile(data.merged_video, 0, 0, shouldLoop);
 
                                         // Switch to viewer on mobile after merge completes
                                         if (isMobileLayout()) {
