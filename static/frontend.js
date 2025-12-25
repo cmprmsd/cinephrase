@@ -2613,6 +2613,11 @@ function createWaveformVisualization(container, initialStartTrim = 450, initialE
     
     // Mouse events on canvas (for clicking between handles)
     canvas.addEventListener('mousedown', (e) => {
+        console.log('[Waveform] Canvas mousedown fired', { 
+            target: e.target, 
+            className: e.target.className,
+            isTimeline: e.target.closest('.timeline-item') !== null
+        });
         const effectiveMax = clipDuration || maxTrim;
         const rect = canvas.getBoundingClientRect();
         const x = e.clientX - rect.left;
@@ -2620,8 +2625,32 @@ function createWaveformVisualization(container, initialStartTrim = 450, initialE
         const endHandleX = (1 - (endTrim / effectiveMax)) * rect.width; // End is from right
         
         if (Math.abs(x - startHandleX) < Math.abs(x - endHandleX)) {
+            console.log('[Waveform] Starting drag on start handle');
             startDrag(startHandle, e.clientX);
         } else {
+            console.log('[Waveform] Starting drag on end handle');
+            startDrag(endHandle, e.clientX);
+        }
+    });
+    
+    // Mouse events on selection overlay (for clicking between handles - same as canvas)
+    selectionOverlay.addEventListener('mousedown', (e) => {
+        console.log('[Waveform] Selection overlay mousedown fired', { 
+            target: e.target, 
+            className: e.target.className,
+            isTimeline: e.target.closest('.timeline-item') !== null
+        });
+        const effectiveMax = clipDuration || maxTrim;
+        const rect = canvas.getBoundingClientRect(); // Use canvas rect for consistent positioning
+        const x = e.clientX - rect.left;
+        const startHandleX = (startTrim / effectiveMax) * rect.width;
+        const endHandleX = (1 - (endTrim / effectiveMax)) * rect.width; // End is from right
+        
+        if (Math.abs(x - startHandleX) < Math.abs(x - endHandleX)) {
+            console.log('[Waveform] Selection: Starting drag on start handle');
+            startDrag(startHandle, e.clientX);
+        } else {
+            console.log('[Waveform] Selection: Starting drag on end handle');
             startDrag(endHandle, e.clientX);
         }
     });
@@ -6012,7 +6041,22 @@ function registerTimelineItemDrag(item, entry) {
     const waveformContainer = item.querySelector('.waveform-container');
     if (waveformContainer) {
         waveformContainer.addEventListener('mousedown', event => {
-            event.stopPropagation();
+            console.log('[Timeline] Waveform container mousedown', { 
+                target: event.target, 
+                className: event.target.className,
+                isCanvas: event.target === waveformContainer.querySelector('canvas'),
+                isSelection: event.target === waveformContainer.querySelector('.waveform-selection')
+            });
+            // Allow propagation for canvas and waveform-selection clicks (to enable blue area resizing)
+            const isCanvasClick = event.target === waveformContainer.querySelector('canvas');
+            const isSelectionClick = event.target === waveformContainer.querySelector('.waveform-selection');
+            
+            if (!isCanvasClick && !isSelectionClick) {
+                console.log('[Timeline] Stopping propagation (not canvas or selection)');
+                event.stopPropagation();
+            } else {
+                console.log('[Timeline] Allowing propagation (canvas or selection click)');
+            }
             item.setAttribute('draggable', 'false');
         });
         waveformContainer.addEventListener('mouseup', () => {
