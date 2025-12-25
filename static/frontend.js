@@ -5395,8 +5395,106 @@ function updateSentenceAutocomplete() {
     // prefix, but preserves the helpful injection once the user really moves
     // into a dead-end like "sicher schwimmbäder und keine".
     // Skip if we just undid an auto-semicolon (to prevent immediate re-insertion)
-    const shouldSkipAutoSemicolon = sentenceAutocompleteState.skipAutoSemicolon;
+    // Skip if we're in a multi-sentence completion context (recent tab completion with sentence-ending text)
+    const currentInputValue = elements.sentenceInput.value.trim();
+    const currentSemicolonIndex = currentInputValue.lastIndexOf(';');
+    const activeGroupCheck = currentSemicolonIndex === -1 ? currentInputValue : currentInputValue.slice(currentSemicolonIndex + 1).trim();
+    
+    console.log('[Auto-semicolon Debug] Input:', currentInputValue);
+    console.log('[Auto-semicolon Debug] Active group:', activeGroupCheck);
+    console.log('[Auto-semicolon Debug] Suggestions:', suggestions.length);
+    console.log('[Auto-semicolon Debug] Input words:', inputWords.length);
+    console.log('[Auto-semicolon Debug] Previously had prefix match:', previouslyHadPrefixMatch);
+    
+    const shouldSkipAutoSemicolon = sentenceAutocompleteState.skipAutoSemicolon || 
+                                   (activeGroupCheck.match(/[.!?]\s+[A-ZÄÖÜ]/));
+    
+    console.log('[Auto-semicolon Debug] Should skip:', shouldSkipAutoSemicolon);
+    
     sentenceAutocompleteState.skipAutoSemicolon = false; // Reset flag
+    
+    // Special handling for multi-sentence contexts: always check for next sentence suggestions
+    if (activeGroupCheck.match(/[.!?]\s+[A-ZÄÖÜ]/)) {
+        console.log('[Multi-sentence] Detected sentence continuation - checking for next sentence suggestions');
+        
+        // Extract the last sentence and look for what comes after it
+        // Find the LAST sentence boundary, not the first one
+        const splitSentences = activeGroupCheck.split(/[.!?]\s+/);
+        const sentenceEndings = [...activeGroupCheck.matchAll(/[.!?]\s+/g)];
+        
+        if (splitSentences.length > 1 && sentenceEndings.length > 0) {
+            // Get the last complete sentence and what comes after
+            const lastSentenceIndex = splitSentences.length - 2; // Second to last (last sentence)
+            const lastSentence = splitSentences[lastSentenceIndex].trim();
+            const lastSentenceEnd = sentenceEndings[sentenceEndings.length - 1][0]; // The punctuation + space
+            const nextPart = splitSentences[splitSentences.length - 1].trim(); // What's after the last sentence
+            const nextWords = nextPart.split(/\s+/);
+            
+            // Reconstruct the full last sentence with punctuation
+            const fullLastSentence = lastSentence + lastSentenceEnd.trim();
+            
+            console.log('[Multi-sentence] Multiple sentences detected');
+            console.log('[Multi-sentence] All sentences:', splitSentences);
+            console.log('[Multi-sentence] Last sentence:', fullLastSentence);
+            console.log('[Multi-sentence] Next part:', nextPart);
+            console.log('[Multi-sentence] Next words:', nextWords);
+            
+            if (nextWords.length > 0) {
+                // Look for suggestions that start with the next words
+                const nextSentenceSuggestions = [];
+                console.log('[Multi-sentence] Searching in sentences database with', sentences.length, 'entries');
+                console.log('[Multi-sentence] First 5 sentences:', sentences.slice(0, 5).map(s => s.current));
+                
+                // Search through all sentences for matches
+                for (const sentence of sentences) {
+                    const segmentNormalized = sentence.currentNormalized;
+                    const segmentWords = segmentNormalized.split(/\s+/);
+                    
+                    // Check if segment starts with the next words
+                    if (segmentWords.length >= nextWords.length) {
+                        let matches = true;
+                        for (let i = 0; i < nextWords.length; i++) {
+                            if (segmentWords[i] !== nextWords[i].toLowerCase()) {
+                                matches = false;
+                                break;
+                            }
+                        }
+                        
+                        if (matches) {
+                            nextSentenceSuggestions.push(sentence);
+                            console.log('[Multi-sentence] Found matching suggestion:', sentence.current);
+                            if (nextSentenceSuggestions.length >= 10) break; // Limit for performance
+                        }
+                    }
+                }
+                
+                console.log('[Multi-sentence] Current suggestions count:', suggestions.length);
+                console.log('[Multi-sentence] Next sentence suggestions count:', nextSentenceSuggestions.length);
+                
+                // If we have no current suggestions, use next sentence suggestions
+                if (suggestions.length === 0 && nextSentenceSuggestions.length > 0) {
+                    suggestions.push(...nextSentenceSuggestions);
+                    console.log('[Multi-sentence] Using next sentence suggestions:', nextSentenceSuggestions.length);
+                }
+                // If we have current suggestions, add next sentence suggestions for continuation
+                else if (suggestions.length > 0 && nextSentenceSuggestions.length > 0) {
+                    // Add next sentence suggestions that aren't already in suggestions
+                    for (const nextSuggestion of nextSentenceSuggestions) {
+                        if (!suggestions.some(s => s.currentNormalized === nextSuggestion.currentNormalized)) {
+                            suggestions.push(nextSuggestion);
+                            console.log('[Multi-sentence] Added suggestion:', nextSuggestion.current);
+                            if (suggestions.length >= 15) break; // Limit total
+                        }
+                    }
+                    console.log('[Multi-sentence] Added next sentence suggestions, total:', suggestions.length);
+                }
+            }
+        }
+    } else {
+        console.log('[Multi-sentence] No sentence continuation detected in:', activeGroupCheck);
+    }
+    
+    originalSuggestionsLength = suggestions.length;
     
     if (suggestions.length === 0 && inputWords.length > 1 && !previouslyHadPrefixMatch && !shouldSkipAutoSemicolon) {
         const lastWord = inputWords[inputWords.length - 1] || '';
@@ -5747,17 +5845,57 @@ function acceptNextWord() {
         }
         
         // If complete, look for segments that start with current input + space (next segment)
+        // But also check if we're in the middle of a multi-sentence segment
         if (isComplete) {
+            // First, try to find if current input is part of a longer multi-sentence segment
+            let foundContinuation = false;
+            
             for (const entry of sentenceAutocompleteState.suggestions) {
                 const segmentNormalized = entry.currentNormalized;
-                // Look for segments that start with current input followed by more words
-                if (segmentNormalized.startsWith(normalizedInput + ' ')) {
-                    const remaining = segmentNormalized.substring(normalizedInput.length + 1);
-                    const nextWord = remaining.split(/\s+/)[0];
-                    if (nextWord) {
-                        bestNextWord = nextWord;
-                        bestSegment = entry.current;
+                const segmentText = entry.current;
+                
+                // Check if current input is a prefix of a longer segment (multi-sentence)
+                if (segmentNormalized.startsWith(normalizedInput + ' ') && segmentNormalized.length > normalizedInput.length) {
+                    // Get the next word/phrase after current input
+                    const remaining = segmentText.substring(normalizedInput.length).trim();
+                    if (remaining) {
+                        // For multi-sentence segments, take more than just the next word
+                        // Take up to the next sentence boundary or reasonable chunk
+                        let nextChunk = remaining;
+                        const sentenceEnd = remaining.search(/[.!?]/);
+                        if (sentenceEnd > 0 && sentenceEnd < 50) {
+                            // Take up to first sentence ending if it's reasonable
+                            nextChunk = remaining.substring(0, sentenceEnd + 1);
+                        } else {
+                            // Otherwise take first few words (up to 3 words or 30 chars)
+                            const words = remaining.split(/\s+/);
+                            nextChunk = words.slice(0, Math.min(3, words.length)).join(' ');
+                            if (nextChunk.length < remaining.length && !nextChunk.match(/[.!?]$/)) {
+                                nextChunk += ' '; // Add space if not complete sentence
+                            }
+                        }
+                        
+                        bestNextWord = nextChunk;
+                        bestSegment = segmentText;
+                        foundContinuation = true;
                         break;
+                    }
+                }
+            }
+            
+            // If no multi-sentence continuation found, fall back to single word approach
+            if (!foundContinuation) {
+                for (const entry of sentenceAutocompleteState.suggestions) {
+                    const segmentNormalized = entry.currentNormalized;
+                    // Look for segments that start with current input followed by more words
+                    if (segmentNormalized.startsWith(normalizedInput + ' ')) {
+                        const remaining = segmentNormalized.substring(normalizedInput.length + 1);
+                        const nextWord = remaining.split(/\s+/)[0];
+                        if (nextWord) {
+                            bestNextWord = nextWord;
+                            bestSegment = entry.current;
+                            break;
+                        }
                     }
                 }
             }
