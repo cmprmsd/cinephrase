@@ -6875,7 +6875,9 @@ function handleAddAllVariantsToTimeline(container) {
             file: fileValue,
             matchLabel: option.text,
             startTrim: startTrim,
-            endTrim: endTrim
+            endTrim: endTrim,
+            displayStartTrim: startTrim,
+            displayEndTrim: endTrim
         };
         
         const timelineEntry = createTimelineEntry(baseEntry);
