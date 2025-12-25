@@ -5940,16 +5940,30 @@ function buildTimelineEntryFromContainer(container) {
     }
     
     // Check if this video is already re-rendered
-    const isRerendered = selectedOption?.dataset?.rerendered === 'true' || fileValue.includes('_trimmed_');
+    // A video is re-rendered if it has the rerendered dataset flag OR contains '_trimmed_' in filename
+    // Note: temp/ files are NOT automatically re-rendered - they could be original exported clips
+    const isRerendered = selectedOption?.dataset?.rerendered === 'true' || 
+                         fileValue.includes('_trimmed_');
+    
+    console.log(`[Timeline] Rerendered check for ${fileValue}:`, {
+        datasetFlag: selectedOption?.dataset?.rerendered,
+        containsTemp: fileValue.includes('temp/'),
+        containsTrimmed: fileValue.includes('_trimmed_'),
+        isRerendered: isRerendered
+    });
     
     // Store original trim values for timeline display
     const originalStartTrim = startTrim;
     const originalEndTrim = endTrim;
     
     // For re-rendered videos, use 0 for playback but preserve original trims for display
+    // For non-re-rendered videos, keep the trim values for processing during merge
     if (isRerendered) {
+        console.log(`[Timeline] Video is re-rendered, setting trims to 0: ${fileValue}`);
         startTrim = 0;
         endTrim = 0;
+    } else {
+        console.log(`[Timeline] Video needs re-rendering, keeping trim values: start=${startTrim}ms, end=${endTrim}ms`);
     }
     
     return {
@@ -6874,15 +6888,50 @@ async function handleAddContainerToTimeline(container) {
         return;
     }
     
-    // If duration wasn't available in dataset, try to fetch it from the video file
+    // Check if this video needs re-rendering (has trim values but not re-rendered yet)
     const select = container.querySelector('select');
     const selectedOption = select?.options[select.selectedIndex >= 0 ? select.selectedIndex : 0];
     const fileValue = baseEntry.file;
     
+    // Re-render the video if it has trim values but isn't re-rendered yet
+    console.log(`[Timeline] Checking re-rendering need:`, {
+        rerendered: baseEntry.rerendered,
+        startTrim: baseEntry.startTrim,
+        endTrim: baseEntry.endTrim,
+        shouldRerender: !baseEntry.rerendered && (baseEntry.startTrim > 0 || baseEntry.endTrim > 0)
+    });
+    
+    if (!baseEntry.rerendered && (baseEntry.startTrim > 0 || baseEntry.endTrim > 0)) {
+        console.log(`[Timeline] Re-rendering video with trims: start=${baseEntry.startTrim}ms, end=${baseEntry.endTrim}ms`);
+        
+        try {
+            const rerenderedPath = await rerenderClipWithNewTrims(container, baseEntry.startTrim, baseEntry.endTrim);
+            if (rerenderedPath && rerenderedPath.trim() !== '') {
+                console.log(`[Timeline] Successfully re-rendered: ${rerenderedPath}`);
+                // Update the base entry with the re-rendered path
+                baseEntry.file = rerenderedPath;
+                baseEntry.rerendered = true;
+                baseEntry.startTrim = 0;  // Re-rendered videos don't need trims
+                baseEntry.endTrim = 0;    // Re-rendered videos don't need trims
+                
+                // Update the select element
+                if (selectedOption) {
+                    selectedOption.value = rerenderedPath;
+                    selectedOption.dataset.rerendered = 'true';
+                }
+            } else {
+                console.warn('[Timeline] Re-rendering failed, using original file');
+            }
+        } catch (err) {
+            console.error('[Timeline] Error during re-rendering:', err);
+        }
+    }
+    
+    // If duration wasn't available in dataset, try to fetch it from the video file
     if (fileValue && !selectedOption?.dataset?.durationMs) {
         // Try to get duration from video metadata
         try {
-            const duration = await getVideoDuration(fileValue);
+            const duration = await getVideoDuration(baseEntry.file);
             if (duration && duration > 0) {
                 // Re-validate trim values with the fetched duration
                 const maxTrim = duration - 100; // Leave at least 100ms for playback
@@ -6909,10 +6958,11 @@ async function handleAddContainerToTimeline(container) {
     });
 }
 
-function handleAddAllVariantsToTimeline(container) {
+async function handleAddAllVariantsToTimeline(container) {
     if (!activeProject || !container) {
         return;
     }
+    
     const select = container.querySelector('select');
     if (!select || !select.options.length) {
         return;
@@ -6935,15 +6985,47 @@ function handleAddAllVariantsToTimeline(container) {
             continue;
         }
         
-        const baseEntry = {
-            phrase: phrase || 'Clip',
-            file: fileValue,
-            matchLabel: option.text,
-            startTrim: startTrim,
-            endTrim: endTrim,
-            displayStartTrim: startTrim,
-            displayEndTrim: endTrim
-        };
+        // Temporarily select this option to use buildTimelineEntryFromContainer
+        select.selectedIndex = i;
+        
+        // Use the same logic as handleAddContainerToTimeline
+        let baseEntry = buildTimelineEntryFromContainer(container);
+        if (!baseEntry) {
+            continue;
+        }
+        
+        // Check if this video needs re-rendering (has trim values but not re-rendered yet)
+        console.log(`[Timeline] Checking re-rendering need for variant ${i+1}:`, {
+            rerendered: baseEntry.rerendered,
+            startTrim: baseEntry.startTrim,
+            endTrim: baseEntry.endTrim,
+            shouldRerender: !baseEntry.rerendered && (baseEntry.startTrim > 0 || baseEntry.endTrim > 0)
+        });
+        
+        // Re-render the video if it has trim values but isn't re-rendered yet
+        if (!baseEntry.rerendered && (baseEntry.startTrim > 0 || baseEntry.endTrim > 0)) {
+            console.log(`[Timeline] Re-rendering variant ${i+1} with trims: start=${baseEntry.startTrim}ms, end=${baseEntry.endTrim}ms`);
+            
+            try {
+                const rerenderedPath = await rerenderClipWithNewTrims(container, baseEntry.startTrim, baseEntry.endTrim);
+                if (rerenderedPath && rerenderedPath.trim() !== '') {
+                    console.log(`[Timeline] Successfully re-rendered variant ${i+1}: ${rerenderedPath}`);
+                    // Update the base entry with the re-rendered path
+                    baseEntry.file = rerenderedPath;
+                    baseEntry.rerendered = true;
+                    baseEntry.startTrim = 0;  // Re-rendered videos don't need trims
+                    baseEntry.endTrim = 0;    // Re-rendered videos don't need trims
+                    
+                    // Update the option
+                    option.value = rerenderedPath;
+                    option.dataset.rerendered = 'true';
+                } else {
+                    console.warn(`[Timeline] Re-rendering failed for variant ${i+1}, using original file`);
+                }
+            } catch (err) {
+                console.error(`[Timeline] Error during re-rendering variant ${i+1}:`, err);
+            }
+        }
         
         const timelineEntry = createTimelineEntry(baseEntry);
         if (timelineEntry) {

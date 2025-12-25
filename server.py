@@ -1845,8 +1845,18 @@ def merge_videos_with_progress(videos, output_path):
         start_trim = video['startTrim'] / 1000  # Convert ms to seconds
         end_trim = video['endTrim'] / 1000
         
-        # Check if video is already pre-rendered (both trims are 0)
-        is_prerendered = (video['startTrim'] == 0 and video['endTrim'] == 0)
+        # Check if video is already pre-rendered (has been re-rendered with custom trims)
+        # A video is considered pre-rendered if it's in temp/ and has matching trim metadata
+        is_prerendered = False
+        if video_path.startswith('temp/'):
+            # For temp files, check if they've been re-rendered with the current trims
+            # If the file is already in temp/, it's likely been re-rendered
+            is_prerendered = True
+            print(f"[Merge] Video {i+1}: Detected as pre-rendered (temp file)")
+        else:
+            # For non-temp files, check if trims are 0 (not yet re-rendered)
+            is_prerendered = (video['startTrim'] == 0 and video['endTrim'] == 0)
+            print(f"[Merge] Video {i+1}: Checking pre-rendered status: {is_prerendered}")
         
         print(f"[Merge] Video {i+1}: {video_path}, start_trim={start_trim}s, end_trim={end_trim}s, prerendered={is_prerendered}")
         
@@ -1935,65 +1945,73 @@ def merge_videos_with_progress(videos, output_path):
         speed = max(0.5, min(1.0, speed))
         
         # Trim and re-encode video segment
-        # Use -t before -i to limit INPUT duration (allows speed filter to extend output)
-        # Add -vsync cfr and -r to ensure consistent frame rate for short segments
-        # Scale to target resolution if needed
-        trim_command = ['ffmpeg', '-y']
-        
-        # Only add trimming parameters for non-pre-rendered videos
-        if not is_prerendered:
+        # For pre-rendered videos, just copy them directly to avoid timing issues
+        if is_prerendered:
+            print(f"[Merge] Video {i+1}: Pre-rendered, copying directly without re-encoding")
+            # Just copy the file directly
+            import shutil
+            shutil.copy2(input_path, temp_file)
+        else:
+            # Use -t before -i to limit INPUT duration (allows speed filter to extend output)
+            # Add -vsync cfr and -r to ensure consistent frame rate for short segments
+            # Scale to target resolution if needed
+            trim_command = ['ffmpeg', '-y']
+            
+            # Only add trimming parameters for non-pre-rendered videos
             trim_command.extend([
                 '-ss', str(start_trim),
                 '-t', str(output_duration),  # Limit INPUT duration (before -i)
             ])
-        
-        trim_command.extend(['-i', input_path])
-        
-        # Build video filter chain
-        video_filters = []
-        audio_filters = []
-        
-        # Calculate final output duration for logging
-        final_output_duration = output_duration / speed
-        
-        # Add speed adjustment if not 1.0
-        if speed != 1.0:
-            # For video: setpts=PTS/speed (e.g., 0.5 speed -> setpts=PTS/0.5 = PTS*2)
-            video_filters.append(f'setpts=PTS/{speed}')
-            # For audio: atempo=speed (atempo accepts 0.5 to 2.0)
-            audio_filters.append(f'atempo={speed}')
-            print(f"[Merge] Video {i+1}: Applying speed={speed} ({int(speed*100)}%), input={output_duration:.2f}s -> output={final_output_duration:.2f}s")
-        
-        # Add scale filter if resolution differs from target
-        # Use crop-to-fill instead of letterboxing to avoid black bars
-        if current_width != target_width or current_height != target_height:
-            # Scale up to cover target, then crop to exact size (no black bars)
-            video_filters.append(f'scale={target_width}:{target_height}:force_original_aspect_ratio=increase,crop={target_width}:{target_height}')
-            print(f"[Merge] Video {i+1}: Scaling from {current_width}x{current_height} to {target_width}x{target_height} (crop-to-fill)")
-        
-        # Apply video filters if any
-        if video_filters:
-            trim_command.extend(['-vf', ','.join(video_filters)])
-        
-        # Apply audio filters if any
-        if audio_filters:
-            trim_command.extend(['-af', ','.join(audio_filters)])
-        
-        trim_command.extend([
-            '-c:v', 'libx264',
-            '-preset', 'medium',  # Better quality (was ultrafast)
-            '-crf', '18',  # High quality (lower = better, 18 is visually lossless)
-            '-c:a', 'aac',
-            '-ac', '2',  # Force stereo output (fixes mono and 5.1 issues)
-            '-b:a', '192k',  # Higher audio bitrate for quality
-            '-vsync', 'cfr',  # Constant frame rate
-            '-r', '30',  # 30fps for smoother playback
-            '-pix_fmt', 'yuv420p',  # Ensure compatible pixel format
-            temp_file
-        ])
-        trim_result = subprocess.run(trim_command, capture_output=True, text=True)
-        if trim_result.returncode != 0:
-            raise RuntimeError(f"Failed to process video segment {i+1}: {trim_result.stderr}")
+            
+            trim_command.extend(['-i', input_path])
+            
+            # Build video filter chain
+            video_filters = []
+            audio_filters = []
+            
+            # Calculate final output duration for logging
+            final_output_duration = output_duration / speed
+            
+            # Add speed adjustment if not 1.0
+            if speed != 1.0:
+                # For video: setpts=PTS/speed (e.g., 0.5 speed -> setpts=PTS/0.5 = PTS*2)
+                video_filters.append(f'setpts=PTS/{speed}')
+                # For audio: atempo=speed (atempo accepts 0.5 to 2.0)
+                audio_filters.append(f'atempo={speed}')
+                print(f"[Merge] Video {i+1}: Applying speed={speed} ({int(speed*100)}%), input={output_duration:.2f}s -> output={final_output_duration:.2f}s")
+            
+            # Add scale filter if resolution differs from target
+            # Use crop-to-fill instead of letterboxing to avoid black bars
+            if current_width != target_width or current_height != target_height:
+                # Scale up to cover target, then crop to exact size (no black bars)
+                video_filters.append(f'scale={target_width}:{target_height}:force_original_aspect_ratio=increase,crop={target_width}:{target_height}')
+                print(f"[Merge] Video {i+1}: Scaling from {current_width}x{current_height} to {target_width}x{target_height} (crop-to-fill)")
+            
+            # Apply video filters if any
+            if video_filters:
+                trim_command.extend(['-vf', ','.join(video_filters)])
+            
+            # Apply audio filters if any
+            if audio_filters:
+                trim_command.extend(['-af', ','.join(audio_filters)])
+            
+            trim_command.extend([
+                '-c:v', 'libx264',
+                '-preset', 'medium',  # Better quality (was ultrafast)
+                '-crf', '18',  # High quality (lower = better, 18 is visually lossless)
+                '-c:a', 'aac',
+                '-ac', '2',  # Force stereo output (fixes mono and 5.1 issues)
+                '-b:a', '192k',  # Higher audio bitrate for quality
+                '-vsync', 'cfr',  # Constant frame rate
+                '-r', '30',  # 30fps for smoother playback
+                '-pix_fmt', 'yuv420p',  # Ensure compatible pixel format
+                temp_file
+            ])
+            trim_result = subprocess.run(trim_command, capture_output=True, text=True)
+            if trim_result.returncode != 0:
+                # Clean up error message to prevent JSON parsing issues
+                clean_error = trim_result.stderr.replace('\n', ' ').replace('\r', ' ').strip()
+                raise RuntimeError(f"Failed to process video segment {i+1}: {clean_error}")
         
         # Verify the output file exists and has valid video/audio
         if not os.path.exists(temp_file):
@@ -2053,6 +2071,8 @@ def merge_videos_with_progress(videos, output_path):
         '-b:a', '192k',  # Higher audio bitrate for quality
         '-fps_mode', 'vfr',  # Variable frame rate to avoid frozen frames at segment boundaries
         '-pix_fmt', 'yuv420p',  # Ensure compatible pixel format
+        # Normalize video parameters to prevent reconfiguration errors
+        '-vf', 'format=yuv420p,scale=1920:1080:force_original_aspect_ratio=increase,crop=1920:1080',
         # Avoid frame duplication at segment boundaries
         '-avoid_negative_ts', 'make_zero',
         # Ensure smooth transitions without frame duplication
@@ -2070,7 +2090,9 @@ def merge_videos_with_progress(videos, output_path):
     merge_result = subprocess.run(merge_command, capture_output=True, text=True)
     if merge_result.returncode != 0:
         print(f"[Merge] FFmpeg merge error output: {merge_result.stderr}")
-        raise RuntimeError(f"Failed to merge videos: {merge_result.stderr}")
+        # Clean up error message to prevent JSON parsing issues
+        clean_error = merge_result.stderr.replace('\n', ' ').replace('\r', ' ').strip()
+        raise RuntimeError(f"Failed to merge videos: {clean_error}")
     
     # Verify the merged file exists and has video
     if not os.path.exists(output_path):
