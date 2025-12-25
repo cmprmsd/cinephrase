@@ -6103,44 +6103,16 @@ function registerTimelineItemDrag(item, entry) {
         
         dragState.type = 'timelineItem';
         dragState.data = { id: entry.id };
+        dragState.sourceIndex = Array.from(elements.timelineList.querySelectorAll('.timeline-item')).indexOf(item);
         item.classList.add('drag-source');
         event.dataTransfer.effectAllowed = 'move';
         event.dataTransfer.setData('text/plain', entry.id);
+        
         if (elements.timelineList) {
             elements.timelineList.classList.add('drag-active');
-            
-            // Store original positions of ALL items BEFORE any transforms are applied
-            // This is critical because getBoundingClientRect() includes transforms
-            // Store positions RELATIVE TO CONTENT (not viewport) so they're scroll-independent
-            const allItems = elements.timelineList.querySelectorAll('.timeline-item');
-            dragState.originalItemPositions = [];
-            
-            // Store initial scroll position - this is our "expected" scroll
+            // Store initial scroll position
             dragStartScrollLeft = elements.timelineList.scrollLeft;
             expectedScrollLeft = elements.timelineList.scrollLeft;
-            
-            // Clear any existing transforms first to get true original positions
-            allItems.forEach((itm) => {
-                itm.style.transform = '';
-            });
-            // Force reflow to ensure transforms are cleared
-            void elements.timelineList.offsetHeight;
-            
-            // Capture positions relative to CONTENT START (scroll-independent)
-            const containerRect = elements.timelineList.getBoundingClientRect();
-            const scrollLeft = elements.timelineList.scrollLeft;
-            
-            allItems.forEach((itm) => {
-                const rect = itm.getBoundingClientRect();
-                // Convert to content-relative positions (independent of scroll)
-                const contentLeft = rect.left - containerRect.left + scrollLeft;
-                dragState.originalItemPositions.push({
-                    contentLeft: contentLeft,
-                    contentRight: contentLeft + rect.width,
-                    width: rect.width,
-                    contentMidpoint: contentLeft + rect.width / 2
-                });
-            });
         }
     });
     item.addEventListener('dragend', () => {
@@ -6308,11 +6280,18 @@ function clearTimelineDragPreview() {
     if (!elements.timelineList) {
         return;
     }
-    const allItems = elements.timelineList.querySelectorAll('.timeline-item');
-    allItems.forEach(item => {
-        item.style.transform = '';
+    
+    // Clear all visual feedback
+    const items = elements.timelineList.querySelectorAll('.timeline-item');
+    items.forEach(item => {
         item.classList.remove('drag-over');
+        // Reset transforms with smooth transition
+        item.style.transform = '';
+        item.style.transition = 'transform 0.2s ease-out';
     });
+    
+    // Clear preview state
+    dragState.previewTargetIndex = undefined;
 }
 
 function handleTimelineDragEnter(event) {
@@ -6350,15 +6329,76 @@ function handleTimelineDragOver(event) {
     }
 }
 
-// Handle scroll during drag - PREVENT scrolling to avoid calculation issues
+// Handle scroll during drag - ALLOW scrolling but update expected position
 function handleTimelineScrollDuringDrag() {
     if (dragState.type === 'timelineItem') {
-        // Force scroll back to expected position immediately
-        // This prevents browser auto-scroll from affecting calculations
-        if (elements.timelineList.scrollLeft !== expectedScrollLeft) {
-            elements.timelineList.scrollLeft = expectedScrollLeft;
-        }
+        // Update expected scroll position to match actual scroll
+        // This allows natural scrolling while maintaining accurate calculations
+        expectedScrollLeft = elements.timelineList.scrollLeft;
+        dragStartScrollLeft = elements.timelineList.scrollLeft;
     }
+}
+
+// Simplified drag preview update with floating animation
+function updateTimelineDragPreviewByPosition(mouseX) {
+    if (!elements.timelineList || dragState.type !== 'timelineItem') {
+        return;
+    }
+    
+    const timelineRect = elements.timelineList.getBoundingClientRect();
+    const relativeX = mouseX - timelineRect.left + elements.timelineList.scrollLeft;
+    
+    // Find the closest drop position
+    const items = Array.from(elements.timelineList.querySelectorAll('.timeline-item'));
+    let closestIndex = 0;
+    let closestDistance = Infinity;
+    
+    items.forEach((item, index) => {
+        const rect = item.getBoundingClientRect();
+        const itemCenter = rect.left + rect.width / 2 - timelineRect.left + elements.timelineList.scrollLeft;
+        const distance = Math.abs(relativeX - itemCenter);
+        
+        if (distance < closestDistance) {
+            closestDistance = distance;
+            closestIndex = index;
+        }
+    });
+    
+    // Update preview target
+    dragState.previewTargetIndex = closestIndex;
+    
+    // Apply floating animation to create drop gap
+    const sourceIndex = dragState.sourceIndex;
+    items.forEach((item, index) => {
+        const itemElement = item;
+        
+        // Remove any existing transforms
+        itemElement.style.transform = '';
+        itemElement.style.transition = 'transform 0.2s ease-out';
+        
+        // Remove drag-over class from all items first
+        item.classList.remove('drag-over');
+        
+        // Apply floating effect based on drop position
+        if (index === closestIndex) {
+            item.classList.add('drag-over');
+            
+            // If source is before target, float items right to make space
+            if (sourceIndex < closestIndex) {
+                // Items at and after target float right
+                if (index >= closestIndex) {
+                    itemElement.style.transform = 'translateX(60px)';
+                }
+            } 
+            // If source is after target, float items left to make space  
+            else if (sourceIndex > closestIndex) {
+                // Items at and before target float left
+                if (index <= closestIndex) {
+                    itemElement.style.transform = 'translateX(-60px)';
+                }
+            }
+        }
+    });
 }
 
 function handleTimelineDragLeave(event) {
@@ -6398,13 +6438,13 @@ function handleTimelineDrop(event) {
         }
     } else if (dragState.type === 'timelineItem' && dragState.data) {
         const movingId = dragState.data.id;
-        if (movingId) {
+        const sourceIndex = dragState.sourceIndex;
+        if (movingId && sourceIndex !== undefined) {
             updateTimeline(entries => {
-                const fromIndex = entries.findIndex(item => item.id === movingId);
-                console.log('Moving item from index:', fromIndex, 'to index:', dropIndex);
+                console.log('Moving item from index:', sourceIndex, 'to index:', dropIndex);
                 
-                if (fromIndex === -1) {
-                    console.warn('Could not find item to move');
+                if (sourceIndex === -1 || sourceIndex >= entries.length) {
+                    console.warn('Invalid source index');
                     return;
                 }
                 
@@ -6412,16 +6452,16 @@ function handleTimelineDrop(event) {
                 let targetIndex = Math.max(0, Math.min(dropIndex, entries.length));
                 
                 // If dropping at the same position, do nothing
-                if (targetIndex === fromIndex) {
+                if (targetIndex === sourceIndex) {
                     console.log('No move needed - same position');
                     return;
                 }
                 
                 // Remove the item from its current position
-                const [item] = entries.splice(fromIndex, 1);
+                const [item] = entries.splice(sourceIndex, 1);
                 
                 // Adjust target index if we removed an item before the target
-                if (fromIndex < targetIndex) {
+                if (sourceIndex < targetIndex) {
                     targetIndex -= 1;
                 }
                 
