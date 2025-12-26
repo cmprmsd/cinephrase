@@ -2835,12 +2835,156 @@ function handleSentenceSearch() {
         return;
     }
     
+    // Get the max results per segment value
+    const maxResultsInput = document.getElementById('maxResultsPerSegment');
+    const maxResultsPerSegment = maxResultsInput ? parseInt(maxResultsInput.value, 10) : 25;
+    
+    // Function to expand wildcards by finding matching sentences
+    function expandWildcards(searchTerms) {
+        const expandedTerms = [];
+        
+        for (const term of searchTerms) {
+            // Check if term contains wildcards
+            if (term.includes('*')) {
+                const hasSingleWildcard = term.includes('*') && !term.includes('**');
+                const hasDoubleWildcard = term.includes('**');
+                
+                if (hasDoubleWildcard) {
+                    // ** matches any sequence of words (including spaces)
+                    // Check if it's wrapped (starts and ends with **)
+                    const isWrapped = term.startsWith('**') && term.endsWith('**');
+                    const hasLeading = term.startsWith('**') && !term.endsWith('**');
+                    const hasTrailing = !term.startsWith('**') && term.endsWith('**');
+                    
+                    if (isWrapped) {
+                        // **ball** - match full sentences containing "ball"
+                        const searchTerm = term.slice(2, -2); // Remove ** from both ends
+                        let pattern = searchTerm.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); // Escape special chars
+                        pattern = `.*${pattern}.*`; // Match anywhere in sentence
+                        const regex = new RegExp(pattern, 'i');
+                        
+                        const matchingSentences = sentences
+                            .filter(s => s.current && regex.test(s.current))
+                            .map(s => s.current)
+                            .slice(0, maxResultsPerSegment);
+                        
+                        if (matchingSentences.length > 0) {
+                            expandedTerms.push(...matchingSentences);
+                        }
+                    } else if (hasLeading) {
+                        // **ball - match up to "ball" in sentence (extract substring up to "ball")
+                        const searchTerm = term.slice(2); // Remove ** from beginning
+                        let pattern = searchTerm.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); // Escape special chars
+                        pattern = `.*${pattern}`; // Find "ball" anywhere in sentence
+                        const regex = new RegExp(pattern, 'i');
+                        
+                        const matchingSentences = sentences
+                            .filter(s => {
+                                if (!s.current) return false;
+                                
+                                const matches = regex.test(s.current);
+                                if (matches) {
+                                    // Find the position of the search term and extract up to there
+                                    const matchIndex = s.current.toLowerCase().indexOf(searchTerm.toLowerCase());
+                                    return matchIndex !== -1;
+                                }
+                                return false;
+                            })
+                            .map(s => {
+                                // Extract substring up to match position (including the search term)
+                                const matchIndex = s.current.toLowerCase().indexOf(searchTerm.toLowerCase());
+                                return s.current.substring(0, matchIndex + searchTerm.length);
+                            })
+                            .slice(0, maxResultsPerSegment);
+                        
+                        if (matchingSentences.length > 0) {
+                            expandedTerms.push(...matchingSentences);
+                        }
+                    } else if (hasTrailing) {
+                        // ball** - match from "ball" onwards in sentence (extract substring from "ball")
+                        const searchTerm = term.slice(0, -2); // Remove ** from end
+                        let pattern = searchTerm.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); // Escape special chars
+                        pattern = `.*${pattern}`; // Find "ball" anywhere in sentence
+                        const regex = new RegExp(pattern, 'i');
+                        
+                        const matchingSentences = sentences
+                            .filter(s => {
+                                if (!s.current) return false;
+                                
+                                const matches = regex.test(s.current);
+                                if (matches) {
+                                    // Find the position of the search term and extract from there onwards
+                                    const matchIndex = s.current.toLowerCase().indexOf(searchTerm.toLowerCase());
+                                    return matchIndex !== -1;
+                                }
+                                return false;
+                            })
+                            .map(s => {
+                                // Extract substring from match position onwards
+                                const matchIndex = s.current.toLowerCase().indexOf(searchTerm.toLowerCase());
+                                return s.current.substring(matchIndex);
+                            })
+                            .slice(0, maxResultsPerSegment);
+                        
+                        if (matchingSentences.length > 0) {
+                            expandedTerms.push(...matchingSentences);
+                        }
+                    }
+                } else if (hasSingleWildcard) {
+                    // * matches within a single word (no spaces) - complete words only
+                    // For ball* we want words like "ballsaal", "ballspiel" but not "ballen"
+                    let pattern = term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); // Escape special chars
+                    // Replace escaped * with [^\\s]*
+                    pattern = pattern.replace(/\\\*/g, '[^\\s]*');
+                    // Add word boundaries to match complete words only
+                    pattern = `\\b${pattern}\\b`;
+                    const regex = new RegExp(pattern, 'i');
+                    
+                    const matchingSentences = sentences
+                        .filter(s => {
+                            if (!s.current) return false;
+                            
+                            // For single wildcard, extract individual words and check if any match the pattern
+                            const words = s.current.split(/\s+/);
+                            return words.some(word => regex.test(word));
+                        })
+                        .flatMap(s => {
+                            // For single wildcard, return just the matching words, not the full sentence
+                            const words = s.current.split(/\s+/);
+                            return words.filter(word => regex.test(word));
+                        })
+                        .slice(0, maxResultsPerSegment);
+                    
+                    if (matchingSentences.length > 0) {
+                        expandedTerms.push(...matchingSentences);
+                    }
+                } else {
+                    // No wildcards, keep original term
+                    expandedTerms.push(term);
+                }
+            } else {
+                // No wildcards, keep original term
+                expandedTerms.push(term);
+            }
+        }
+        
+        return expandedTerms;
+    }
+    
     // Split into semicolon-separated groups and keep non-empty trimmed ones
-    const sentenceGroups = rawSentence
+    let sentenceGroups = rawSentence
         .split(';')
         .map(part => part.trim())
         .filter(part => part.length > 0);
         
+    if (sentenceGroups.length === 0) {
+        return;
+    }
+    
+    // Expand wildcards to find actual sentences
+    const originalGroups = [...sentenceGroups];
+    sentenceGroups = expandWildcards(sentenceGroups);
+    
     if (sentenceGroups.length === 0) {
         return;
     }
@@ -2865,10 +3009,6 @@ function handleSentenceSearch() {
     const includePartialMatches = includePartialMatchesCheckbox ? includePartialMatchesCheckbox.checked : false;
     const allPartialMatchesCheckbox = document.getElementById('allPartialMatches');
     const allPartialMatches = allPartialMatchesCheckbox ? allPartialMatchesCheckbox.checked : false;
-    
-    // Get the max results per segment value
-    const maxResultsInput = document.getElementById('maxResultsPerSegment');
-    const maxResultsPerSegment = maxResultsInput ? parseInt(maxResultsInput.value, 10) : 25;
     
     updateProjectData(data => {
         data.currentSentence = rawSentence;
@@ -3927,7 +4067,9 @@ function addSegmentResult(segmentData) {
             }
             const trimmedLength = formatTrimmedLength(clipDurationMs, defaultStartTrim, defaultEndTrim);
             // Always show the trimmed length, even if empty (format function returns empty string if invalid)
-            option.text = `Match ${fileIndex + 1} (${trimmedLength}${videoName})`;
+            // Show the actual sentence content instead of just "Match 1"
+            const sentenceText = file.text || segmentData.phrase || `Match ${fileIndex + 1}`;
+            option.text = `${sentenceText} (${trimmedLength}${videoName})`;
             option.title = sourceVideo;
             // Store the original exported clip path for waveform (before any re-rendering)
             option.dataset.originalClipPath = file.file;
@@ -3956,7 +4098,9 @@ function addSegmentResult(segmentData) {
                             // This is the exported clip duration, subtract default trims for playable length
                             option.dataset.durationMs = String(duration);
                             const updatedTrimmedLength = formatTrimmedLength(duration, defaultStartTrim, defaultEndTrim);
-                            option.text = `Match ${fileIndex + 1} (${updatedTrimmedLength}${videoName})`;
+                            // Show the actual sentence content instead of just "Match 1"
+                            const sentenceText = file.text || segmentData.phrase || `Match ${fileIndex + 1}`;
+                            option.text = `${sentenceText} (${updatedTrimmedLength}${videoName})`;
                         }
                     }).catch(() => {
                         // Ignore errors - duration will remain unknown
@@ -3965,7 +4109,9 @@ function addSegmentResult(segmentData) {
             }
         } else {
             option.value = file;
-            option.text = `Match ${fileIndex + 1}`;
+            // Show the actual sentence content instead of just "Match 1"
+            const sentenceText = file.text || segmentData.phrase || `Match ${fileIndex + 1}`;
+            option.text = sentenceText;
         }
         listbox.appendChild(option);
     });
@@ -5302,7 +5448,7 @@ function updateSentenceAutocomplete() {
                         break;
                     }
                 } else {
-                    // Earlier words: must match exactly
+                    // Previous words: must match exactly
                     if (textWord !== inputWord) {
                         matches = false;
                         break;
@@ -5315,6 +5461,32 @@ function updateSentenceAutocomplete() {
         }
         
         return false;
+    }
+    
+    // Helper function to handle wildcard matching
+    function matchesWithWildcards(text, input) {
+        // Check for wildcards in input
+        const hasSingleWildcard = input.includes('*') && !input.includes('**');
+        const hasDoubleWildcard = input.includes('**');
+        
+        if (!hasSingleWildcard && !hasDoubleWildcard) {
+            // No wildcards, use exact matching
+            return text.includes(input);
+        }
+        
+        // Convert wildcard pattern to regex
+        let pattern = input.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); // Escape special chars
+        
+        if (hasDoubleWildcard) {
+            // ** matches any sequence of words (including spaces)
+            pattern = pattern.replace(/\*\*/g, '.*');
+        } else {
+            // * matches within a single word (no spaces)
+            pattern = pattern.replace(/\*/g, '[^\\s]*');
+        }
+        
+        const regex = new RegExp(pattern, 'i'); // Case insensitive
+        return regex.test(text);
     }
     
     // Collect all matches that contain the input (like updateAutocomplete)
@@ -5332,6 +5504,10 @@ function updateSentenceAutocomplete() {
         if (currentAccepted && normalizedInput.startsWith(currentAccepted) && segmentNormalized.startsWith(currentAccepted)) {
             continuingSegments.push(entry);
         }
+        // Check for wildcard patterns first
+        else if (matchesWithWildcards(segmentNormalized, normalizedInput)) {
+            allMatches.push(entry);
+        }
         // All other segments that match the input (with word boundary checking if trailing space)
         else if (matchesAtWordBoundary(segmentNormalized, normalizedInput, hasTrailingSpace)) {
             allMatches.push(entry);
@@ -5343,15 +5519,32 @@ function updateSentenceAutocomplete() {
     allMatches.sort((a, b) => {
         const aText = a.currentNormalized || a.current?.toLowerCase() || '';
         const bText = b.currentNormalized || b.current?.toLowerCase() || '';
-        const aStarts = aText.startsWith(normalizedInput);
-        const bStarts = bText.startsWith(normalizedInput);
         
-        // Prioritize matches that start with input
-        if (aStarts && !bStarts) return -1;
-        if (!aStarts && bStarts) return 1;
+        // Check if we're using wildcards
+        const hasWildcards = normalizedInput.includes('*');
         
-        // Within same group, sort by length (longest first)
-        return bText.length - aText.length;
+        if (hasWildcards) {
+            // For wildcard searches, prioritize exact matches, then by length
+            const aExact = aText === normalizedInput;
+            const bExact = bText === normalizedInput;
+            
+            if (aExact && !bExact) return -1;
+            if (!aExact && bExact) return 1;
+            
+            // Within same group, sort by length (longest first)
+            return bText.length - aText.length;
+        } else {
+            // Normal sorting for non-wildcard searches
+            const aStarts = aText.startsWith(normalizedInput);
+            const bStarts = bText.startsWith(normalizedInput);
+            
+            // Prioritize matches that start with input
+            if (aStarts && !bStarts) return -1;
+            if (!aStarts && bStarts) return 1;
+            
+            // Within same group, sort by length (longest first)
+            return bText.length - aText.length;
+        }
     });
     
     // Deduplicate by continuation words for matches starting with input
@@ -5400,23 +5593,13 @@ function updateSentenceAutocomplete() {
     const currentSemicolonIndex = currentInputValue.lastIndexOf(';');
     const activeGroupCheck = currentSemicolonIndex === -1 ? currentInputValue : currentInputValue.slice(currentSemicolonIndex + 1).trim();
     
-    console.log('[Auto-semicolon Debug] Input:', currentInputValue);
-    console.log('[Auto-semicolon Debug] Active group:', activeGroupCheck);
-    console.log('[Auto-semicolon Debug] Suggestions:', suggestions.length);
-    console.log('[Auto-semicolon Debug] Input words:', inputWords.length);
-    console.log('[Auto-semicolon Debug] Previously had prefix match:', previouslyHadPrefixMatch);
-    
     const shouldSkipAutoSemicolon = sentenceAutocompleteState.skipAutoSemicolon || 
                                    (activeGroupCheck.match(/[.!?]\s+[A-ZÄÖÜ]/));
-    
-    console.log('[Auto-semicolon Debug] Should skip:', shouldSkipAutoSemicolon);
     
     sentenceAutocompleteState.skipAutoSemicolon = false; // Reset flag
     
     // Special handling for multi-sentence contexts: always check for next sentence suggestions
     if (activeGroupCheck.match(/[.!?]\s+[A-ZÄÖÜ]/)) {
-        console.log('[Multi-sentence] Detected sentence continuation - checking for next sentence suggestions');
-        
         // Extract the last sentence and look for what comes after it
         // Find the LAST sentence boundary, not the first one
         const splitSentences = activeGroupCheck.split(/[.!?]\s+/);
@@ -5433,17 +5616,9 @@ function updateSentenceAutocomplete() {
             // Reconstruct the full last sentence with punctuation
             const fullLastSentence = lastSentence + lastSentenceEnd.trim();
             
-            console.log('[Multi-sentence] Multiple sentences detected');
-            console.log('[Multi-sentence] All sentences:', splitSentences);
-            console.log('[Multi-sentence] Last sentence:', fullLastSentence);
-            console.log('[Multi-sentence] Next part:', nextPart);
-            console.log('[Multi-sentence] Next words:', nextWords);
-            
             if (nextWords.length > 0) {
                 // Look for suggestions that start with the next words
                 const nextSentenceSuggestions = [];
-                console.log('[Multi-sentence] Searching in sentences database with', sentences.length, 'entries');
-                console.log('[Multi-sentence] First 5 sentences:', sentences.slice(0, 5).map(s => s.current));
                 
                 // Search through all sentences for matches
                 for (const sentence of sentences) {
@@ -5462,19 +5637,14 @@ function updateSentenceAutocomplete() {
                         
                         if (matches) {
                             nextSentenceSuggestions.push(sentence);
-                            console.log('[Multi-sentence] Found matching suggestion:', sentence.current);
                             if (nextSentenceSuggestions.length >= 10) break; // Limit for performance
                         }
                     }
                 }
                 
-                console.log('[Multi-sentence] Current suggestions count:', suggestions.length);
-                console.log('[Multi-sentence] Next sentence suggestions count:', nextSentenceSuggestions.length);
-                
                 // If we have no current suggestions, use next sentence suggestions
                 if (suggestions.length === 0 && nextSentenceSuggestions.length > 0) {
                     suggestions.push(...nextSentenceSuggestions);
-                    console.log('[Multi-sentence] Using next sentence suggestions:', nextSentenceSuggestions.length);
                 }
                 // If we have current suggestions, add next sentence suggestions for continuation
                 else if (suggestions.length > 0 && nextSentenceSuggestions.length > 0) {
@@ -5482,16 +5652,12 @@ function updateSentenceAutocomplete() {
                     for (const nextSuggestion of nextSentenceSuggestions) {
                         if (!suggestions.some(s => s.currentNormalized === nextSuggestion.currentNormalized)) {
                             suggestions.push(nextSuggestion);
-                            console.log('[Multi-sentence] Added suggestion:', nextSuggestion.current);
                             if (suggestions.length >= 15) break; // Limit total
                         }
                     }
-                    console.log('[Multi-sentence] Added next sentence suggestions, total:', suggestions.length);
                 }
             }
         }
-    } else {
-        console.log('[Multi-sentence] No sentence continuation detected in:', activeGroupCheck);
     }
     
     originalSuggestionsLength = suggestions.length;
