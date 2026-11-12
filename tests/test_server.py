@@ -196,6 +196,54 @@ class ClipEndpointsTest(ServerTestCase):
             '-pix_fmt', 'yuv444p10le', '-c:v', 'libx264', '-preset', 'ultrafast', '-c:a', 'aac', '-shortest')
         self.assertEqual(clip['pix_fmt'], 'yuv420p')
 
+    def test_other_sites_cannot_use_the_browser_to_reach_the_api(self):
+        project = {'name': 'x'}
+        # DNS rebinding: the attacker's host name resolves to this machine
+        self.assertEqual(self.client.get('/api/projects', headers={'Host': 'evil.example:5000'}).status_code, 403)
+        for host in ('127.0.0.1:5000', '192.168.1.20:5000', '[::1]:5000', 'localhost:5000'):
+            self.assertEqual(self.client.get('/api/projects', headers={'Host': host}).status_code, 200, host)
+        # a form on another site posting to the app
+        blocked = self.client.post('/api/projects', data='{"name": "x"}', content_type='text/plain',
+                                   headers={'Origin': 'https://evil.example'})
+        self.assertEqual(blocked.status_code, 403)
+        self.assertEqual(self.client.post('/api/projects', json=project, headers={'Origin': 'null'}).status_code, 403)
+        self.assertEqual(self.client.post('/api/projects', json=project,
+                                          headers={'Sec-Fetch-Site': 'cross-site'}).status_code, 403)
+        # the app's own page, and tools without a browser
+        own = self.client.post('/api/projects', json=project, headers={'Origin': 'http://localhost'})
+        self.assertEqual(own.status_code, 201)
+        self.assertEqual(self.client.post('/api/projects', json=project).status_code, 201)
+        server.ALLOWED_HOSTS.add('media.example')
+        try:
+            self.assertEqual(self.client.get('/api/projects', headers={'Host': 'media.example'}).status_code, 200)
+        finally:
+            server.ALLOWED_HOSTS.discard('media.example')
+
+    def test_malformed_bodies_are_not_server_errors(self):
+        for route in ('/get_waveform', '/merge_videos_stream', '/ensure_clip'):
+            for body in ('[1]', '"x"', '5'):
+                response = self.client.post(route, data=body, content_type='application/json')
+                self.assertLess(response.status_code, 500, (route, body))
+        huge = self.client.post('/search_longest_segments_stream',
+                                json={'files': [self.source], 'sentence': 'x', 'maxResultsPerSegment': 1e999})
+        self.assertLess(huge.status_code, 500)
+
+    def test_ensure_clip_has_the_limits_of_the_other_clip_routes(self):
+        reference = dict(self.reference, originalStart=0, originalEnd=5000, clip='temp/group/long.mp4')
+        too_long = self.client.post('/ensure_clip', json=reference)
+        self.assertEqual((too_long.status_code, 'more than' in too_long.get_json()['error']), (400, True))
+        nested = dict(self.reference, originalStart=1, originalEnd=2, clip='temp/a/b/c/clip.mp4')
+        self.assertEqual(self.client.post('/ensure_clip', json=nested).status_code, 400)
+
+    def test_overlapping_library_folders_list_each_video_once(self):
+        roots = list(server.LIBRARY_ROOTS)
+        server.LIBRARY_ROOTS.append(os.path.join(self.library, '.'))
+        try:
+            listed = self.client.get('/get_files').get_json()
+        finally:
+            server.LIBRARY_ROOTS[:] = roots
+        self.assertEqual(len(listed), len({os.path.realpath(path) for path in listed}))
+
     def test_clip_audio_is_exactly_as_long_as_the_cut(self):
         query = 'clip={clip}&source={source}&original_start={originalStart}&original_end={originalEnd}'.format(
             **{key: (value if not isinstance(value, str) else __import__('urllib.parse').parse.quote(value))
@@ -483,6 +531,37 @@ class SearchExportTest(ServerTestCase):
         self.assertEqual((story['segments'], rendered), ([], []))
         # the id is forgotten with the request: a late cancel cannot hit a later story
         self.assertEqual(self.client.post('/cancel_search', json={'search_id': 'story_1'}).status_code, 404)
+
+    def test_identical_searches_do_not_share_an_id(self):
+        first = self._search(sentence_groups=['hello there'])[0]['search_id']
+        second = self._search(sentence_groups=['hello there'])[0]['search_id']
+        self.assertNotEqual(first, second)
+        # ... and nothing of a finished search is left behind
+        self.assertEqual(self.client.post('/cancel_search', json={'search_id': first}).status_code, 404)
+        self.assertEqual(server.SKIP_SEGMENTS, {})
+
+    def test_videos_that_left_the_library_are_named_instead_of_no_matches(self):
+        gone = os.path.join(self.library, 'deleted.mp4')
+        events = self._search(files=[self.source, gone], sentence_groups=['hello there'])
+        self.assertIn('1 of 2 project videos are not in the library', events[0]['warning'])
+        self.assertTrue(any(event.get('files') for event in events))
+        events = self._search(files=[gone], sentence_groups=['hello there'])
+        self.assertIn('1 of 1', events[0]['warning'])
+        self.assertTrue(events[-1]['done'])
+
+    def test_subtitles_with_a_language_suffix_are_searchable_and_cached(self):
+        video = os.path.join(self.library, 'lecture.mp4')
+        shutil.copy(self.source, video)
+        with open(os.path.join(self.library, 'lecture.en.vtt'), 'w', encoding='utf-8') as handle:
+            handle.write('WEBVTT\n\n00:00:01.000 --> 00:00:03.000\npurple elephants dance\n')
+        events = self._search(files=[video], sentence_groups=['purple elephants'])
+        self.assertEqual([event['phrase'] for event in events if event.get('files')], ['purple elephants'])
+        self.assertIsNotNone(server._transcript_signature(video))
+        self.assertIn(video, server._TRANSCRIPT_CACHE)
+        # a transcript of another video with a longer name is still not borrowed
+        with open(os.path.join(self.library, 'lecture.part2.vtt'), 'w', encoding='utf-8') as handle:
+            handle.write('WEBVTT\n\n00:00:01.000 --> 00:00:03.000\nother words\n')
+        self.assertEqual([path.name for path in server._find_related_files(video, ['.vtt'])], ['lecture.en.vtt'])
 
     def test_groups_without_a_match_are_reported_and_the_search_id_comes_first(self):
         events = self._search(sentence_groups=['hello there', 'no such words'])

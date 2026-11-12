@@ -1,11 +1,13 @@
 import argparse
 import glob
 import hashlib
+import ipaddress
 import json
 import os
 import posixpath
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import traceback
@@ -17,7 +19,8 @@ from datetime import datetime, timezone
 from fractions import Fraction
 from pathlib import Path
 from threading import Event, Lock, RLock, Semaphore
-from typing import List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
+from urllib.parse import urlsplit
 
 from flask import Flask, jsonify, render_template, request, send_from_directory, Response, stream_with_context
 from werkzeug.exceptions import HTTPException
@@ -392,14 +395,90 @@ def write_projects(projects):
 
 
 def library_files_only(files):
-    """Keep the client-supplied video paths that exist inside a library root (the strings are kept as sent)."""
+    """The client-supplied video paths that exist inside a library root, as the paths that were checked.
+
+    Paths as /get_files lists them come back unchanged; other spellings of a library file are replaced by the
+    file that was actually validated, so nothing downstream opens a path that was not checked.
+    """
     if not isinstance(files, list):
         return []
-    return [path for path in files if isinstance(path, str) and resolve_source_video(path)]
+    resolved = (resolve_source_video(path) for path in files if isinstance(path, str))
+    return list(OrderedDict.fromkeys(path for path in resolved if path))
+
+
+def missing_files_note(requested, usable):
+    """A sentence for the user when some of the requested videos are not in the library (else '')."""
+    wanted = len([path for path in requested if isinstance(path, str)]) if isinstance(requested, list) else 0
+    missing = wanted - len(usable)
+    if missing <= 0:
+        return ''
+    return (f'{missing} of {wanted} project videos are not in the library and were not searched '
+            f'(moved, deleted, or the server was started without their --library-path).')
 
 
 def clamp_max_results(value):
     return max(1, min(sanitize_int(value, 25), MAX_RESULTS_PER_SEGMENT_LIMIT))
+
+
+ALLOWED_HOSTS = set()      # extra host names from --allowed-host (lower case)
+
+
+def _local_host_names():
+    names = {'localhost'}
+    for lookup in (socket.gethostname, socket.getfqdn):
+        try:
+            name = lookup().strip().lower()
+        except OSError:
+            continue
+        if name:
+            names.update({name, name.split('.')[0], name.split('.')[0] + '.local'})
+    return names
+
+
+LOCAL_HOST_NAMES = _local_host_names()
+
+
+def host_is_allowed(host_header):
+    """Whether a Host header names this machine: an IP address, localhost, the machine's own name or a name
+    given with --allowed-host. Anything else is how a DNS-rebinding page reaches a local server."""
+    try:
+        host = (urlsplit('//' + (host_header or '')).hostname or '').lower().rstrip('.')
+    except ValueError:
+        return False
+    if not host:
+        return False
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        pass
+    return host in LOCAL_HOST_NAMES or host.endswith('.localhost') or host in ALLOWED_HOSTS
+
+
+@app.before_request
+def reject_foreign_requests():
+    """This server has no login: keep other web sites from using the browser to talk to it.
+
+    * The Host header must name this machine (stops DNS rebinding).
+    * A request that changes something must come from a page of this server (stops cross-site form posts).
+    """
+    if not host_is_allowed(request.host):
+        return jsonify({'error': f'Host "{request.host}" is not allowed. Open the app by IP address or start '
+                                 f'the server with --allowed-host <name>.'}), 403
+    if request.method in ('POST', 'PUT', 'DELETE', 'PATCH'):
+        origin = request.headers.get('Origin')
+        if origin and origin != 'null':
+            try:
+                same_origin = urlsplit(origin).netloc.lower() == request.host.lower()
+            except ValueError:
+                same_origin = False
+        else:
+            # No (usable) Origin: browsers that send none still say where the request comes from
+            same_origin = request.headers.get('Sec-Fetch-Site', 'same-origin') in ('same-origin', 'none') \
+                and origin != 'null'
+        if not same_origin:
+            return jsonify({'error': 'Requests from other sites are not accepted.'}), 403
+    return None
 
 
 def request_json_object():
@@ -680,11 +759,16 @@ def get_sentences():
 @app.route('/get_files', methods=['GET'])
 def get_files():
     file_list = []
+    seen = set()        # overlapping library roots must not list (and search) a video twice
     for root in LIBRARY_ROOTS:
         for path, dirs, files in os.walk(root, followlinks=True):
             for file in files:
                 if file.lower().endswith(VIDEO_EXTENSIONS):
-                    file_list.append(os.path.join(path, file))
+                    full_path = os.path.join(path, file)
+                    real_path = os.path.realpath(full_path)
+                    if real_path not in seen:
+                        seen.add(real_path)
+                        file_list.append(full_path)
     file_list.sort(key=str.lower)
     return jsonify(file_list)
 
@@ -709,6 +793,14 @@ def skip_segment():
     
     print(f"[Skip] ⏭️  Marked segment for skip: '{segment_phrase[:50]}...' (search_id: {search_id})")
     return jsonify({'status': 'ok', 'skipped': segment_phrase})
+
+
+def forget_search(search_id):
+    """Drop the skip/cancel state of a search that has ended."""
+    with SKIP_LOCK:
+        SKIP_SEGMENTS.pop(search_id, None)
+    with CANCEL_LOCK:
+        CANCELLED_SEARCHES.discard(search_id)
 
 
 @app.route('/cancel_search', methods=['POST'])
@@ -948,13 +1040,13 @@ def generate_story_prompt():
     prompt = data.get('prompt') if isinstance(data.get('prompt'), str) else ''
     prompt = prompt.strip()
     selected_files = library_files_only(data.get('files'))
-    max_segments = sanitize_int(data.get('maxSegments'), 10)
+    max_segments = max(1, min(50, sanitize_int(data.get('maxSegments'), 10)))
     
     if not prompt:
         return jsonify({'error': 'No prompt provided'}), 400
     
     if not selected_files:
-        return jsonify({'error': 'No files selected'}), 400
+        return jsonify({'error': missing_files_note(data.get('files'), selected_files) or 'No files selected'}), 400
     
     llm_prompt, corpus_entries, corpus_text = build_story_llm_prompt(
         prompt, selected_files, max_segments, prefer_long_segments=data.get('preferLongSegments', True) is not False)
@@ -986,10 +1078,7 @@ def generate_story():
         return jsonify({'cancelled': True, 'segments': [], 'unmatched': []})
     finally:
         if search_id:
-            with SKIP_LOCK:
-                SKIP_SEGMENTS.pop(search_id, None)
-            with CANCEL_LOCK:
-                CANCELLED_SEARCHES.discard(search_id)
+            forget_search(search_id)
 
 
 def _generate_story(data, search_id):
@@ -1012,7 +1101,7 @@ def _generate_story(data, search_id):
         return jsonify({'error': 'No prompt provided'}), 400
     
     if not selected_files:
-        return jsonify({'error': 'No files selected'}), 400
+        return jsonify({'error': missing_files_note(data.get('files'), selected_files) or 'No files selected'}), 400
     
     print(f"[Story] Generating story with prompt: '{prompt[:100]}...'")
     print(f"[Story] Max segments: {max_segments}, Prefer long: {prefer_long_segments}")
@@ -1258,8 +1347,11 @@ def search_longest_segments_stream():
         sentence_groups = [data.get('sentence')]
     sentence_groups = [group.strip() for group in sentence_groups if isinstance(group, str) and group.strip()]
 
+    files_note = missing_files_note(data.get('files'), selected_files)
     if not sentence_groups or not selected_files:
-        return Response('data: {"done": true, "total_segments": 0, "total_skipped": 0}\n\n', mimetype='text/event-stream')
+        events = [{'warning': files_note}] if files_note else []
+        events.append({'done': True, 'total_segments': 0, 'total_skipped': 0})
+        return Response(''.join(f'data: {json.dumps(event)}\n\n' for event in events), mimetype='text/event-stream')
 
     min_silence, max_silence = extract_silence_preferences(data)
     silence_word_threshold = sanitize_int(data.get('silenceWordThreshold'), 2)
@@ -1270,6 +1362,8 @@ def search_longest_segments_stream():
     def generate():
         total_segment_count = 0
         total_skipped_count = 0
+        if files_note:
+            yield f'data: {json.dumps({"warning": files_note})}\n\n'
         
         # Process each sentence group separately
         for group_index, sentence in enumerate(sentence_groups, 1):
@@ -1277,14 +1371,12 @@ def search_longest_segments_stream():
                 continue
                 
             clip_group = generate_clip_group_name('sentence', sentence, selected_files)
-            search_id = f"{counter}_{clip_group}"  # Unique ID for this search
+            # Unique per run: two identical searches (two tabs, a quick repeat) must not share skip/cancel state
+            search_id = f"{counter}_{clip_group}_{uuid.uuid4().hex[:8]}"
             
-            # Fresh skip/cancel state for this search (ids repeat after a page reload, so a cancel that
-            # arrived after the previous search with this id had ended must not abort this one)
+            # Registered while the search runs: /skip_segment and /cancel_search only accept running searches
             with SKIP_LOCK:
                 SKIP_SEGMENTS[search_id] = set()
-            with CANCEL_LOCK:
-                CANCELLED_SEARCHES.discard(search_id)
             
             if not include_partial_matches:
                 mode_str = "full match only"
@@ -1306,6 +1398,7 @@ def search_longest_segments_stream():
                     'group_index': group_index, 'total_groups': len(sentence_groups),
                 }) + '\n\n'
             except (GeneratorExit, BrokenPipeError, ConnectionError):
+                forget_search(search_id)
                 return
 
             try:
@@ -1379,11 +1472,7 @@ def search_longest_segments_stream():
                     print(f"[SSE] ❌ Client disconnected while sending error")
                     return
             finally:
-                # Clean up skip list and cancelled flag for this search
-                with SKIP_LOCK:
-                    SKIP_SEGMENTS.pop(search_id, None)
-                with CANCEL_LOCK:
-                    CANCELLED_SEARCHES.discard(search_id)
+                forget_search(search_id)
         
         # Signal completion of all searches
         print(f"[SSE] ✓ All searches completed - Total: {total_segment_count} segments, {total_skipped_count} skipped")
@@ -1397,8 +1486,11 @@ def search_silences_stream():
     """
     data = request_json_object()
     selected_files = library_files_only(data.get('files'))
+    files_note = missing_files_note(data.get('files'), selected_files)
     if not selected_files:
-        return Response('data: {"done": true, "total_silences": 0}\n\n', mimetype='text/event-stream')
+        events = [{'warning': files_note}] if files_note else []
+        events.append({'done': True, 'total_silences': 0})
+        return Response(''.join(f'data: {json.dumps(event)}\n\n' for event in events), mimetype='text/event-stream')
 
     min_silence = sanitize_float(data.get('minSilence'), 0.0)
     max_silence = sanitize_float(data.get('maxSilence'), 10.0)
@@ -1410,6 +1502,8 @@ def search_silences_stream():
     print(f"[Silence SSE] Searching for silences between {min_silence:.3f}s and {max_silence:.3f}s across {len(selected_files)} file(s)")
 
     def generate():
+        if files_note:
+            yield f'data: {json.dumps({"warning": files_note})}\n\n'
         # Collect all silence matches first (across all files)
         all_silence_entries = []
         
@@ -1635,7 +1729,7 @@ def sanitize_float(value, default):
 def sanitize_int(value, default):
     try:
         return int(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return default
 
 
@@ -1683,41 +1777,52 @@ def extract_silence_preferences(payload, default_min=0.0, default_max=10.0):
     return min_silence, max_silence
 
 
+_TRANSCRIPT_EXTENSIONS = ('.json', '.vtt', '.srt')
+_LANGUAGE_TAG = re.compile(r'[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8})?')
+_DIRECTORY_TRANSCRIPTS = {}         # folder -> (mtime_ns, {video stem: [transcript file names]})
+_DIRECTORY_TRANSCRIPTS_LOCK = Lock()
+
+
+def _directory_transcripts(directory: str) -> Dict[str, List[str]]:
+    """Transcript files of a folder by the video name they belong to; re-read when the folder changes.
+
+    "<name>.<ext>" comes first, then "<name>.<language>.<ext>" (yt-dlp and videogrep write those). Nothing else
+    counts: "talk.part2.json" is not a transcript of "talk.mp4".
+    """
+    try:
+        stamp = os.stat(directory or '.').st_mtime_ns
+    except OSError:
+        return {}
+    with _DIRECTORY_TRANSCRIPTS_LOCK:
+        cached = _DIRECTORY_TRANSCRIPTS.get(directory)
+    if cached and cached[0] == stamp:
+        return cached[1]
+    index: Dict[str, List[str]] = {}
+    try:
+        names = sorted(os.listdir(directory or '.'))
+    except OSError:
+        names = []
+    for name in names:
+        base, extension = os.path.splitext(name)
+        if extension.lower() not in _TRANSCRIPT_EXTENSIONS:
+            continue
+        index.setdefault(base, []).insert(0, name)
+        stem, dot, tag = base.rpartition('.')
+        if dot and _LANGUAGE_TAG.fullmatch(tag):
+            index.setdefault(stem, []).append(name)
+    with _DIRECTORY_TRANSCRIPTS_LOCK:
+        if len(_DIRECTORY_TRANSCRIPTS) > 512:
+            _DIRECTORY_TRANSCRIPTS.clear()
+        _DIRECTORY_TRANSCRIPTS[directory] = (stamp, index)
+    return index
+
+
 def _find_related_files(video_path: str, extensions: Sequence[str]) -> List[Path]:
+    """The video's transcript files with one of ``extensions``, in order of preference."""
     source_path = Path(video_path)
-    parent = source_path.parent
-    # Get base name without extension (e.g., "video.mp4" -> "video")
-    base_name = source_path.stem
-    
-    candidates: List[Path] = []
-
-    for ext in extensions:
-        normalized_ext = ext if ext.startswith('.') else f'.{ext}'
-        # Only look for exact match: base_name + extension
-        # This prevents matching files with similar prefixes
-        exact_match = parent / f'{base_name}{normalized_ext}'
-        candidates.append(exact_match)
-
-    unique: List[Path] = []
-    seen = set()
-    for candidate in candidates:
-        # Check if file exists first (more reliable than strict resolve)
-        if not candidate.exists():
-            continue
-        try:
-            resolved = candidate.resolve()
-        except (OSError, RuntimeError) as e:
-            # Still add it if it exists, even if resolve fails
-            if candidate not in seen:
-                seen.add(candidate)
-                unique.append(candidate)
-            continue
-        if resolved in seen:
-            continue
-        seen.add(resolved)
-        unique.append(candidate)
-    
-    return unique
+    names = _directory_transcripts(str(source_path.parent)).get(source_path.stem, [])
+    wanted = [ext if ext.startswith('.') else f'.{ext}' for ext in extensions]
+    return [source_path.parent / name for ext in wanted for name in names if name.lower().endswith(ext)]
 
 
 def _load_json_transcript(path: Path) -> Optional[List[dict]]:
@@ -1767,13 +1872,12 @@ TRANSCRIPT_CACHE_FILES = 512
 def _transcript_signature(video_path):
     """Identity of the transcript/subtitle files next to a video (None while there are none)."""
     signature = []
-    for suffix in ('.json', '.vtt', '.srt'):
-        candidate = Path(video_path).with_suffix(suffix)
+    for candidate in _find_related_files(video_path, _TRANSCRIPT_EXTENSIONS):
         try:
             stat = candidate.stat()
         except OSError:
             continue
-        signature.append((suffix, stat.st_mtime_ns, stat.st_size))
+        signature.append((candidate.name, stat.st_mtime_ns, stat.st_size))
     return tuple(signature) or None
 
 
@@ -1850,7 +1954,7 @@ def _read_transcript_sentences(video_path: str) -> Optional[List[dict]]:
         print(f"Failed to parse transcript via videogrep for '{video_path}': {exc}")
 
     for subtitle_path in _find_related_files(video_path, ['.vtt', '.srt']):
-        output_path = subtitle_path.with_suffix('.json')
+        output_path = Path(video_path).with_suffix('.json')
         try:
             # Subtitles with inline word timestamps (YouTube VTT) are converted once and stored as JSON
             segments, _stats = convert_subtitles(subtitle_path, output_path)
@@ -1959,7 +2063,7 @@ def build_merge_segments(video_info):
 @app.route('/merge_videos_stream', methods=['POST'])
 def merge_videos_stream():
     """SSE endpoint: render the timeline sample-accurately and stream progress."""
-    data = request.get_json(silent=True) or {}
+    data = request_json_object()
     video_info = data.get('videos')
     if not isinstance(video_info, list) or not video_info:
         return jsonify({'error': 'No videos to merge'}), 400
@@ -2755,7 +2859,7 @@ def clip_audio():
 @app.route('/get_waveform', methods=['POST'])
 def get_waveform():
     """Waveform envelope of exactly the audio the preview plays, plus its duration (the trim reference)."""
-    data = request.get_json(silent=True) or {}
+    data = request_json_object()
     try:
         media, base, seconds = resolve_cut_media(**_clip_reference_from(data))
     except ClipReferenceError as exc:
@@ -2787,6 +2891,12 @@ def ensure_clip():
     start = _finite_number(reference['original_start'])
     end = _finite_number(reference['original_end'])
     has_bounds = bool(source_path) and start is not None and end is not None and start >= 0 and end > start
+    if has_bounds and end - start > MAX_CLIP_SECONDS:
+        return jsonify({'error': f'Clip bounds span more than {MAX_CLIP_SECONDS} seconds.'}), 400
+    # Clips live in one folder per search below temp/ (older versions wrote them into temp/ itself)
+    relative = os.path.relpath(clip_path, TEMP_DIR).replace(os.sep, '/').split('/')
+    if len(relative) > 2 or not re.fullmatch(r'[\w.,+ -]+\.mp4', relative[-1]):
+        return jsonify({'error': 'Invalid clip path'}), 400
 
     if data.get('canonical') and has_bounds:
         folder = os.path.dirname(clip_path)
@@ -2828,6 +2938,14 @@ if __name__ == '__main__':
         type=str,
         default='127.0.0.1:5000',
         help='Server listener address in format HOST:PORT (default: 127.0.0.1:5000, example: 0.0.0.0:8080)'
+    )
+    parser.add_argument(
+        '--allowed-host',
+        action='append',
+        default=[],
+        metavar='NAME',
+        help='Host name the app may be opened under, besides IP addresses, localhost and this machine\'s name '
+             '(repeatable; needed behind a reverse proxy or with a custom DNS name)'
     )
     parser.add_argument(
         '--merge-resolution',
@@ -2898,7 +3016,7 @@ if __name__ == '__main__':
     if extra_library_paths:
         for abs_path in extra_library_paths:
             if os.path.exists(abs_path):
-                if abs_path not in LIBRARY_ROOTS:
+                if os.path.realpath(abs_path) not in {os.path.realpath(root) for root in LIBRARY_ROOTS}:
                     LIBRARY_ROOTS.append(abs_path)
                     print(f"[Startup] Added library path: {abs_path}")
                 else:
@@ -2939,4 +3057,5 @@ if __name__ == '__main__':
         print("[Startup] WARNING: --debug exposes an interactive debugger to everyone who can reach "
               f"{host}:{port}. Do not use it on a network you do not fully trust.")
     print(f"[Startup] Starting server on {host}:{port}")
+    ALLOWED_HOSTS.update(name.strip().lower().rstrip('.') for name in [*args.allowed_host, host] if name.strip())
     app.run(debug=args.debug, use_reloader=args.debug, threaded=True, host=host, port=port)

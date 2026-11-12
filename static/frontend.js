@@ -2917,7 +2917,17 @@ function handleSentenceSearch() {
             return false;
         }
         if (data.done) {
+            if (data.cancelled) {
+                problems.push('cancelled');     // ended from elsewhere: not "No matches found"
+                showResultNotice('The search was cancelled.');
+            }
             return false;
+        }
+        if (data.warning) {
+            // e.g. project videos that are no longer in the library
+            problems.push(data.warning);
+            showResultNotice(data.warning);
+            return true;
         }
         if (data.error) {
             // One group failed; the server continues with the next one.
@@ -3037,9 +3047,15 @@ function handleSearchSilence() {
 
     let clipCount = 0;
     let failure = null;
+    let warned = false;
     const onEvent = data => {
         if (!search.isCurrent || data.done) {
             return false;
+        }
+        if (data.warning) {
+            warned = true;
+            showResultNotice(data.warning);
+            return true;
         }
         if (data.error) {
             failure = data.error;
@@ -3083,7 +3099,7 @@ function handleSearchSilence() {
             finishSearch(search);
             if (failure) {
                 showNoResults(`Error: ${failure}`);
-            } else if (!clipCount) {
+            } else if (!clipCount && !warned) {
                 showNoResults(`No silences found ${range}.`);
             }
         })
