@@ -34,6 +34,34 @@
     const CACHE_BYTES = 160 * 1024 * 1024;
     const FADE_OUT = 0.008;         // s, only when playback is interrupted (never at a planned cut)
 
+    /** Preview loudness: one setting for every stage, remembered in this browser. */
+    const volume = (() => {
+        let level = 1;
+        let muted = false;
+        const listeners = new Set();
+        try {
+            const stored = JSON.parse(root.localStorage.getItem('clipPlayerVolume') || 'null');
+            if (stored && Number.isFinite(stored.level)) level = Math.min(1, Math.max(0, stored.level));
+            if (stored) muted = Boolean(stored.muted);
+        } catch (ignored) { /* private mode or blocked storage: start at full volume */ }
+        return {
+            get level() { return level; },
+            get muted() { return muted; },
+            get gain() { return muted ? 0 : level; },
+            set(nextLevel, nextMuted) {
+                level = Math.min(1, Math.max(0, Number(nextLevel) || 0));
+                muted = Boolean(nextMuted);
+                try {
+                    root.localStorage.setItem('clipPlayerVolume', JSON.stringify({ level, muted }));
+                } catch (ignored) { /* not remembered then */ }
+                listeners.forEach(listener => listener());
+            },
+            subscribe(listener) {
+                listeners.add(listener);
+            }
+        };
+    })();
+
     function mediaUrl(path) {
         if (!path) return '';
         const encoded = String(path).split('/').map(encodeURIComponent).join('/');
@@ -137,6 +165,52 @@
         status.className = 'clip-stage-status';
         hud.appendChild(title);
         hud.appendChild(status);
+
+        // Volume, mute and fullscreen (the pictures are muted <video> elements, so there are no native controls).
+        const controls = document.createElement('span');
+        controls.className = 'clip-stage-controls';
+        const control = (label, onClick) => {
+            const button = document.createElement('button');
+            button.type = 'button';
+            button.className = 'clip-stage-button';
+            button.addEventListener('click', onClick);
+            button.title = label;
+            button.setAttribute('aria-label', label);
+            controls.appendChild(button);
+            return button;
+        };
+        const muteButton = control('Mute', () => volume.set(volume.level || 1, !volume.muted));
+        const slider = document.createElement('input');
+        slider.type = 'range';
+        slider.min = '0';
+        slider.max = '1';
+        slider.step = '0.05';
+        slider.className = 'clip-stage-volume';
+        slider.setAttribute('aria-label', 'Volume');
+        slider.addEventListener('input', () => volume.set(slider.value, false));
+        controls.appendChild(slider);
+        const fullscreenElement = () => document.fullscreenElement || document.webkitFullscreenElement || null;
+        const fullscreenButton = control('Fullscreen', () => {
+            if (fullscreenElement() === element) {
+                (document.exitFullscreen || document.webkitExitFullscreen).call(document);
+            } else {
+                const request = element.requestFullscreen || element.webkitRequestFullscreen;
+                if (request) Promise.resolve(request.call(element)).catch(() => { /* refused by the browser */ });
+            }
+        });
+        fullscreenButton.textContent = '⛶';
+        fullscreenButton.hidden = !(element.requestFullscreen || element.webkitRequestFullscreen);
+        const showVolume = () => {
+            muteButton.textContent = volume.gain > 0 ? '🔊' : '🔇';
+            muteButton.title = volume.muted ? 'Unmute' : 'Mute';
+            muteButton.setAttribute('aria-label', muteButton.title);
+            slider.value = String(volume.muted ? 0 : volume.level);
+        };
+        volume.subscribe(showVolume);
+        showVolume();
+        // Using a control must not count as a click on the stage (which stops or replays).
+        ['click', 'keydown', 'pointerdown'].forEach(type => controls.addEventListener(type, event => event.stopPropagation()));
+        hud.appendChild(controls);
         element.appendChild(hud);
 
         const progress = document.createElement('div');
@@ -155,7 +229,6 @@
             element,
             slots,
             active: null,
-            lastRequest: null,      // { items, options } of the last play() on this stage, for replay
             onActivate: null,       // set by the player: click / Enter / Space on the stage
             show() {
                 element.hidden = false;
@@ -188,8 +261,11 @@
             slotFor(index) {
                 return slots.find(slot => slot.index === index) || null;
             },
-            /** Load `item`'s picture into a free slot and park it on the first frame of the cut. */
-            prepare(index, item, restoreClip) {
+            /**
+             * Load `item`'s picture into a slot and park it on the first frame of the cut. Slots of clips before
+             * `onAir` (they are over) may be reused; if none is free the picture is prepared on a later call.
+             */
+            prepare(index, item, restoreClip, onAir = 0) {
                 const existing = stage.slotFor(index);
                 if (existing) return existing.ready;
                 const url = mediaUrl(item.clip);
@@ -198,7 +274,7 @@
                 const onScreen = stage.active && stage.active.index < 0 && stage.active.url === url ? stage.active : null;
                 const slot = onScreen
                     || slots.find(candidate => candidate !== stage.active && candidate.index < 0)
-                    || slots.find(candidate => candidate !== stage.active && candidate.index < index - 1);
+                    || slots.find(candidate => candidate !== stage.active && candidate.index < onAir);
                 if (!slot) return Promise.resolve(false);
                 if (slot.cancelLoad) slot.cancelLoad();
                 slot.index = index;
@@ -211,6 +287,7 @@
                     const finish = ok => {
                         if (settled) return;
                         settled = true;
+                        video.removeEventListener('loadedmetadata', onData);
                         video.removeEventListener('loadeddata', onData);
                         video.removeEventListener('seeked', onSeeked);
                         video.removeEventListener('error', onError);
@@ -231,7 +308,13 @@
                         video.addEventListener('seeked', onSeeked);
                         video.currentTime = target;
                     };
-                    const onData = () => seek();
+                    // Seek as soon as the duration is known: iOS loads no frame data until something asks for it.
+                    let seekStarted = false;
+                    const onData = () => {
+                        if (seekStarted) return;
+                        seekStarted = true;
+                        seek();
+                    };
                     const onError = () => finish(false);
                     const timer = setTimeout(() => finish(video.readyState >= 2), 8000);
                     video.addEventListener('error', onError);
@@ -240,6 +323,7 @@
                         seek();
                     } else {
                         slot.url = url;
+                        video.addEventListener('loadedmetadata', onData);
                         video.addEventListener('loadeddata', onData);
                         video.src = url;
                         video.load();
@@ -328,7 +412,11 @@
                 context = new Ctor();
             }
             output = context.createGain();
+            output.gain.value = volume.gain;
             output.connect(context.destination);
+            volume.subscribe(() => {
+                output.gain.value = volume.gain;
+            });
             return context;
         }
 
@@ -439,6 +527,7 @@
             cancelAnimationFrame(current.frame);
             clearInterval(current.pumpTimer);
             stopSources(current, completed);
+            current.sources.clear();     // the nodes hold their buffers: do not keep them past the session
             const stage = current.stage;
             stage.release();
             stage.setPlaying(false);
@@ -457,9 +546,6 @@
                 }
             }
             current.resolve({ completed, error: error || null });
-            if (completed && current.options.loop && stage.lastRequest && stage.lastRequest.session === current) {
-                play(stage, stage.lastRequest.items, stage.lastRequest.options);
-            }
         }
 
         /** Schedule audio for every item whose buffer is there, up to SCHEDULE_AHEAD seconds ahead. */
@@ -501,14 +587,16 @@
                 node.buffer = buffer;
                 node.connect(current.gain);
                 node.start(when, offset, duration);
-                if (index === items.length - 1) {
-                    // requestAnimationFrame stops in background tabs: let the last source end the session too.
-                    node.onended = () => {
+                const last = index === items.length - 1;
+                node.onended = () => {
+                    current.sources.delete(node);
+                    if (last) {
+                        // requestAnimationFrame stops in background tabs: let the last source end the session too.
                         const outputLag = Math.max(0, context.currentTime - audibleTime());
                         setTimeout(() => finish(current, true), outputLag * 1000 + 60);
-                    };
-                }
-                current.sources.push(node);
+                    }
+                };
+                current.sources.add(node);
                 current.plan[index] = { when, duration, offset };
                 current.cursor = quantise(when + duration);
                 current.scheduled += 1;
@@ -522,6 +610,11 @@
         function syncPicture(current, slot, item, plan, now) {
             const video = slot.video;
             if (now < plan.when - playLead) return;       // parked on the first frame of the cut
+            if (now >= plan.when + plan.duration) {
+                // The cut is over but the next clip is not on air yet (its sound arrived late): hold this frame.
+                if (!video.paused) video.pause();
+                return;
+            }
             const elapsed = clamp(now - plan.when, 0, plan.duration);
             const target = item.startTrim / 1000 + elapsed * item.speed;
             if (video.paused && !video.ended) {
@@ -577,12 +670,12 @@
             if (onAir >= 0) {
                 const plan = current.plan[onAir];
                 if (!current.pictureShown) {
-                    stage.prepare(onAir, items[onAir], settings.restoreClip);
+                    stage.prepare(onAir, items[onAir], settings.restoreClip, onAir);
                     current.pictureShown = stage.activate(onAir);
                     if (!current.pictureShown) stage.freeze();
                 }
                 for (let ahead = onAir + 1; ahead < Math.min(items.length, onAir + PICTURE_SLOTS); ahead++) {
-                    stage.prepare(ahead, items[ahead], settings.restoreClip);
+                    stage.prepare(ahead, items[ahead], settings.restoreClip, onAir);
                 }
                 if (current.pictureShown && stage.active) syncPicture(current, stage.active, items[onAir], plan, now);
                 const within = clamp((now - plan.when) / plan.duration, 0, 1);
@@ -602,6 +695,8 @@
         /**
          * Play `items` back to back on `stage`. Resolves with {completed, error} when playback ends or is
          * replaced by another play()/stop(). Must be called from a user gesture the first time (autoplay policy).
+         * options: onItemStart(index, item), onProgress(index, fraction), onSchedule(index, plan), onEnd(result),
+         * replay() - what a click on the idle stage does (default: play the same items again).
          */
         function play(stage, rawItems, playOptions) {
             const items = (Array.isArray(rawItems) ? rawItems : [rawItems]).filter(Boolean).map(normaliseItem);
@@ -628,7 +723,7 @@
                 items,
                 options: opts,
                 gain: ctx.createGain(),
-                sources: [],
+                sources: new Set(),
                 plan: [],
                 waiting: new Set(),
                 scheduled: 0,
@@ -646,12 +741,13 @@
             };
             current.gain.connect(output);
             session = current;
-            stage.lastRequest = { items: rawItems, options: opts, session: current };
             stage.onActivate = () => {
                 if (session && session.stage === stage) {
                     stop();
-                } else if (stage.lastRequest) {
-                    play(stage, stage.lastRequest.items, stage.lastRequest.options);
+                } else if (opts.replay) {
+                    opts.replay();      // the caller rebuilds the items: trims or the timeline may have changed
+                } else {
+                    play(stage, rawItems, opts);
                 }
             };
 
@@ -698,14 +794,6 @@
         return {
             play,
             stop,
-            /** Warm the audio cache (e.g. for the first match of a new result card). */
-            prefetch(item) {
-                try {
-                    return loadAudio(normaliseItem(item)).then(() => true, () => false);
-                } catch (error) {
-                    return Promise.resolve(false);
-                }
-            },
             isPlaying(stage) {
                 return Boolean(session) && (!stage || session.stage === stage);
             },
@@ -724,5 +812,5 @@
         };
     }
 
-    root.ClipPlayer = { create, createStage, mediaUrl, audioSpec, normaliseItem };
+    root.ClipPlayer = { create, createStage, mediaUrl, audioSpec, normaliseItem, volume };
 })(window);

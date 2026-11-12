@@ -1524,6 +1524,8 @@ textarea {
 }
 
 .clip-stage-title {
+    flex: 1 1 auto;
+    min-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
@@ -1533,6 +1535,63 @@ textarea {
     flex: none;
     font-variant-numeric: tabular-nums;
     opacity: 0.85;
+}
+
+/* Volume, mute, fullscreen: the only parts of the HUD that take clicks */
+.clip-stage-controls {
+    flex: none;
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    margin: -3px -4px 0 0;
+    pointer-events: auto;
+    cursor: default;
+    opacity: 0.6;
+    transition: opacity 0.15s ease;
+}
+
+.clip-stage:hover .clip-stage-controls,
+.clip-stage:focus-within .clip-stage-controls {
+    opacity: 1;
+}
+
+.clip-stage-controls .clip-stage-button {
+    width: auto;
+    min-width: 0;
+    min-height: 0;
+    margin: 0;
+    padding: 4px 6px;
+    border: 0;
+    border-radius: 6px;
+    background: rgba(0, 0, 0, 0.45);
+    box-shadow: none;
+    color: #fff;
+    font-size: 13px;
+    line-height: 1;
+    cursor: pointer;
+}
+
+.clip-stage-controls .clip-stage-button:hover {
+    background: rgba(255, 255, 255, 0.22);
+}
+
+.clip-stage-controls .clip-stage-volume {
+    width: 72px;
+    min-width: 0;
+    height: 4px;
+    margin: 0;
+    padding: 0;
+    accent-color: var(--accent);
+    cursor: pointer;
+}
+
+.clip-stage:fullscreen {
+    width: 100%;
+    height: 100%;
+    padding-top: 0;
+    aspect-ratio: auto;
+    border: 0;
+    border-radius: 0;
 }
 
 .clip-stage-progress {
@@ -1625,14 +1684,6 @@ textarea {
     text-decoration-style: dotted;
     text-underline-offset: 3px;
     position: relative;
-}
-
-.floating-preview-video {
-    width: 100%;
-    border-radius: 14px;
-    background: #000;
-    border: 1px solid var(--border);
-    min-height: 220px;
 }
 
 /* Loading indicator */

@@ -731,6 +731,12 @@ function bindEventListeners() {
         elements.timelineList.addEventListener('dragleave', handleTimelineDragLeave);
         elements.timelineList.addEventListener('drop', handleTimelineDrop);
     }
+    if (elements.loopMergedVideo && elements.videoPlayer) {
+        // Also takes effect on a merged video that is already playing
+        elements.loopMergedVideo.addEventListener('change', () => {
+            elements.videoPlayer.loop = elements.loopMergedVideo.checked;
+        });
+    }
 }
 
 function initializeUI() {
@@ -2515,14 +2521,18 @@ function createWaveformVisualization({
             side = Math.abs(x - handlePositionPx('start', rect)) <= Math.abs(x - handlePositionPx('end', rect)) ? 'start' : 'end';
         }
         // Grabbing a handle keeps the grab offset; clicking the waveform moves the nearest handle to the pointer.
+        // A finger on the waveform may be the start of a page scroll, so it never makes a handle jump: it drags
+        // the nearest handle from where it is, and a gesture the browser takes over is undone (see endDrag).
         const onHandle = event.target === startHandle || event.target === endHandle;
-        state.dragOffsetPx = onHandle ? x - handlePositionPx(side, rect) : 0;
+        const jump = !onHandle && event.pointerType !== 'touch';
+        state.dragOffsetPx = jump ? 0 : x - handlePositionPx(side, rect);
         state.dragging = side;
+        state.gestureStart = { start: state.start, end: state.end };
         event.preventDefault();
         event.stopPropagation();
         container.setPointerCapture(event.pointerId);
         (side === 'start' ? startHandle : endHandle).focus({ preventScroll: true });
-        if (!onHandle) trimAt(side, event.clientX);
+        if (jump) trimAt(side, event.clientX);
     });
 
     container.addEventListener('pointermove', event => {
@@ -2533,7 +2543,14 @@ function createWaveformVisualization({
         if (!state.dragging) return;
         state.dragging = null;
         if (container.hasPointerCapture(event.pointerId)) container.releasePointerCapture(event.pointerId);
-        release();
+        const before = state.gestureStart;
+        if (event.type === 'pointercancel') {
+            updateTrim(before.start, before.end);       // it became a scroll: nothing was meant to change
+            return;
+        }
+        if (event.pointerType !== 'touch' || state.start !== before.start || state.end !== before.end) {
+            release();
+        }
     };
     container.addEventListener('pointerup', endDrag);
     container.addEventListener('pointercancel', endDrag);
@@ -2569,7 +2586,6 @@ function createWaveformVisualization({
 
     // --- public API -------------------------------------------------------------------------------------
 
-    container.updateTrim = (start, end, silent = false) => updateTrim(start, end, silent);
     container.getTrim = () => ({ start: state.start, end: state.end });
     container.getDuration = () => state.durationMs;
     /** Show another clip (new match selected) with its own trims. */
@@ -2582,7 +2598,6 @@ function createWaveformVisualization({
         state.speed = newSpeed;
         updateSelection();
     };
-    container.getSpeed = () => state.speed;
     /** Position of the play head as a fraction of the trimmed range, or null to hide it. */
     container.setPlayhead = fraction => {
         if (fraction === null || !(state.durationMs > 0)) {
@@ -3582,7 +3597,8 @@ function playVideo(phraseContainer) {
     const waveform = card.waveform;
     return getClipPlayer().play(getFloatingStage(), [card.toItem(match)], {
         onProgress: (index, fraction) => waveform.setPlayhead(fraction),
-        onEnd: () => waveform.setPlayhead(null)
+        onEnd: () => waveform.setPlayhead(null),
+        replay: () => playVideo(phraseContainer)
     });
 }
 
@@ -3605,7 +3621,8 @@ function playAllVideos() {
         onEnd: () => {
             highlight(null);
             updateVideoPlayerTitle('Preview');
-        }
+        },
+        replay: playAllVideos
     });
     if (isMobileLayout()) {
         switchMobileSection('viewer');
@@ -5725,8 +5742,11 @@ function markTimelinePlaying(entryId, scrollIntoView = false) {
         return null;
     }
     item.classList.add('is-playing');
-    if (scrollIntoView) {
-        item.scrollIntoView({ behavior: 'smooth', block: 'nearest', inline: 'center' });
+    const scroller = scrollIntoView ? item.closest('.timeline-scroll') : null;
+    if (scroller && scroller.scrollWidth > scroller.clientWidth) {
+        // Only the timeline strip scrolls (scrollIntoView would also pull the page away from the preview).
+        const offset = item.getBoundingClientRect().left - scroller.getBoundingClientRect().left;
+        scroller.scrollBy({ left: offset - (scroller.clientWidth - item.offsetWidth) / 2, behavior: 'smooth' });
     }
     return item.querySelector('.waveform-container');
 }
@@ -5746,7 +5766,8 @@ function playTimelineItem(itemId) {
         onProgress: (index, fraction) => {
             if (waveform && waveform.setPlayhead) waveform.setPlayhead(fraction);
         },
-        onEnd: () => markTimelinePlaying(null)
+        onEnd: () => markTimelinePlaying(null),
+        replay: () => playTimelineItem(itemId)
     });
 }
 
@@ -5781,8 +5802,6 @@ function playTimeline() {
     if (!entries.length || !stage) {
         return;
     }
-    timelinePlaybackActive = true;
-    updateTimelinePlayButton();
     let waveform = null;
     getClipPlayer().play(stage, entries.map(entryToItem), {
         onItemStart: index => {
@@ -5797,8 +5816,12 @@ function playTimeline() {
             updateTimelinePlayButton();
             markTimelinePlaying(null);
             updateVideoPlayerTitle('Preview');
-        }
+        },
+        replay: playTimeline
     });
+    // Set after play(): starting a playback first ends the one before it, whose onEnd clears the flag.
+    timelinePlaybackActive = getClipPlayer().isPlaying(stage);
+    updateTimelinePlayButton();
     if (isMobileLayout()) {
         switchMobileSection('viewer');
     }
