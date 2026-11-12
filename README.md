@@ -150,6 +150,11 @@ python server.py
 # Address and port (default 127.0.0.1:5000). Use 0.0.0.0 to reach it from other devices.
 python server.py --listen 0.0.0.0:8080
 
+# The app answers only when opened by IP address, as localhost or under this machine's name (the server has
+# no login; this keeps other web sites from reaching it through your browser). Other names, e.g. behind a
+# reverse proxy, must be allowed:
+python server.py --listen 0.0.0.0:8080 --allowed-host media.example.org
+
 # Additional video folders (repeatable); the Library/ folder next to server.py is always used
 python server.py --library-path /path/to/videos --library-path /another/folder
 
@@ -225,7 +230,8 @@ The server will:
 
 1. Click **"Add to timeline"** on any match card (or drag the card title onto the timeline)
 2. Clips appear in the Timeline section at the top
-3. Drag clips to reorder them (a bar shows where the clip will land) or use the arrow buttons; Ctrl+Z undoes
+3. Drag clips to reorder them (a bar shows where the clip will land); Ctrl+Z undoes, Ctrl+Shift+Z redoes.
+   Keyboard: Tab to a clip, then Enter plays it, Alt+arrow keys move it, Delete removes it
 4. Use **"Play timeline"** to preview the sequence: it plays gaplessly, exactly as the merge will cut it
 5. Click **"Merge timeline"** to export as a single video file
 6. Download button is below the preview on the right

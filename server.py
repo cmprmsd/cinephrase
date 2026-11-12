@@ -2091,7 +2091,13 @@ def merge_videos_stream():
                 yield f'data: {json.dumps(progress_update)}\n\n'
             print(f"[Merge SSE] ✓ {filename}: {summary.get('duration_ms')} ms, {summary.get('frames')} frames, "
                   f"{summary.get('width')}x{summary.get('height')} @ {summary.get('fps')} fps ({summary.get('encoder')})")
-            yield f'data: {json.dumps({"done": True, "merged_video": f"temp/{filename}"})}\n\n'
+            done = {'done': True, 'merged_video': f'temp/{filename}'}
+            # Clips whose library video is gone are cut from their preview clip, which is a lossy re-encode
+            from_previews = sum(1 for segment in segments if _is_inside(segment.media, TEMP_DIR))
+            if from_previews:
+                done['warning'] = (f'{from_previews} of {len(segments)} clips were cut from their preview clips '
+                                   f'because the source video was not found: their quality is lower.')
+            yield f'data: {json.dumps(done)}\n\n'
         except (GeneratorExit, BrokenPipeError, ConnectionError):
             print("[Merge SSE] ❌ Client disconnected")
             raise

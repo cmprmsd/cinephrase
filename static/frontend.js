@@ -102,6 +102,31 @@ function formatTrimmedLength(clipDurationMs, startTrimMs = 450, endTrimMs = 450)
     }
 }
 
+/**
+ * Copy text to the clipboard; resolves to whether it worked. The Clipboard API only exists on https and
+ * localhost, so a device that reaches the app over the LAN needs the selection-based way.
+ */
+async function copyText(text) {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+        try {
+            await navigator.clipboard.writeText(text);
+            return true;
+        } catch (error) { /* refused (no focus, permission): try the other way */ }
+    }
+    const area = document.createElement('textarea');
+    area.value = text;
+    area.setAttribute('readonly', '');
+    area.style.cssText = 'position: fixed; top: 0; left: 0; width: 1px; height: 1px; opacity: 0;';
+    document.body.appendChild(area);
+    area.select();
+    let copied = false;
+    try {
+        copied = document.execCommand('copy');
+    } catch (error) { /* not supported */ }
+    area.remove();
+    return copied;
+}
+
 function generateId(prefix = 'id') {
     return `${prefix}_${Math.random().toString(36).slice(2, 10)}_${Date.now()}`;
 }
@@ -740,6 +765,7 @@ function bindEventListeners() {
 
     if (elements.timelineList) {
         elements.timelineList.addEventListener('click', handleTimelineListClick);
+        elements.timelineList.addEventListener('keydown', handleTimelineListKeydown);
         elements.timelineList.addEventListener('dragenter', handleTimelineDragEnter);
         elements.timelineList.addEventListener('dragover', handleTimelineDragOver);
         elements.timelineList.addEventListener('dragleave', handleTimelineDragLeave);
@@ -784,9 +810,10 @@ function updateProjectControlsState() {
 
     toggledControls.forEach(key => {
         if (elements[key]) {
-            elements[key].disabled = !hasProject || (key === 'timelineMergeButton' && mergeRunning);
+            elements[key].disabled = !hasProject;
         }
     });
+    updateTimelineActionButtons();      // Play/Merge also need an enabled clip (and no merge in progress)
 
     if (elements.availableFileSelector) {
         elements.availableFileSelector.disabled = !hasProject;
@@ -889,6 +916,7 @@ async function loadProject(projectId) {
         // Nothing of the previous project may arrive in the next one (search results, a story, a preview)
         cancelActiveSearch();
         stopClipPlayback();
+        clearMergedOutput();
         hideFloatingPreview();
         setAutosaveStatus('Loading project…', 'saving');
         const response = await fetch(`/api/projects/${projectId}`);
@@ -1005,6 +1033,7 @@ async function handleDeleteProject() {
         cancelAutosave();
         cancelActiveSearch();
         stopClipPlayback();
+        clearMergedOutput();
         hideFloatingPreview();
         const response = await fetch(`/api/projects/${activeProject.id}`, { method: 'DELETE' });
         // 404: already deleted elsewhere, which is what was asked for
@@ -2005,7 +2034,32 @@ function hideSearchLoading() {
 function revealResultsSection() {
     if (isMobileLayout()) {
         switchMobileSection('results');
+        return;
     }
+    // Desktop: the Matches card is often below the fold, where a spinner or "No matches" would go unseen
+    const section = elements.resultsContainer ? elements.resultsContainer.closest('.card') : null;
+    if (section && section.getBoundingClientRect().top > window.innerHeight - 200) {
+        section.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    }
+}
+
+/** Mark the search buttons while a search runs (the spinner itself may be off screen). */
+function setSearchBusy(busy) {
+    document.querySelectorAll('#searchLongestSegmentsButton, #searchSilenceButton, #generateStoryButton').forEach(button => {
+        button.classList.toggle('is-busy', busy);
+        button.setAttribute('aria-busy', busy ? 'true' : 'false');
+    });
+}
+
+/** Refuse a search with a reason, keeping the results that are on screen. */
+function rejectSearch(message) {
+    document.querySelectorAll('.result-notice.search-rejected').forEach(notice => notice.remove());
+    const notice = document.createElement('div');
+    notice.className = 'result-notice search-rejected';
+    notice.setAttribute('role', 'alert');
+    notice.textContent = message;
+    elements.resultsContainer.prepend(notice);
+    revealResultsSection();
 }
 
 /** Floating progress box of a running merge: what the server is doing, a bar and a cancel button. */
@@ -2694,6 +2748,8 @@ function beginSearch() {
     };
     activeSearch = search;
     window.currentSearchId = null;
+    setSearchBusy(true);
+    revealResultsSection();
     return search;
 }
 
@@ -2704,6 +2760,7 @@ function cancelActiveSearch() {
     }
     activeSearch = null;
     search.cancelled = true;
+    setSearchBusy(false);
     if (search.serverId) {
         // Tell the server to stop rendering clips right away (closing the connection is only noticed later).
         fetch('/cancel_search', {
@@ -2719,6 +2776,7 @@ function cancelActiveSearch() {
 function finishSearch(search) {
     if (activeSearch === search) {
         activeSearch = null;
+        setSearchBusy(false);
         hideSearchLoading();
     }
 }
@@ -2830,16 +2888,9 @@ function handleSentenceSearch() {
         return;
     }
 
-    cancelActiveSearch();
-    stopClipPlayback();
-    hideFloatingPreview();
-    if (elements.resultsContainer) {
-        elements.resultsContainer.innerHTML = '';
-    }
-
     const selectedFiles = Array.isArray(activeProject.data?.selectedFiles) ? activeProject.data.selectedFiles : [];
     if (!selectedFiles.length) {
-        showNoResults('Add at least one video to the project (Media Library) before searching.');
+        rejectSearch('Add at least one video to the project (Media Library) before searching.');
         return;
     }
 
@@ -2852,12 +2903,12 @@ function handleSentenceSearch() {
         let expansions = [term];
         if (term.includes('*')) {
             if (!sentences.length) {
-                showNoResults('Wildcards (*) are looked up in the corpus: click "Load corpus" in the Media Library first.');
+                rejectSearch('Wildcards (*) are looked up in the corpus: click "Load corpus" in the Media Library first.');
                 return;
             }
             expansions = expandWildcardTerm(term, WILDCARD_EXPANSION_LIMIT + 1);
             if (expansions === null) {
-                showNoResults(`"${term}" is not a supported wildcard pattern. Use ball*, ball**, **ball or **ball**.`);
+                rejectSearch(`"${term}" is not a supported wildcard pattern. Use ball*, ball**, **ball or **ball**.`);
                 return;
             }
             if (!expansions.length) {
@@ -2877,9 +2928,17 @@ function handleSentenceSearch() {
     }
     if (!sentenceGroups.length) {
         if (notes.length) {
-            showNoResults(notes.join(' '));
+            rejectSearch(notes.join(' '));
         }
         return;
+    }
+
+    // The search is valid: only now replace what is on screen
+    cancelActiveSearch();
+    stopClipPlayback();
+    hideFloatingPreview();
+    if (elements.resultsContainer) {
+        elements.resultsContainer.innerHTML = '';
     }
 
     if (isMobileLayout()) {
@@ -3016,17 +3075,16 @@ function handleSearchSilence() {
         return;
     }
 
+    const selectedFiles = Array.isArray(activeProject.data?.selectedFiles) ? activeProject.data.selectedFiles : [];
+    if (!selectedFiles.length) {
+        rejectSearch('Add at least one video to the project (Media Library) before searching.');
+        return;
+    }
     cancelActiveSearch();
     stopClipPlayback();
     hideFloatingPreview();
     if (elements.resultsContainer) {
         elements.resultsContainer.innerHTML = '';
-    }
-
-    const selectedFiles = Array.isArray(activeProject.data?.selectedFiles) ? activeProject.data.selectedFiles : [];
-    if (!selectedFiles.length) {
-        showNoResults('Add at least one video to the project (Media Library) before searching.');
-        return;
     }
 
     let minMs = Math.max(0, Math.min(10000, parseInt(elements.silenceRangeMinInput.value, 10) || 0));
@@ -3068,7 +3126,7 @@ function handleSearchSilence() {
                 .map(container => resultCards.get(container))
                 .find(card => card && card.phrase === data.phrase);
             if (existing) {
-                existing.addFiles(data.files);
+                existing.addFiles(data.files, data.total_matches);
             } else {
                 createResultCard(data);
             }
@@ -3278,17 +3336,24 @@ function handleCopyLLMPrompt() {
         if (data.error || !data.prompt) {
             throw new Error(data.error || 'the server returned no prompt');
         }
-        return navigator.clipboard.writeText(data.prompt).then(
-            () => {
+        return copyText(data.prompt).then(copied => {
+            if (copied) {
                 setButton('Copied!', true);
                 setTimeout(() => setButton(label, false), 1500);
-            },
-            () => {
-                // Clipboard access can be refused (no focus, insecure origin): let the user copy it by hand
-                setButton(label, false);
-                window.prompt('Copy the LLM prompt:', data.prompt);
+                return;
             }
-        );
+            // The browser refused: show the prompt so it can be copied by hand
+            setButton(label, false);
+            const box = document.createElement('textarea');
+            box.className = 'result-notice';
+            box.readOnly = true;
+            box.rows = 8;
+            box.style.width = '100%';
+            box.value = data.prompt;
+            elements.resultsContainer.prepend(box);
+            revealResultsSection();
+            box.select();
+        });
     })
     .catch(error => {
         setButton(label, false);
@@ -3765,6 +3830,11 @@ function createResultCard(segmentData) {
     listbox.classList.add('phrase-video-listbox');
     listbox.setAttribute('aria-label', `Matches for "${segmentData.phrase}". Space replays, Enter adds to the timeline.`);
     container.appendChild(listbox);
+    // "25 of 312": the list is cut at "Max results per segment", which the card would otherwise hide
+    const moreNote = document.createElement('div');
+    moreNote.className = 'phrase-more-note';
+    moreNote.hidden = true;
+    container.appendChild(moreNote);
 
     const waveform = createWaveformVisualization({
         onTrimChange: (start, end) => {
@@ -3801,7 +3871,10 @@ function createResultCard(segmentData) {
             };
         },
         /** Append matches that are not listed yet (silence buckets grow while the search is streaming). */
-        addFiles(files) {
+        addFiles(files, totalMatches) {
+            if (Number.isFinite(totalMatches)) {
+                card.totalMatches = Math.max(card.totalMatches || 0, totalMatches);
+            }
             (files || []).forEach(file => {
                 const match = describeMatch(file, card.phrase);
                 if (!match.clip || card.matches.some(existing => existing.clip === match.clip)) {
@@ -3817,6 +3890,10 @@ function createResultCard(segmentData) {
             });
             if (listbox.selectedIndex < 0 && listbox.options.length > 0) {
                 listbox.selectedIndex = 0;
+            }
+            moreNote.hidden = !(card.totalMatches > card.matches.length);
+            if (!moreNote.hidden) {
+                moreNote.textContent = `${card.matches.length} of ${card.totalMatches} matches shown (raise "Max results per segment" for more)`;
             }
             if (card.shownIndex < 0 && card.matches.length > 0) {
                 card.showSelected();
@@ -3868,12 +3945,16 @@ function createResultCard(segmentData) {
         return button;
     };
     addControl('Play', 'play-button', () => playVideo(container));
-    addControl('Add to Timeline', 'add-button', () => handleAddContainerToTimeline(container));
+    const addButton = addControl('Add to Timeline', 'add-button', () => {
+        if (handleAddContainerToTimeline(container)) {
+            flashButton(addButton, 'Added ✓');
+        }
+    });
     addControl('Add All Variants', 'add-all-button', () => handleAddAllVariantsToTimeline(container));
     container.appendChild(controls);
 
     elements.resultsContainer.appendChild(container);
-    card.addFiles(segmentData.files);
+    card.addFiles(segmentData.files, segmentData.total_matches);
     initializeFloatingPreview();
     return card;
 }
@@ -3940,12 +4021,19 @@ function updateFloatingPreview(phraseContainer) {
         return;
     }
 
-    if (isMobileLayout()) {
-        floatingPreviewContainer.style.left = '16px';
-        floatingPreviewContainer.style.right = '16px';
-        floatingPreviewContainer.style.top = '16px';
-        floatingPreviewContainer.style.width = 'calc(100% - 32px)';
+    const inline = isMobileLayout();
+    floatingPreviewContainer.classList.toggle('is-inline', inline);
+    if (inline) {
+        // Narrow screens: the preview sits inside its card. As an overlay it covered the card being auditioned
+        // (list, waveform, buttons) and could only be dismissed by scrolling.
+        floatingPreviewContainer.style.cssText = '';
+        if (floatingPreviewContainer.parentElement !== phraseContainer) {
+            phraseContainer.insertBefore(floatingPreviewContainer, card.listbox);
+        }
     } else {
+        if (floatingPreviewContainer.parentElement !== document.body) {
+            document.body.appendChild(floatingPreviewContainer);
+        }
         const cardRect = phraseContainer.getBoundingClientRect();
         const previewWidth = 400;
         const previewHeight = floatingPreviewContainer.offsetHeight || 320;
@@ -3992,8 +4080,8 @@ document.addEventListener('click', event => {
 // The preview is positioned next to its card: once the page scrolls it would point at the wrong place
 let scrollTimeout = null;
 window.addEventListener('scroll', () => {
-    if (!isFloatingPreviewVisible()) {
-        return;
+    if (!isFloatingPreviewVisible() || floatingPreviewContainer.classList.contains('is-inline')) {
+        return;     // inside its card it scrolls along
     }
     clearTimeout(scrollTimeout);
     scrollTimeout = setTimeout(hideFloatingPreview, 150);
@@ -4001,7 +4089,8 @@ window.addEventListener('scroll', () => {
 
 // Move floating preview away when mouse hovers over cards behind it
 document.addEventListener('mousemove', (event) => {
-    if (!floatingPreviewContainer || floatingPreviewContainer.style.display === 'none' || !elements.resultsContainer) {
+    if (!floatingPreviewContainer || floatingPreviewContainer.style.display === 'none' || !elements.resultsContainer
+            || floatingPreviewContainer.classList.contains('is-inline')) {
         return;
     }
     
@@ -4675,13 +4764,10 @@ function updateSentenceAutocompleteSelection() {
     
     const items = sentenceAutocompleteContainer.querySelectorAll('.suggestion-item');
     items.forEach((item, index) => {
-        if (index === sentenceAutocompleteState.selectedIndex) {
-            item.style.backgroundColor = 'var(--accent)';
-            item.style.color = 'var(--bg-primary)';
-            item.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
-        } else {
-            item.style.backgroundColor = 'transparent';
-            item.style.color = 'var(--text)';
+        const selected = index === sentenceAutocompleteState.selectedIndex;
+        item.classList.toggle('is-selected', selected);
+        if (selected && sentenceAutocompleteState.keyboardSelection) {
+            item.scrollIntoView({ block: 'nearest' });
         }
     });
 }
@@ -5102,7 +5188,8 @@ function registerSearchContainerDrag(handleElement, container) {
         dragState.type = 'searchClip';
         dragState.data = baseEntry;
         event.dataTransfer.effectAllowed = 'copy';
-        event.dataTransfer.setData('text/plain', JSON.stringify({ type: 'searchClip' }));
+        // A private type: text fields ignore it (plain text would be inserted where the drag is released)
+        event.dataTransfer.setData('application/x-cinephrase-clip', 'search');
         container.classList.add('drag-source');
         if (elements.timelineList) {
             elements.timelineList.classList.add('drag-active');
@@ -5138,7 +5225,7 @@ function registerTimelineItemDrag(item, entry) {
         dragState.data = { id: entry.id };
         item.classList.add('drag-source');
         event.dataTransfer.effectAllowed = 'move';
-        event.dataTransfer.setData('text/plain', entry.id);
+        event.dataTransfer.setData('application/x-cinephrase-clip', 'timeline');
         elements.timelineList.classList.add('drag-active');
     });
     item.addEventListener('dragend', resetDragState);
@@ -5274,7 +5361,15 @@ function renderTimeline(entriesParam) {
     }
     isRenderingTimeline = true;
     const entries = Array.isArray(entriesParam) ? entriesParam : getTimelineEntries();
+    // The cards are rebuilt: remember which control had the focus so the keyboard does not lose its place
+    const focusable = 'button, input, select, [tabindex]';
+    const focused = document.activeElement && elements.timelineList.contains(document.activeElement) ? document.activeElement : null;
+    const focusedCard = focused ? focused.closest('.timeline-item') : null;
+    const focusPosition = focusedCard
+        ? { id: focusedCard.dataset.id, index: Array.from(focusedCard.querySelectorAll(focusable)).indexOf(focused) }
+        : null;        // index -1: the card itself had the focus
     elements.timelineList.innerHTML = '';
+    updateTimelineActionButtons();
 
     if (!entries.length) {
         isRenderingTimeline = false;
@@ -5303,6 +5398,8 @@ function renderTimeline(entriesParam) {
             item.classList.add('timeline-item-disabled');
         }
         item.dataset.id = entry.id;
+        item.tabIndex = 0;
+        item.setAttribute('aria-label', `Clip ${index + 1}: ${entry.phrase || 'clip'}. Enter plays, Alt+arrow keys move, Delete removes.`);
 
         const indexBadge = document.createElement('div');
         indexBadge.className = 'timeline-index';
@@ -5358,7 +5455,9 @@ function renderTimeline(entriesParam) {
         title.style.alignItems = 'center';
         title.style.gap = '6px';
         const titleText = document.createElement('strong');
+        titleText.className = 'timeline-title-text';
         titleText.textContent = entry.phrase || `Clip ${index + 1}`;
+        titleText.title = titleText.textContent;        // long phrases are cut with an ellipsis
         title.appendChild(titleText);
         // Add info icon with tooltip
         if (entry.file) {
@@ -5377,7 +5476,9 @@ function renderTimeline(entriesParam) {
                 const sourcePath = entry.sourceVideo || entry.originalSource || 'Unknown';
                 if (sourcePath !== 'Unknown') {
                     try {
-                        await navigator.clipboard.writeText(sourcePath);
+                        if (!await copyText(sourcePath)) {
+                            return;
+                        }
                         // Visual feedback
                         infoIcon.style.opacity = '1';
                         infoIcon.style.backgroundColor = '#4CAF50';
@@ -5399,6 +5500,15 @@ function renderTimeline(entriesParam) {
             title.appendChild(infoIcon);
         }
         meta.appendChild(title);
+        // Which match this is: variants of one phrase are otherwise indistinguishable
+        const origin = entry.matchLabel || (entry.sourceVideo ? entry.sourceVideo.split('/').pop() : '');
+        if (origin) {
+            const originLine = document.createElement('div');
+            originLine.className = 'timeline-origin';
+            originLine.textContent = origin;
+            originLine.title = origin;
+            meta.appendChild(originLine);
+        }
 
         body.appendChild(meta);
 
@@ -5434,6 +5544,7 @@ function renderTimeline(entriesParam) {
 
         const speedSlider = document.createElement('input');
         speedSlider.type = 'range';
+        speedSlider.setAttribute('aria-label', 'Playback speed');
         speedSlider.className = 'speed-slider';
         speedSlider.min = '50';
         speedSlider.max = '100';
@@ -5481,7 +5592,7 @@ function renderTimeline(entriesParam) {
         toggleCheckbox.addEventListener('change', (e) => {
             const enabled = e.target.checked;
             toggleLabel.textContent = enabled ? 'Enabled' : 'Disabled';
-            entry.enabled = enabled;
+            // (the entry itself is changed inside updateTimeline, after the undo snapshot has been taken)
             
             // Update visual state
             if (enabled) {
@@ -5535,6 +5646,24 @@ function renderTimeline(entriesParam) {
 
     elements.timelineList.appendChild(fragment);
     isRenderingTimeline = false;
+    if (focusPosition) {
+        const card = Array.from(elements.timelineList.querySelectorAll('.timeline-item')).find(node => node.dataset.id === focusPosition.id);
+        const control = card && focusPosition.index === -1 ? card : card ? card.querySelectorAll(focusable)[focusPosition.index] : null;
+        if (control && !control.disabled) {
+            control.focus({ preventScroll: true });
+        }
+    }
+}
+
+/** "Play timeline" and "Merge timeline" need at least one enabled clip. */
+function updateTimelineActionButtons() {
+    const playable = getTimelineEntries().some(entry => entry && (entry.originalClipPath || entry.file) && entry.enabled !== false);
+    if (elements.timelinePlayButton) {
+        elements.timelinePlayButton.disabled = !playable && !timelinePlaybackActive;
+    }
+    if (elements.timelineMergeButton) {
+        elements.timelineMergeButton.disabled = !playable || mergeRunning || !activeProject;
+    }
 }
 
 // ---------------------------------------------------------------------------------------------------------
@@ -5614,9 +5743,11 @@ document.addEventListener('keydown', event => {
     if (key !== 'z' && key !== 'y') {
         return;
     }
-    // Text fields keep their own undo
+    // Text fields keep their own undo; everything else (match lists, sliders, buttons) has none
     const target = event.target;
-    if (target && (target.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName)) && target.type !== 'range' && target.type !== 'checkbox') {
+    const textEntry = target && (target.isContentEditable || target.tagName === 'TEXTAREA'
+        || (target.tagName === 'INPUT' && !/^(range|checkbox|radio|button|submit|file|color)$/.test(target.type)));
+    if (textEntry) {
         return;
     }
     event.preventDefault();
@@ -5631,6 +5762,9 @@ function updateTimeline(mutator, options) {
     if (!activeProject || typeof mutator !== 'function') {
         return;
     }
+    if (timelinePlaybackActive) {
+        stopClipPlayback();     // it plays a snapshot of the clips: what is changed now would not be heard
+    }
     recordTimelineUndo();
     // Adding, removing and moving clips is saved right away, not after the typing delay
     updateProjectData(data => {
@@ -5642,17 +5776,45 @@ function updateTimeline(mutator, options) {
     renderTimeline();
 }
 
+/** Show for a moment that a button's action happened (the effect may be off screen). */
+function flashButton(button, text) {
+    if (!button || button.dataset.label) {
+        return;
+    }
+    button.dataset.label = button.textContent;
+    button.textContent = text;
+    button.classList.add('is-confirmed');
+    setTimeout(() => {
+        button.textContent = button.dataset.label;
+        delete button.dataset.label;
+        button.classList.remove('is-confirmed');
+    }, 1200);
+}
+
+/** Bring a timeline clip into view inside the strip (the page itself does not scroll). */
+function revealTimelineItem(entryId) {
+    const item = Array.from(elements.timelineList.querySelectorAll('.timeline-item')).find(node => node.dataset.id === entryId);
+    const scroller = item ? item.closest('.timeline-scroll') : null;
+    if (scroller && scroller.scrollWidth > scroller.clientWidth) {
+        const offset = item.getBoundingClientRect().left - scroller.getBoundingClientRect().left;
+        scroller.scrollBy({ left: offset - (scroller.clientWidth - item.offsetWidth) / 2, behavior: 'smooth' });
+    }
+}
+
+/** Append the selected match of a result card to the timeline. Returns whether a clip was added. */
 function handleAddContainerToTimeline(container) {
     if (!activeProject || !container) {
-        return;
+        return false;
     }
     const timelineEntry = createTimelineEntry(buildTimelineEntryFromContainer(container));
     if (!timelineEntry) {
-        return;
+        return false;
     }
     updateTimeline(entries => {
         entries.push(timelineEntry);
     });
+    revealTimelineItem(timelineEntry.id);
+    return true;
 }
 
 /** Add every match of a card (each with the trims set for it) so the variants can be compared in place. */
@@ -5683,6 +5845,37 @@ function addAllMatchesToTimeline() {
             entries.push(...additions);
         });
     }
+}
+
+/** Keys on a focused timeline card (not on the controls inside it). */
+function handleTimelineListKeydown(event) {
+    const card = event.target.classList && event.target.classList.contains('timeline-item') ? event.target : null;
+    if (!card || event.ctrlKey || event.metaKey) {
+        return;
+    }
+    const entryId = card.dataset.id;
+    const backward = event.key === 'ArrowLeft' || event.key === 'ArrowUp';
+    const forward = event.key === 'ArrowRight' || event.key === 'ArrowDown';
+    if (event.altKey && (backward || forward)) {
+        moveTimelineItem(entryId, backward ? 'up' : 'down');
+    } else if (event.altKey) {
+        return;
+    } else if (event.key === 'Delete' || event.key === 'Backspace') {
+        // keep the keyboard on the strip: focus goes to the clip that takes this one's place
+        const cards = Array.from(elements.timelineList.querySelectorAll('.timeline-item'));
+        const position = cards.indexOf(card);
+        removeTimelineItem(entryId);
+        const remaining = elements.timelineList.querySelectorAll('.timeline-item');
+        const next = remaining[Math.min(position, remaining.length - 1)];
+        if (next) {
+            next.focus();
+        }
+    } else if (event.key === 'Enter' || event.key === ' ') {
+        playTimelineItem(entryId);
+    } else {
+        return;
+    }
+    event.preventDefault();
 }
 
 function handleTimelineListClick(event) {
@@ -5836,17 +6029,32 @@ let mergeRunning = false;
 
 function setMergeBusy(busy) {
     mergeRunning = busy;
-    if (elements.timelineMergeButton) {
-        elements.timelineMergeButton.disabled = busy || !activeProject;
+    updateTimelineActionButtons();
+}
+
+/** Forget the merged video and its download link (another project, or a new merge is on its way). */
+function clearMergedOutput() {
+    const link = document.getElementById('mergedDownloadLink');
+    if (link) {
+        link.remove();
+    }
+    document.querySelectorAll('.merge-note').forEach(note => note.remove());
+    const video = elements.videoPlayer;
+    if (video && video.getAttribute('src')) {
+        video.pause();
+        video.removeAttribute('src');
+        video.load();
+        updateVideoPlayerTitle('Preview');
     }
 }
 
-function showMergedDownloadLink(mergedPath) {
+function showMergedDownloadLink(mergedPath, warning) {
     const downloadId = 'mergedDownloadLink';
     const existing = document.getElementById(downloadId);
     if (existing) {
         existing.remove();
     }
+    document.querySelectorAll('.merge-note').forEach(note => note.remove());
     const link = document.createElement('a');
     link.id = downloadId;
     link.className = 'button ghost-button';
@@ -5855,6 +6063,12 @@ function showMergedDownloadLink(mergedPath) {
     link.textContent = 'Download merged video';
     const videoCard = elements.videoPlayer ? elements.videoPlayer.closest('.video-card') : null;
     (videoCard || document.body).appendChild(link);
+    if (warning) {
+        const note = document.createElement('p');
+        note.className = 'result-notice merge-note';
+        note.textContent = warning;
+        (videoCard || document.body).appendChild(note);
+    }
 }
 
 /**
@@ -5866,6 +6080,7 @@ function mergeTimeline() {
     if (!entries.length || mergeRunning) {
         return;
     }
+    clearMergedOutput();        // a failed merge must not leave the previous video looking like its result
     const videosToMerge = entries.map(entry => {
         const item = entryToItem(entry);
         return {
@@ -5899,7 +6114,7 @@ function mergeTimeline() {
             finish();
             if (data.merged_video) {
                 playMergedVideo(data.merged_video, elements.loopMergedVideo ? elements.loopMergedVideo.checked : false);
-                showMergedDownloadLink(data.merged_video);
+                showMergedDownloadLink(data.merged_video, data.warning);
                 if (isMobileLayout()) {
                     setTimeout(() => switchMobileSection('viewer'), 500);
                 }
@@ -5964,9 +6179,22 @@ function moveTimelineEntryTo(entryId, target) {
     if (!activeProject || index === -1 || target === index || target < 0 || target >= entries.length) {
         return;
     }
+    const cardOf = () => Array.from(elements.timelineList.querySelectorAll('.timeline-item')).find(node => node.dataset.id === entryId);
+    const before = cardOf() ? cardOf().getBoundingClientRect() : null;
     updateTimeline(list => {
         list.splice(target, 0, list.splice(index, 1)[0]);
     });
+    const card = cardOf();
+    if (before && card) {
+        // The list was rebuilt and the card now sits one place further: scroll so it is where it was on screen.
+        // (Otherwise a second tap on the same spot hits the neighbour and moves the clip back.)
+        const after = card.getBoundingClientRect();
+        const scroller = card.closest('.timeline-scroll');
+        if (scroller && scroller.scrollWidth > scroller.clientWidth) {
+            scroller.scrollLeft += after.left - before.left;
+        }
+        window.scrollBy(0, after.top - before.top);
+    }
 }
 
 function moveTimelineItem(entryId, direction) {

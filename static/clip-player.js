@@ -141,8 +141,8 @@
         element.className = 'clip-stage';
         element.hidden = true;
         element.tabIndex = 0;
-        element.setAttribute('role', 'button');
-        element.setAttribute('aria-label', 'Clip preview. Click to replay or stop.');
+        element.setAttribute('role', 'group');
+        element.setAttribute('aria-label', 'Clip preview. Click, Enter or Space replays or stops.');
 
         const slots = [];
         for (let index = 0; index < PICTURE_SLOTS; index++) {

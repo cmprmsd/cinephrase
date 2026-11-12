@@ -119,6 +119,71 @@ body {
     margin: 0;
     padding: 0;
     min-height: 200px;
+    /* as wide as its cards, so the gaps between them (also beyond the first screen width) accept drops */
+    width: max-content;
+    min-width: 100%;
+    box-sizing: border-box;
+}
+
+.timeline-list-horizontal:empty {
+    align-items: center;
+    justify-content: center;
+    border: 1px dashed var(--border-strong);
+    border-radius: 12px;
+}
+
+.timeline-list-horizontal:empty::after {
+    content: "No clips yet. Use \"Add to Timeline\" on a match, or drag its title here.";
+    color: var(--text-muted);
+    font-size: 13px;
+    padding: 16px;
+    text-align: center;
+}
+
+.timeline-list-horizontal.drag-active:empty {
+    border-color: var(--accent);
+    background: rgba(63, 169, 245, 0.08);
+}
+
+.timeline-title {
+    min-width: 0;
+}
+
+.timeline-title-text {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.timeline-title .info-icon {
+    flex: none;
+}
+
+.timeline-origin {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 11px;
+    color: var(--text-muted);
+}
+
+/* The global input rule (full width, padding) is for text fields, not for the Enabled checkbox */
+.timeline-toggle input[type="checkbox"] {
+    width: auto;
+    padding: 0;
+    flex: none;
+}
+
+.timeline-item:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+}
+
+.timeline-item input[type="checkbox"]:focus-visible,
+.timeline-item input[type="range"]:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
 }
 
 .timeline-title {
@@ -1093,7 +1158,7 @@ textarea {
 
 /* Extra subtle button styling for less prominent actions */
 .ghost-button.subtle {
-    opacity: 0.6;
+    opacity: 0.85;
     font-size: 11px;
     padding: 4px 8px;
     border: 1px solid transparent;
@@ -1102,8 +1167,15 @@ textarea {
     transition: all 0.2s ease;
 }
 
+.ghost-button.subtle:disabled,
+.ghost-button.subtle:disabled:hover {
+    opacity: 0.35;
+    background: transparent;
+    color: var(--text-muted, #666);
+}
+
 .ghost-button.subtle:hover {
-    opacity: 0.8;
+    opacity: 1;
     color: var(--text-secondary, #ccc);
     background: var(--bg-tertiary, #2a2a2a);
 }
@@ -1355,8 +1427,20 @@ textarea {
     transform: none;
 }
 
+#sentenceAutocomplete .suggestion-item.is-selected,
+.autocomplete-suggestions .suggestion-item.is-selected {
+    background: var(--accent);
+    color: var(--bg);
+}
+
+#sentenceAutocomplete .suggestion-item.is-selected span,
+#sentenceAutocomplete .suggestion-item.is-selected b {
+    color: inherit;
+    opacity: 1;
+}
+
 .results-grid:empty::after {
-    content: "Run a search to see matching clips. Saved results appear here.";
+    content: "Run a search to see matching clips.";
     color: var(--text-muted);
     text-align: center;
     padding: 40px;
@@ -1374,7 +1458,7 @@ textarea {
 /* Floating progress box of a running merge */
 .merge-progress {
     position: fixed;
-    top: 20px;
+    bottom: 20px;
     right: 20px;
     z-index: 10000;
     width: 280px;
@@ -1446,7 +1530,58 @@ textarea {
         left: 16px;
         right: 16px;
         width: auto;
+        bottom: calc(88px + env(safe-area-inset-bottom, 0px));      /* above the bottom navigation */
     }
+}
+
+/* A search is running (its spinner may be below the fold) */
+button.is-busy {
+    position: relative;
+    opacity: 0.75;
+    cursor: progress;
+}
+
+button.is-busy::after {
+    content: "";
+    display: inline-block;
+    width: 0.8em;
+    height: 0.8em;
+    margin-left: 0.5em;
+    vertical-align: -0.1em;
+    border: 2px solid currentColor;
+    border-right-color: transparent;
+    border-radius: 50%;
+    animation: busy-spin 0.8s linear infinite;
+}
+
+@keyframes busy-spin {
+    to { transform: rotate(360deg); }
+}
+
+button.is-confirmed {
+    border-color: #4caf50;
+    color: #4caf50;
+}
+
+.phrase-more-note {
+    font-size: 11px;
+    color: var(--text-muted);
+}
+
+.field-hint {
+    display: block;
+    margin-top: 6px;
+    font-size: 12px;
+    color: var(--text-muted);
+}
+
+.field-hint kbd,
+.field-hint code {
+    font-family: inherit;
+    padding: 0 4px;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    color: var(--text);
 }
 
 /* Notices between result cards (failed renders, unmatched story segments) */
@@ -2158,6 +2293,11 @@ textarea {
     .timeline-list-horizontal {
         flex-direction: column;
         min-height: auto;
+        width: auto;
+    }
+
+    .timeline-list-horizontal:empty {
+        min-height: 96px;
     }
 
     .timeline-list-horizontal .timeline-item {
@@ -2397,13 +2537,18 @@ textarea {
     }
 
     /* Floating preview mobile - position at top */
-    .floating-preview {
-        width: calc(100% - 32px);
-        max-width: 100%;
-        left: 16px !important;
-        right: 16px;
-        top: 16px !important;
-        bottom: auto !important;
-        max-height: calc(100vh - 100px);
+    .floating-preview.is-inline {
+        position: static;
+        width: auto;
+        max-height: none;
+        overflow: visible;
+        padding: 0;
+        border: 0;
+        box-shadow: none;
+        background: transparent;
+    }
+
+    .floating-preview.is-inline .floating-preview-title {
+        display: none;      /* the card already shows the phrase */
     }
 }
