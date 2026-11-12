@@ -192,10 +192,12 @@ The server will:
 #### Searching for Clips
 
 **Sentence Search:**
-1. Enter a phrase in the "Sentence" field (e.g., "hello world")
-2. Use Tab for autocomplete suggestions (if corpus is loaded)
+1. Enter a phrase in the "Sentence" field (e.g., "hello world"); separate several phrases with `;`
+2. With the corpus loaded, suggestions appear while typing: Tab adds the next word, the arrow keys and Enter
+   (or a click) take a whole suggestion. When the words you typed are not spoken one after the other anywhere,
+   a `;` is inserted before the last word to start a new phrase; Backspace right away undoes it
 3. Click **"Search sentence"**
-4. Results appear in the Matches section below
+4. Results appear in the Matches section below; phrases without a match are listed there
 
 **Silence Search:**
 1. Adjust the dual-range slider to set min/max silence duration
@@ -208,21 +210,22 @@ The server will:
 - **Max results per segment**: Limit matches (default: 25); the results are spread over the selected videos
 
 **Wildcards** (looked up in the loaded corpus):
-- `ball*` - words starting with "ball" (`*ball`, `b*ll` work too)
+- `ball*` - words starting with "ball" (`*ball`, `b*ll` work too; a `*` on its own is one whole word: `der * ist`)
 - `ball**` - from a word starting with "ball" to the end of its sentence
 - `**ball` - from the start of a sentence up to a word ending in "ball"
 - `**ball**` - whole sentences containing "ball"
+- A term is expanded to at most 50 phrases; a notice says when there were more
 
 **Auditioning matches:**
 - Click a match (or use the arrow keys in the list) to play it; Space replays, Enter adds it to the timeline
 - Drag the waveform handles or use the arrow keys on a focused handle to trim; the trim is remembered per match
-- Click the preview picture to stop or replay
+- Click the preview picture to stop or replay; its top right corner has mute, volume and fullscreen
 
 #### Building a Timeline
 
 1. Click **"Add to timeline"** on any match card (or drag the card title onto the timeline)
 2. Clips appear in the Timeline section at the top
-3. Drag clips to reorder them
+3. Drag clips to reorder them (a bar shows where the clip will land) or use the arrow buttons; Ctrl+Z undoes
 4. Use **"Play timeline"** to preview the sequence: it plays gaplessly, exactly as the merge will cut it
 5. Click **"Merge timeline"** to export as a single video file
 6. Download button is below the preview on the right
@@ -432,6 +435,7 @@ lands (by cross-correlating the output with the source).
 - `POST /ensure_clip` - Re-create a preview clip that is missing from `temp/`
 - `POST /merge_videos_stream` - Render the timeline, streaming progress
 - `POST /generate_story`, `POST /generate_story_prompt` - AI story generation
+- `POST /parse_story_response` - Read an LLM answer that was pasted in
 - `GET /api/projects` - List all projects
 - `POST /api/projects` - Create new project
 - `GET|PUT|DELETE /api/projects/<id>` - Read, update, delete a project
