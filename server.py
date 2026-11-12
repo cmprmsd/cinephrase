@@ -853,28 +853,40 @@ def parse_story_response(llm_response, corpus_entries):
     segments, bare strings instead of objects and the old index-based format. Raises ValueError if there is no
     JSON object at all.
     """
+    # The answer is the first object that has the list of sentences. Other objects are kept as a fallback:
+    # an answer cut off by the token limit never closes its outer object, but the sentences before the cut
+    # are complete objects of their own (as is an example object some models put in their preamble).
     story_data = None
+    loose_sentences = []
     decoder = json.JSONDecoder()
     position = llm_response.find('{')
+    found_object = False
     while position != -1:
         try:
-            candidate, _end = decoder.raw_decode(llm_response, position)
+            candidate, end = decoder.raw_decode(llm_response, position)
         except json.JSONDecodeError:
-            candidate = None
+            candidate, end = None, position + 1
         if isinstance(candidate, dict):
-            story_data = candidate
-            break
-        position = llm_response.find('{', position + 1)
+            found_object = True
+            if any(isinstance(candidate.get(key), list) for key in ('sentences', 'storyline', 'segments')):
+                story_data = candidate
+                break
+            if 'sentence' in candidate or 'source_segments' in candidate:
+                loose_sentences.append(candidate)
+        else:
+            end = position + 1
+        position = llm_response.find('{', end)
     if story_data is None:
-        raise ValueError('The LLM did not return a JSON object')
+        if not found_object:
+            raise ValueError('The LLM did not return a JSON object')
+        story_data = {'sentences': loose_sentences}
 
     def as_text(value):
         return value.strip() if isinstance(value, str) else ''
 
     explanation = as_text(story_data.get('explanation'))
-    raw_sentences = story_data.get('sentences')
-    if not isinstance(raw_sentences, list):
-        raw_sentences = []
+    raw_sentences = next((story_data[key] for key in ('sentences', 'storyline')
+                          if isinstance(story_data.get(key), list)), [])
     selected_indices = None
     sentence_queries = []
 
@@ -904,6 +916,21 @@ def parse_story_response(llm_response, corpus_entries):
         if sentence_text:
             sentence_queries.append((sentence_text, search_queries or [sentence_text]))
     return explanation, sentence_queries, selected_indices, raw_sentences
+
+
+@app.route('/parse_story_response', methods=['POST'])
+def parse_story_response_route():
+    """Read an LLM answer the user pasted, with the same tolerance as /generate_story."""
+    data = request_json_object()
+    text = data.get('response') if isinstance(data.get('response'), str) else ''
+    try:
+        explanation, sentence_queries, _indices, _raw = parse_story_response(text, [])
+    except ValueError as exc:
+        return jsonify({'error': str(exc)}), 400
+    return jsonify({
+        'explanation': explanation,
+        'sentences': [{'sentence': sentence, 'queries': queries} for sentence, queries in sentence_queries],
+    })
 
 
 @app.route('/generate_story_prompt', methods=['POST'])
@@ -943,7 +970,7 @@ def generate_story():
     prompt = data.get('prompt') if isinstance(data.get('prompt'), str) else ''
     prompt = prompt.strip()
     selected_files = library_files_only(data.get('files'))
-    max_segments = sanitize_int(data.get('maxSegments'), 10)
+    max_segments = max(1, min(50, sanitize_int(data.get('maxSegments'), 10)))
     prefer_long_segments = data.get('preferLongSegments', True)
     debug_mode = data.get('debugMode', False)  # Enable debug logging
     
@@ -994,7 +1021,8 @@ def generate_story():
             "stream": False,
             "options": {
                 "temperature": 0.7,
-                "num_predict": 1000  # Increased for sentence generation (was 500 for numbers)
+                # Room for the requested number of sentences (a fixed limit cut long stories off mid-JSON)
+                "num_predict": 300 + 150 * max_segments
             }
         }
         
@@ -1149,11 +1177,6 @@ def generate_story():
             if llm_sentences_data and isinstance(llm_sentences_data[0], str):
                 debug_info['llm_sentences'] = llm_sentences_data
             response_data['debug'] = debug_info
-        else:
-            # Even if debug mode is off, return the prompt so users can copy it
-            response_data['debug'] = {
-                'prompt': llm_prompt
-            }
         
         return jsonify(response_data)
         
@@ -1235,7 +1258,17 @@ def search_longest_segments_stream():
             
             segment_count = 0
             skipped_count = 0
-            
+
+            # Tell the client the id right away: without it, Cancel cannot reach the server during the
+            # matching phase (which reads every transcript on the first search after a start).
+            try:
+                yield 'data: ' + json.dumps({
+                    'progress': f"Looking for '{sentence}'...", 'search_id': search_id,
+                    'group_index': group_index, 'total_groups': len(sentence_groups),
+                }) + '\n\n'
+            except (GeneratorExit, BrokenPipeError, ConnectionError):
+                return
+
             try:
                 # Use the generator version that yields results per segment
                 for result in find_and_export_longest_matches_incremental(
@@ -1281,6 +1314,14 @@ def search_longest_segments_stream():
                         return
                 
                 print(f"[SSE] [{group_index}/{len(sentence_groups)}] ✓ Search completed - {segment_count} segments, {skipped_count} skipped")
+                if segment_count == 0 and skipped_count == 0:
+                    try:
+                        yield 'data: ' + json.dumps({
+                            'no_match': True, 'phrase': sentence,
+                            'group_index': group_index, 'total_groups': len(sentence_groups),
+                        }) + '\n\n'
+                    except (GeneratorExit, BrokenPipeError, ConnectionError):
+                        return
                 
             except SearchCancelled:
                 print(f"[SSE] ❌ Search cancelled by the user after {total_segment_count} segments")

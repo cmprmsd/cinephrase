@@ -2116,15 +2116,23 @@ function updateSearchLoadingMessage(message, segmentData) {
         console.warn('[updateSearchLoadingMessage] Message element not found');
     }
     
-    // Remove existing skip button if any
+    // One skip button per segment: progress events arrive several times a second, and rebuilding the button
+    // on each of them swallowed clicks and reset its "Skipping..." state.
+    const segmentKey = segmentData && segmentData.segment_index
+        ? `${segmentData.search_id || ''}|${segmentData.segment_phrase || segmentData.segment_index}`
+        : '';
     const existingBtn = messageContainer.querySelector('.skip-segment-btn');
+    if (existingBtn && segmentKey && existingBtn.dataset.segment === segmentKey) {
+        return;
+    }
     if (existingBtn) {
         existingBtn.remove();
     }
     
     // Add skip button if we have segment data
-    if (segmentData && segmentData.segment_index) {
+    if (segmentKey) {
         const skipBtn = document.createElement('button');
+        skipBtn.dataset.segment = segmentKey;
         skipBtn.className = 'button ghost-button skip-segment-btn';
         skipBtn.textContent = 'Skip Segment';
         skipBtn.title = 'Skip this segment immediately (no clips will be rendered)';
@@ -2726,10 +2734,12 @@ function getMaxResultsPerSegment() {
 }
 
 const WORD_CHARACTER = '[\\p{L}\\p{N}]';
+const WILDCARD_EXPANSION_LIMIT = 50;
 
 /**
  * Expand one search term with wildcards against the loaded corpus.
- *   ball*    words that start with "ball" (a * stands for letters inside one word; "der ball*" works too)
+ *   ball*    words that start with "ball" (a * stands for letters inside one word; "der ball*" works too,
+ *            and a * on its own stands for one whole word: "der * ist")
  *   ball**   from a word starting with "ball" to the end of its sentence
  *   **ball   from the start of a sentence up to a word ending in "ball"
  *   **ball** whole sentences containing "ball"
@@ -2741,13 +2751,16 @@ function expandWildcardTerm(term, limit) {
     const seen = new Set();
     const add = text => {
         const cleaned = text.trim().replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, '');
-        const key = cleaned.toLowerCase().replace(/[^\p{L}\p{N}\s']/gu, '').replace(/\s+/g, ' ');
+        const key = searchTokens(cleaned).join(' ');     // what the search would compare
         if (key && !seen.has(key)) {
             seen.add(key);
             results.push(cleaned);
         }
     };
     const corpus = sentences.map(entry => entry && entry.current).filter(Boolean);
+    // A match must start at a word boundary. (Written without lookbehind, which older Safari cannot parse:
+    // the character before the match is captured and skipped instead.)
+    const boundary = `(^|[^\\p{L}\\p{N}])`;
 
     if (term.includes('**')) {
         const leading = term.startsWith('**');
@@ -2758,33 +2771,37 @@ function expandWildcardTerm(term, limit) {
         }
         const escaped = escapeRegExp(core);
         const pattern = leading && trailing
-            ? escaped
+            ? `()(${escaped})`
             : leading
-                ? `${escaped}(?!${WORD_CHARACTER})`
-                : `(?<!${WORD_CHARACTER})${escaped}`;
+                ? `()(${escaped})(?!${WORD_CHARACTER})`
+                : `${boundary}(${escaped})`;
         const regex = new RegExp(pattern, 'iu');
         for (const text of corpus) {
             if (results.length >= limit) break;
             const match = regex.exec(text);
             if (!match) continue;
+            const from = match.index + match[1].length;
             if (leading && trailing) {
                 add(text);
             } else if (leading) {
-                add(text.slice(0, match.index + match[0].length));
+                add(text.slice(0, from + match[2].length));
             } else {
-                add(text.slice(match.index));
+                add(text.slice(from));
             }
         }
         return results;
     }
 
-    // Single *: letters/digits (and inner apostrophes or hyphens) inside one word
-    const pattern = term.split('*').map(escapeRegExp).join(`(?:${WORD_CHARACTER}|['’-])*`);
-    const regex = new RegExp(`(?<!${WORD_CHARACTER})${pattern}(?!${WORD_CHARACTER})`, 'giu');
+    // Single *: letters/digits (and inner apostrophes or hyphens) inside one word; alone it is a whole word
+    const inWord = `(?:${WORD_CHARACTER}|['’-])*`;
+    const pattern = term.split(/\s+/).filter(Boolean)
+        .map(word => (word === '*' ? `${WORD_CHARACTER}${inWord}` : word.split('*').map(escapeRegExp).join(inWord)))
+        .join(`[^\\p{L}\\p{N}]+`);
+    const regex = new RegExp(`${boundary}(${pattern})(?!${WORD_CHARACTER})`, 'giu');
     for (const text of corpus) {
         if (results.length >= limit) break;
         for (const match of text.matchAll(regex)) {
-            add(match[0]);
+            add(match[2]);
             if (results.length >= limit) break;
         }
     }
@@ -2830,6 +2847,7 @@ function handleSentenceSearch() {
     const maxResultsPerSegment = getMaxResultsPerSegment();
     const sentenceGroups = [];
     const seenGroups = new Set();
+    const notes = [];       // things to tell the user about single terms without giving up the other terms
     for (const term of rawSentence.split(';').map(part => part.trim()).filter(Boolean)) {
         let expansions = [term];
         if (term.includes('*')) {
@@ -2837,14 +2855,16 @@ function handleSentenceSearch() {
                 showNoResults('Wildcards (*) are looked up in the corpus: click "Load corpus" in the Media Library first.');
                 return;
             }
-            expansions = expandWildcardTerm(term, maxResultsPerSegment);
+            expansions = expandWildcardTerm(term, WILDCARD_EXPANSION_LIMIT + 1);
             if (expansions === null) {
                 showNoResults(`"${term}" is not a supported wildcard pattern. Use ball*, ball**, **ball or **ball**.`);
                 return;
             }
             if (!expansions.length) {
-                showNoResults(`Nothing in the corpus matches "${term}".`);
-                return;
+                notes.push(`Nothing in the corpus matches "${term}".`);
+            } else if (expansions.length > WILDCARD_EXPANSION_LIMIT) {
+                expansions.length = WILDCARD_EXPANSION_LIMIT;
+                notes.push(`"${term}" matches more than ${WILDCARD_EXPANSION_LIMIT} phrases: only the first ${WILDCARD_EXPANSION_LIMIT} are searched.`);
             }
         }
         expansions.forEach(group => {
@@ -2856,6 +2876,9 @@ function handleSentenceSearch() {
         });
     }
     if (!sentenceGroups.length) {
+        if (notes.length) {
+            showNoResults(notes.join(' '));
+        }
         return;
     }
 
@@ -2884,9 +2907,11 @@ function handleSentenceSearch() {
         ? `${sentenceGroups.slice(0, 3).join('; ')}; … (${sentenceGroups.length} phrases)`
         : sentenceGroups.join('; ');
     showSearchLoading(`Searching for "${displaySentence}"...`, cancelActiveSearch);
+    notes.forEach(showResultNotice);
 
     let resultCount = 0;
-    const problems = [];
+    const problems = [...notes];
+    const unmatched = [];
     const onEvent = data => {
         if (!search.isCurrent) {
             return false;
@@ -2907,6 +2932,10 @@ function handleSentenceSearch() {
                 window.currentSearchId = data.search_id;
             }
             updateSearchLoadingMessage(data.progress, data);
+            return true;
+        }
+        if (data.no_match) {
+            unmatched.push(data.phrase);
             return true;
         }
         if (data.phrase) {
@@ -2956,6 +2985,9 @@ function handleSentenceSearch() {
             finishSearch(search);
             if (!resultCount && !problems.length) {
                 showNoResults(`No matches found for "${displaySentence}".`);
+            } else if (unmatched.length) {
+                // Some phrases of a multi-phrase search found nothing: say which, the cards do not show it.
+                showResultNotice(`No matches for ${unmatched.map(phrase => `"${phrase}"`).join(', ')}.`);
             }
         })
         .catch(error => {
@@ -3153,13 +3185,10 @@ function handleGenerateStory() {
         // Display the generated story segments
         console.log(`[Client] ✓ Received ${data.segments.length} story segments from AI`);
         
-        // Display debug information if available
-        if (data.debug) {
-            console.log('[Client] 🔍 DEBUG INFO:', data.debug);
-            displayDebugInfo(data.debug);
-        }
-        
         displayStorySegments(data.segments, data.story_explanation);
+        if (data.debug) {
+            displayDebugInfo(data.debug);       // after the cards: displayStorySegments empties the list first
+        }
         if (Array.isArray(data.unmatched) && data.unmatched.length) {
             showResultNotice(`${data.unmatched.length} segment(s) of the story were not found in the selected videos: ${data.unmatched.map(item => `"${item}"`).join(', ')}`);
         }
@@ -3267,7 +3296,7 @@ function handleCancelInsertResponse() {
     }
 }
 
-function handleProcessInsertedResponse() {
+async function handleProcessInsertedResponse() {
     if (!elements.llmResponseInput || !activeProject) {
         return;
     }
@@ -3284,49 +3313,35 @@ function handleProcessInsertedResponse() {
         return;
     }
     
-    // Parse the JSON response
-    let storyData;
+    // The server reads the answer, with the same tolerance as for a story it requested itself (text around
+    // the JSON, several objects, an answer that was cut off).
+    let explanation = '';
+    let sentenceQueries = [];
     try {
-        // Try to extract JSON from the response (in case it's wrapped in markdown or text)
-        const jsonMatch = responseText.match(/\{[\s\S]*\}/);
-        if (jsonMatch) {
-            storyData = JSON.parse(jsonMatch[0]);
-        } else {
-            storyData = JSON.parse(responseText);
+        const response = await fetch('/parse_story_response', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ response: responseText })
+        });
+        const parsed = await response.json().catch(() => ({}));
+        if (!response.ok) {
+            throw new Error(parsed.error || `the server answered with HTTP ${response.status}`);
         }
-    } catch (err) {
-        alert('Invalid JSON format. Please check the response and try again.');
-        console.error('JSON parse error:', err);
+        explanation = parsed.explanation || '';
+        sentenceQueries = (parsed.sentences || []).map(item => [item.sentence, item.queries]);
+    } catch (error) {
+        alert(`The response could not be read: ${error.message}`);
         return;
     }
-    
-    // Same tolerance as the server (parse_story_response): "sentences" or "storyline"; objects with
-    // sentence + source_segments (a list or a single string) or bare strings; anything else is ignored.
-    const explanation = typeof storyData.explanation === 'string' ? storyData.explanation : '';
-    const rawSentences = [storyData.sentences, storyData.storyline].find(Array.isArray) || [];
-    const text = value => (typeof value === 'string' ? value.trim() : '');
-    const sentenceQueries = [];
-    for (const item of rawSentences) {
-        const entry = typeof item === 'string' ? { sentence: item } : item;
-        if (!entry || typeof entry !== 'object') {
-            continue;
-        }
-        const segments = (Array.isArray(entry.source_segments) ? entry.source_segments : [entry.source_segments])
-            .map(text)
-            .filter(Boolean);
-        const sentence = text(entry.sentence) || segments.join(' ');
-        if (sentence) {
-            sentenceQueries.push([sentence, segments.length ? segments : [sentence]]);
-        }
-    }
-
     if (!sentenceQueries.length) {
         alert('No sentences found in the response. Expected a "sentences" array.');
         return;
     }
 
-    // Hide the insert response container
-    handleCancelInsertResponse();
+    // Close the input box but keep the pasted text until the user discards it
+    if (elements.insertResponseContainer) {
+        elements.insertResponseContainer.style.display = 'none';
+    }
     cancelActiveSearch();
     stopClipPlayback();
     hideFloatingPreview();

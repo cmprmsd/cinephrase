@@ -275,6 +275,26 @@ class StoryResponseTest(ServerTestCase):
         explanation, queries, indices, _raw = self.parse(text)
         self.assertEqual((explanation, queries, indices), ('why', [('A b', ['a', 'b'])], None))
 
+    def test_answer_cut_off_by_the_token_limit_keeps_its_complete_sentences(self):
+        text = ('{"explanation": "why", "sentences": [{"sentence": "One two", "source_segments": ["one", "two"]}, '
+                '{"sentence": "Three", "source_segments": ["three"]}, {"sentence": "Fo')
+        _, queries, _, _ = self.parse(text)
+        self.assertEqual(queries, [('One two', ['one', 'two']), ('Three', ['three'])])
+
+    def test_example_object_before_the_answer_is_not_taken_for_it(self):
+        text = ('I will use the format {"sentence": "...", "source_segments": ["..."]} as requested.\n'
+                '{"explanation": "why", "sentences": [{"sentence": "Real one", "source_segments": ["real one"]}]}')
+        explanation, queries, _, _ = self.parse(text)
+        self.assertEqual((explanation, queries), ('why', [('Real one', ['real one'])]))
+
+    def test_pasted_answers_are_read_by_the_same_parser(self):
+        pasted = ('```json\n{"storyline": [{"sentence": "A b", "source_segments": "a b"}]}\n```\n'
+                  'I kept every word from the corpus {as requested}.')
+        response = self.client.post('/parse_story_response', json={'response': pasted})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()['sentences'], [{'sentence': 'A b', 'queries': ['a b']}])
+        self.assertEqual(self.client.post('/parse_story_response', json={'response': 'null'}).status_code, 400)
+
     def test_off_format_answers_do_not_crash_or_search_single_letters(self):
         _, queries, _, _ = self.parse(json.dumps({'sentences': [
             {'sentence': 'One', 'source_segments': 'in der'},          # string instead of list
@@ -435,6 +455,12 @@ class SearchExportTest(ServerTestCase):
         again = next(e for e in self._search(sentence_groups=['hello']) if e.get('files'))
         self.assertEqual({item['file'] for item in again['files']}, set(by_path))
         self.assertEqual(stamp, {path: os.path.getmtime(server.resolve_media_path(path)) for path in by_path})  # reused
+
+    def test_groups_without_a_match_are_reported_and_the_search_id_comes_first(self):
+        events = self._search(sentence_groups=['hello there', 'no such words'])
+        self.assertIn('search_id', events[0])                       # known before any matching: Cancel can use it
+        self.assertEqual([event['phrase'] for event in events if event.get('no_match')], ['no such words'])
+        self.assertEqual([event['phrase'] for event in events if event.get('files')], ['hello there'])
 
     def test_commas_do_not_split_a_bare_sentence(self):
         events = self._search(sentence='hello, there')
