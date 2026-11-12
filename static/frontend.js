@@ -1810,53 +1810,56 @@ function hideSearchLoading() {
     }
 }
 
-function showMergeProgress(message, progress, total) {
-    // Remove existing progress indicator if any
-    const existing = document.getElementById('mergeProgressIndicator');
-    if (existing) {
-        existing.remove();
-    }
-    
-    // Create progress indicator
+/** Floating progress box of a running merge: what the server is doing, a bar and a cancel button. */
+function showMergeProgress(message, progress, total, onCancel = null) {
+    hideMergeProgress();
+
     const progressDiv = document.createElement('div');
     progressDiv.id = 'mergeProgressIndicator';
-    progressDiv.className = 'search-loading';
-    progressDiv.style.cssText = 'position: fixed; top: 20px; right: 20px; z-index: 10000; background: #1a1a1a !important; padding: 12px; border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.7); width: 240px; border: 1px solid rgba(255,255,255,0.2); opacity: 1 !important;';
-    
-    const percentage = total > 0 ? Math.round((progress / total) * 100) : 0;
-    progressDiv.innerHTML = `
-        <div style="display: flex; align-items: center; gap: 10px; margin-bottom: 10px;">
-            <div class="loading-spinner" style="width: 20px; height: 20px; flex-shrink: 0;"></div>
-            <div style="flex: 1;">
-                <p style="margin: 0; font-weight: 500; font-size: 14px;">Merging Timeline</p>
-                <p style="margin: 2px 0 0 0; font-size: 12px; color: var(--text-secondary);">${progress} / ${total}</p>
-            </div>
-        </div>
-        <div style="background: var(--bg-secondary); border-radius: 4px; height: 6px; overflow: hidden;">
-            <div style="background: var(--accent); height: 100%; width: ${percentage}%; transition: width 0.3s ease;"></div>
-        </div>
-    `;
-    
+    progressDiv.className = 'merge-progress';
+    progressDiv.setAttribute('role', 'status');
+
+    const header = document.createElement('div');
+    header.className = 'merge-progress-header';
+    const spinner = document.createElement('div');
+    spinner.className = 'loading-spinner';
+    const texts = document.createElement('div');
+    texts.className = 'merge-progress-texts';
+    const title = document.createElement('p');
+    title.className = 'merge-progress-title';
+    title.textContent = 'Merging timeline';
+    const detail = document.createElement('p');
+    detail.className = 'merge-progress-detail';
+    texts.append(title, detail);
+    header.append(spinner, texts);
+
+    const track = document.createElement('div');
+    track.className = 'merge-progress-track';
+    const bar = document.createElement('div');
+    bar.className = 'merge-progress-bar';
+    track.appendChild(bar);
+
+    progressDiv.append(header, track);
+    if (onCancel) {
+        const cancelButton = document.createElement('button');
+        cancelButton.type = 'button';
+        cancelButton.className = 'ghost-button merge-progress-cancel';
+        cancelButton.textContent = 'Cancel merge';
+        cancelButton.addEventListener('click', onCancel);
+        progressDiv.appendChild(cancelButton);
+    }
     document.body.appendChild(progressDiv);
+    updateMergeProgress(message, progress, total);
 }
 
 function updateMergeProgress(message, progress, total) {
     const progressDiv = document.getElementById('mergeProgressIndicator');
     if (!progressDiv) {
-        showMergeProgress(message, progress, total);
         return;
     }
-    
-    const percentage = total > 0 ? Math.round((progress / total) * 100) : 0;
-    const countP = progressDiv.querySelector('p:first-of-type + p');
-    const progressBar = progressDiv.querySelector('div[style*="background: var(--accent)"]');
-    
-    if (countP) {
-        countP.textContent = `${progress} / ${total}`;
-    }
-    if (progressBar) {
-        progressBar.style.width = `${percentage}%`;
-    }
+    const percentage = total > 0 ? Math.max(0, Math.min(100, Math.round((progress / total) * 100))) : 0;
+    progressDiv.querySelector('.merge-progress-detail').textContent = message ? `${message} (${percentage}%)` : `${percentage}%`;
+    progressDiv.querySelector('.merge-progress-bar').style.width = `${percentage}%`;
 }
 
 function hideMergeProgress() {
@@ -5910,14 +5913,19 @@ function mergeTimeline() {
         };
     });
 
-    showMergeProgress('Preparing merge...', 0, videosToMerge.length);
-    setMergeBusy(true);
+    // Closing the connection is the cancel signal: the server stops rendering and removes its work files.
+    const controller = new AbortController();
     let finished = false;
     const finish = () => {
         finished = true;
         hideMergeProgress();
         setMergeBusy(false);
     };
+    showMergeProgress('Preparing merge...', 0, 1, () => {
+        finish();
+        controller.abort();
+    });
+    setMergeBusy(true);
 
     const handleEvent = data => {
         if (data.done) {
@@ -5941,7 +5949,8 @@ function mergeTimeline() {
     fetch('/merge_videos_stream', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ videos: videosToMerge })
+        body: JSON.stringify({ videos: videosToMerge }),
+        signal: controller.signal
     })
         .then(async response => {
             if (!response.ok) {
@@ -5949,6 +5958,9 @@ function mergeTimeline() {
                 throw new Error(failure.error || `HTTP error! status: ${response.status}`);
             }
             await readEventStream(response, data => {
+                if (finished) {
+                    return false;
+                }
                 handleEvent(data);
                 return !finished;
             });
