@@ -16,7 +16,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from fractions import Fraction
 from pathlib import Path
-from threading import Lock, Semaphore
+from threading import Lock, RLock, Semaphore
 from typing import List, Optional, Sequence, Tuple
 
 from flask import Flask, jsonify, render_template, request, send_from_directory, Response, stream_with_context
@@ -30,8 +30,9 @@ DATA_DIR = os.path.join(app.root_path, 'data')
 TEMP_DIR = os.path.join(app.root_path, 'temp')
 PROJECTS_FILE = os.path.join(DATA_DIR, 'projects.json')
 COLLECTIONS_FILE = os.path.join(DATA_DIR, 'collections.json')
-PROJECT_STORE_LOCK = Lock()
-COLLECTIONS_LOCK = Lock()
+# Reentrant: routes hold the lock across read-modify-write, the read/write helpers take it again.
+PROJECT_STORE_LOCK = RLock()
+COLLECTIONS_LOCK = RLock()
 
 # Track skipped segments per search session
 SKIP_SEGMENTS = {}  # Format: {search_id: set(segment_phrases)}
@@ -331,34 +332,85 @@ def initialize_gpu_at_startup():
 def ensure_project_store():
     os.makedirs(DATA_DIR, exist_ok=True)
     os.makedirs(TEMP_DIR, exist_ok=True)
-    if not os.path.exists(PROJECTS_FILE):
-        with open(PROJECTS_FILE, 'w', encoding='utf-8') as file:
-            json.dump({'projects': []}, file, indent=2)
 
 
 def timestamp():
     return datetime.utcnow().replace(microsecond=0).isoformat() + 'Z'
 
 
+def _load_json_list(path, key):
+    """Parse ``{key: [...]}`` from ``path``. Returns None if the file is unreadable or has another shape."""
+    try:
+        with open(path, 'r', encoding='utf-8') as file:
+            data = json.load(file)
+    except (OSError, ValueError):
+        return None
+    items = data.get(key) if isinstance(data, dict) else None
+    return items if isinstance(items, list) else None
+
+
+def _dump_json_atomically(path, payload):
+    temp_path = f'{path}.{uuid.uuid4().hex}.tmp'
+    try:
+        with open(temp_path, 'w', encoding='utf-8') as file:
+            json.dump(payload, file, indent=2)
+            file.flush()
+            os.fsync(file.fileno())
+        os.replace(temp_path, path)
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+
+
+def read_json_store(path, key):
+    """Read a ``{key: [...]}`` store.
+
+    A damaged file is never treated as "empty" (the next save would overwrite everything): the previous good
+    version (``.bak``) is restored instead and the damaged file is kept next to it for manual recovery.
+    """
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    if not os.path.exists(path):
+        return []
+    items = _load_json_list(path, key)
+    if items is not None:
+        return items
+    damaged_copy = f"{path}.damaged-{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}"
+    try:
+        shutil.copy2(path, damaged_copy)
+    except OSError:
+        damaged_copy = None
+    backup = _load_json_list(f'{path}.bak', key)
+    print(f"[Store] {os.path.basename(path)} is damaged"
+          f"{f' (copy kept as {os.path.basename(damaged_copy)})' if damaged_copy else ''}; "
+          f"{'restored the previous version from .bak' if backup is not None else 'no usable .bak, starting empty'}")
+    recovered = backup if backup is not None else []
+    if damaged_copy:
+        _dump_json_atomically(path, {key: recovered})
+    return recovered
+
+
+def write_json_store(path, key, items):
+    """Write a store atomically (temp file + fsync + rename), keeping the previous version as ``.bak``."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    if _load_json_list(path, key) is not None:
+        shutil.copy2(path, f'{path}.bak')
+    _dump_json_atomically(path, {key: items})
+
+
 def read_projects():
-    ensure_project_store()
     with PROJECT_STORE_LOCK:
-        with open(PROJECTS_FILE, 'r', encoding='utf-8') as file:
-            try:
-                data = json.load(file)
-            except json.JSONDecodeError:
-                data = {}
-        projects = data.get('projects', [])
-        if not isinstance(projects, list):
-            projects = []
-        return projects
+        return read_json_store(PROJECTS_FILE, 'projects')
 
 
 def write_projects(projects):
-    ensure_project_store()
     with PROJECT_STORE_LOCK:
-        with open(PROJECTS_FILE, 'w', encoding='utf-8') as file:
-            json.dump({'projects': projects}, file, indent=2)
+        write_json_store(PROJECTS_FILE, 'projects', projects)
+
+
+def request_json_object():
+    """The request body as a dict ({} for missing, malformed or non-object JSON)."""
+    data = request.get_json(silent=True)
+    return data if isinstance(data, dict) else {}
 
 
 def find_project(projects, project_id):
@@ -399,7 +451,7 @@ def list_projects():
 
 @app.route('/api/projects', methods=['POST'])
 def create_project():
-    payload = request.json or {}
+    payload = request_json_object()
     name = normalize_project_name(payload.get('name'), DEFAULT_PROJECT_STATE['name'])
     base_payload = default_project_payload(name)
 
@@ -416,9 +468,10 @@ def create_project():
         'updatedAt': now
     }
 
-    projects = read_projects()
-    projects.append(new_project)
-    write_projects(projects)
+    with PROJECT_STORE_LOCK:
+        projects = read_projects()
+        projects.append(new_project)
+        write_projects(projects)
     return jsonify(new_project), 201
 
 
@@ -433,54 +486,45 @@ def get_project(project_id):
 
 @app.route('/api/projects/<project_id>', methods=['PUT'])
 def update_project(project_id):
-    projects = read_projects()
-    project = find_project(projects, project_id)
-    if not project:
-        return jsonify({'error': 'Project not found'}), 404
+    payload = request_json_object()
+    with PROJECT_STORE_LOCK:
+        projects = read_projects()
+        project = find_project(projects, project_id)
+        if not project:
+            return jsonify({'error': 'Project not found'}), 404
 
-    payload = request.json or {}
+        if 'name' in payload:
+            project['name'] = normalize_project_name(payload['name'], project.get('name', 'Untitled Project'))
 
-    if 'name' in payload:
-        project['name'] = normalize_project_name(payload['name'], project.get('name', 'Untitled Project'))
+        if isinstance(payload.get('data'), dict):
+            project['data'] = payload['data']
 
-    if isinstance(payload.get('data'), dict):
-        project['data'] = json.loads(json.dumps(payload['data']))
-
-    project['updatedAt'] = timestamp()
-    write_projects(projects)
+        project['updatedAt'] = timestamp()
+        write_projects(projects)
     return jsonify(project)
 
 
 @app.route('/api/projects/<project_id>', methods=['DELETE'])
 def delete_project(project_id):
-    projects = read_projects()
-    updated_projects = [project for project in projects if project.get('id') != project_id]
-    if len(updated_projects) == len(projects):
-        return jsonify({'error': 'Project not found'}), 404
-    write_projects(updated_projects)
+    with PROJECT_STORE_LOCK:
+        projects = read_projects()
+        updated_projects = [project for project in projects if project.get('id') != project_id]
+        if len(updated_projects) == len(projects):
+            return jsonify({'error': 'Project not found'}), 404
+        write_projects(updated_projects)
     return jsonify({'status': 'deleted', 'id': project_id})
 
 
 def read_collections():
     """Read collections from file."""
-    os.makedirs(DATA_DIR, exist_ok=True)
-    if not os.path.exists(COLLECTIONS_FILE):
-        with open(COLLECTIONS_FILE, 'w', encoding='utf-8') as file:
-            json.dump({'collections': []}, file, indent=2)
-        return []
-    try:
-        with open(COLLECTIONS_FILE, 'r', encoding='utf-8') as file:
-            data = json.load(file)
-            return data.get('collections', [])
-    except (json.JSONDecodeError, FileNotFoundError):
-        return []
+    with COLLECTIONS_LOCK:
+        return read_json_store(COLLECTIONS_FILE, 'collections')
 
 
 def write_collections(collections):
     """Write collections to file."""
-    os.makedirs(DATA_DIR, exist_ok=True)
-    with open(COLLECTIONS_FILE, 'w', encoding='utf-8') as file:
-        json.dump({'collections': collections}, file, indent=2)
+    with COLLECTIONS_LOCK:
+        write_json_store(COLLECTIONS_FILE, 'collections', collections)
 
 
 @app.route('/api/collections', methods=['GET'])
@@ -494,14 +538,15 @@ def get_collections():
 @app.route('/api/collections', methods=['POST'])
 def save_collection():
     """Save a new collection."""
-    data = request.json or {}
-    name = data.get('name', '').strip()
+    data = request_json_object()
+    name = data.get('name')
+    name = name.strip() if isinstance(name, str) else ''
     files = data.get('files', [])
     
     if not name:
         return jsonify({'error': 'Collection name is required'}), 400
     
-    if not files or not isinstance(files, list):
+    if not files or not isinstance(files, list) or not all(isinstance(item, str) for item in files):
         return jsonify({'error': 'Files list is required'}), 400
     
     with COLLECTIONS_LOCK:

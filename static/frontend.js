@@ -21,8 +21,9 @@ let libraryFiles = [];
 let projectList = [];
 let activeProject = null;
 let autosaveTimer = null;
+let autosaveRevision = 0;      // bumped by every change of the active project
+let autosaveRequest = null;     // the save that is on the wire, if any
 let isApplyingProject = false;
-let isAutosaving = false;
 
 const elements = {};
 const dragState = { type: null, data: null, originalItemPositions: null };
@@ -1064,6 +1065,8 @@ async function loadProject(projectId) {
         return;
     }
     try {
+        await flushAutosave();
+        stopClipPlayback();
         setAutosaveStatus('Loading project…', 'saving');
         const response = await fetch(`/api/projects/${projectId}`);
         if (!response.ok) {
@@ -1153,6 +1156,12 @@ async function handleDeleteProject() {
     }
 
     try {
+        cancelAutosave();
+        if (autosaveRequest) {
+            await autosaveRequest;
+        }
+        cancelAutosave();
+        stopClipPlayback();
         const response = await fetch(`/api/projects/${activeProject.id}`, { method: 'DELETE' });
         if (!response.ok) {
             throw new Error(`Failed to delete project: ${response.status}`);
@@ -1368,59 +1377,111 @@ function scheduleAutosave(immediate = false) {
     if (!activeProject || isApplyingProject) {
         return;
     }
-
-    if (autosaveTimer) {
-        clearTimeout(autosaveTimer);
-        autosaveTimer = null;
-    }
-
+    autosaveRevision += 1;
+    clearTimeout(autosaveTimer);
     setAutosaveStatus('Unsaved changes', 'dirty');
-
-    const delay = immediate ? 0 : AUTOSAVE_DELAY;
-    autosaveTimer = setTimeout(runAutosave, delay);
+    autosaveTimer = setTimeout(runAutosave, immediate ? 0 : AUTOSAVE_DELAY);
 }
 
-async function runAutosave() {
-    if (!activeProject || isApplyingProject || isAutosaving) {
+function putProject(project, keepalive = false) {
+    const body = JSON.stringify({
+        name: normalizeProjectName(project.name),
+        data: project.data || {}
+    });
+    return fetch(`/api/projects/${project.id}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body,
+        // keepalive lets the request outlive the page, but browsers cap such bodies at 64 KiB.
+        keepalive: keepalive && body.length < 60000
+    });
+}
+
+/**
+ * Save the active project. The local project object stays the source of truth (the server's echo is not
+ * swapped in), so edits made while a save is on the wire are kept and trigger a follow-up save.
+ */
+async function runAutosave(keepalive = false) {
+    clearTimeout(autosaveTimer);
+    autosaveTimer = null;
+    if (!activeProject || isApplyingProject) {
         return;
     }
-
-    autosaveTimer = null;
-    isAutosaving = true;
+    if (autosaveRequest) {
+        // One save at a time; the running one re-runs when it sees a newer revision.
+        return autosaveRequest;
+    }
+    const project = activeProject;
+    const revision = autosaveRevision;
     setAutosaveStatus('Saving…', 'saving');
-
-    try {
-        const payload = {
-            name: normalizeProjectName(activeProject.name),
-            data: activeProject.data || {}
-        };
-        const response = await fetch(`/api/projects/${activeProject.id}`, {
-            method: 'PUT',
-            headers: {
-                'Content-Type': 'application/json'
-            },
-            body: JSON.stringify(payload)
-        });
-
-        if (!response.ok) {
-            throw new Error(`Autosave failed: ${response.status}`);
+    autosaveRequest = (async () => {
+        let failed = false;
+        let gone = false;
+        try {
+            const response = await putProject(project, keepalive === true);
+            gone = response.status === 404;
+            if (!response.ok) {
+                throw new Error(`Autosave failed: ${response.status}`);
+            }
+            const updated = await response.json();
+            project.updatedAt = updated.updatedAt;
+            updateProjectListEntry(project);
+            refreshActiveProjectOption();
+        } catch (error) {
+            failed = true;
+            console.error('Autosave failed', error);
         }
-
-        const updated = await response.json();
-        activeProject = updated;
-        updateProjectListEntry(updated);
-        renderProjectPicker();
-        if (elements.projectSelect) {
-            elements.projectSelect.value = updated.id;
+        autosaveRequest = null;
+        if (project !== activeProject) {
+            return;
         }
-        setAutosaveStatus('All changes saved', 'ready');
-    } catch (error) {
-        console.error('Autosave failed', error);
-        setAutosaveStatus('Autosave failed', 'error');
-    } finally {
-        isAutosaving = false;
+        if (gone) {
+            setAutosaveStatus('This project no longer exists on the server', 'error');
+        } else if (failed) {
+            setAutosaveStatus('Autosave failed, retrying…', 'error');
+            autosaveTimer = setTimeout(runAutosave, 5000);
+        } else if (autosaveRevision !== revision) {
+            setAutosaveStatus('Unsaved changes', 'dirty');
+            if (!autosaveTimer) {
+                autosaveTimer = setTimeout(runAutosave, 0);
+            }
+        } else {
+            setAutosaveStatus('All changes saved', 'ready');
+        }
+    })();
+    return autosaveRequest;
+}
+
+/** Write pending changes now (before switching, duplicating or leaving the project). */
+async function flushAutosave() {
+    for (let attempt = 0; attempt < 3; attempt++) {
+        if (autosaveRequest) {
+            await autosaveRequest;
+        }
+        if (!autosaveTimer) {
+            return;
+        }
+        await runAutosave();
     }
 }
+
+function cancelAutosave() {
+    clearTimeout(autosaveTimer);
+    autosaveTimer = null;
+}
+
+// Closing or hiding the tab within the autosave delay must not lose the last edits.
+function saveBeforeLeaving() {
+    if (activeProject && autosaveTimer) {
+        runAutosave(true);
+    }
+}
+window.addEventListener('pagehide', saveBeforeLeaving);
+document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden') {
+        saveBeforeLeaving();
+    }
+});
 
 function updateProjectData(mutator, options = {}) {
     if (!activeProject || typeof mutator !== 'function') {
