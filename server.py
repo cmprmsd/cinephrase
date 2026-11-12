@@ -13,7 +13,7 @@ import unicodedata
 import uuid
 from collections import OrderedDict
 from concurrent.futures import CancelledError, ThreadPoolExecutor, as_completed
-from datetime import datetime
+from datetime import datetime, timezone
 from fractions import Fraction
 from pathlib import Path
 from threading import Event, Lock, RLock, Semaphore
@@ -313,8 +313,13 @@ def ensure_project_store():
     os.makedirs(TEMP_DIR, exist_ok=True)
 
 
+def _utc_now():
+    """Current UTC time without tzinfo (the stored timestamps carry a literal 'Z')."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
 def timestamp():
-    return datetime.utcnow().replace(microsecond=0).isoformat() + 'Z'
+    return _utc_now().replace(microsecond=0).isoformat() + 'Z'
 
 
 def _load_json_list(path, key):
@@ -353,7 +358,7 @@ def read_json_store(path, key):
     items = _load_json_list(path, key)
     if items is not None:
         return items
-    damaged_copy = f"{path}.damaged-{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}"
+    damaged_copy = f"{path}.damaged-{_utc_now().strftime('%Y%m%d-%H%M%S')}"
     try:
         shutil.copy2(path, damaged_copy)
     except OSError:
@@ -559,7 +564,7 @@ def save_collection():
             if not data.get('overwrite'):
                 return jsonify({'error': 'Collection with this name already exists'}), 400
             existing['files'] = files
-            existing['updatedAt'] = datetime.utcnow().isoformat() + 'Z'
+            existing['updatedAt'] = timestamp()
             write_collections(collections)
             return jsonify({'status': 'updated', 'collection': existing})
         
@@ -567,8 +572,8 @@ def save_collection():
             'id': str(uuid.uuid4()),
             'name': name,
             'files': files,
-            'createdAt': datetime.utcnow().isoformat() + 'Z',
-            'updatedAt': datetime.utcnow().isoformat() + 'Z'
+            'createdAt': timestamp(),
+            'updatedAt': timestamp()
         }
         
         collections.append(collection)
