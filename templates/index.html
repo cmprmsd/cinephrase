@@ -15,8 +15,10 @@
                     <div class="card-actions">
                         <button id="timelinePlayButton" class="ghost-button">Play timeline</button>
                         <button id="timelineMergeButton">Merge timeline</button>
-                        <button id="timelineRerenderButton" class="ghost-button subtle">Re-render All Videos</button>
-                        <button id="timelineClearButton" class="ghost-button danger">Clear</button>
+                        <button id="timelineRestoreButton" class="ghost-button subtle" title="Re-create preview clips that were removed from the temp folder">Restore missing clips</button>
+                        <button id="timelineUndoButton" class="ghost-button subtle" title="Undo the last timeline change (Ctrl+Z)" disabled>Undo</button>
+                        <button id="timelineRedoButton" class="ghost-button subtle" title="Redo (Ctrl+Shift+Z)" disabled>Redo</button>
+                        <button id="timelineClearButton" class="ghost-button danger" title="Remove all clips from the timeline (can be undone)">Clear</button>
                     </div>
                 </div>
                 <div style="padding: 0 20px 12px 20px;">
@@ -156,6 +158,7 @@
                                                 <textarea id="sentenceInput" class="sentence-input" rows="2" placeholder="Type a sentence to match"></textarea>
                                                 <button id="searchLongestSegmentsButton" class="primary-action">Search sentence</button>
                                             </div>
+                                            <small class="field-hint">Several phrases: separate with <code>;</code> &middot; <code>ball*</code> any ending, <code>ball**</code> to the end of the sentence &middot; <kbd>Tab</kbd> completes from the loaded corpus</small>
                                         </label>
                                         
                                         <div class="search-divider">
@@ -294,6 +297,7 @@
             </button>
         </nav>
 
+        <script src="static/clip-player.js"></script>
         <script src="static/frontend.js"></script>
     </body>
 </html>

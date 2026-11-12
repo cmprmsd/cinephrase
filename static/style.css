@@ -119,6 +119,71 @@ body {
     margin: 0;
     padding: 0;
     min-height: 200px;
+    /* as wide as its cards, so the gaps between them (also beyond the first screen width) accept drops */
+    width: max-content;
+    min-width: 100%;
+    box-sizing: border-box;
+}
+
+.timeline-list-horizontal:empty {
+    align-items: center;
+    justify-content: center;
+    border: 1px dashed var(--border-strong);
+    border-radius: 12px;
+}
+
+.timeline-list-horizontal:empty::after {
+    content: "No clips yet. Use \"Add to Timeline\" on a match, or drag its title here.";
+    color: var(--text-muted);
+    font-size: 13px;
+    padding: 16px;
+    text-align: center;
+}
+
+.timeline-list-horizontal.drag-active:empty {
+    border-color: var(--accent);
+    background: rgba(63, 169, 245, 0.08);
+}
+
+.timeline-title {
+    min-width: 0;
+}
+
+.timeline-title-text {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.timeline-title .info-icon {
+    flex: none;
+}
+
+.timeline-origin {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 11px;
+    color: var(--text-muted);
+}
+
+/* The global input rule (full width, padding) is for text fields, not for the Enabled checkbox */
+.timeline-toggle input[type="checkbox"] {
+    width: auto;
+    padding: 0;
+    flex: none;
+}
+
+.timeline-item:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+}
+
+.timeline-item input[type="checkbox"]:focus-visible,
+.timeline-item input[type="range"]:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
 }
 
 .timeline-title {
@@ -134,11 +199,6 @@ body {
 }
 .info-icon:hover {
     opacity: 1;
-}
-
-/* Prevent scroll anchoring during drag - stops auto-scroll when items shift */
-.timeline-list-horizontal.drag-active {
-    overflow-anchor: none;
 }
 
 .timeline-list-horizontal .timeline-item {
@@ -166,9 +226,13 @@ body {
     box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
 }
 
-.timeline-list-horizontal .timeline-item.drag-over {
-    border-color: rgba(63, 169, 245, 0.65);
-    background: rgba(63, 169, 245, 0.12);
+/* Where a dragged clip will land: a bar on the edge of the card it is inserted next to */
+.timeline-list-horizontal.drag-active .timeline-item.drop-before {
+    box-shadow: inset 4px 0 0 var(--accent);
+}
+
+.timeline-list-horizontal.drag-active .timeline-item.drop-after {
+    box-shadow: inset -4px 0 0 var(--accent);
 }
 
 .timeline-list-horizontal .timeline-item.timeline-item-disabled {
@@ -1009,11 +1073,6 @@ textarea {
     box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
 }
 
-.timeline-item.drag-over {
-    border-color: rgba(63, 169, 245, 0.65);
-    background: rgba(63, 169, 245, 0.12);
-}
-
 .timeline-index {
     font-size: 14px;
     font-weight: 600;
@@ -1072,10 +1131,21 @@ textarea {
     transform: scale(0.95);
 }
 
-/* Show move controls on mobile and tablet */
+/* Show move controls on mobile and tablet: side by side in the title row, clear of the waveform */
 @media (max-width: 1024px) {
     .timeline-move-controls {
         display: flex;
+        flex-direction: row;
+        gap: 6px;
+    }
+
+    .timeline-move-btn {
+        width: 34px;
+        height: 28px;
+    }
+
+    .timeline-list-horizontal .timeline-item .timeline-meta {
+        padding-right: 84px;
     }
 }
 
@@ -1088,7 +1158,7 @@ textarea {
 
 /* Extra subtle button styling for less prominent actions */
 .ghost-button.subtle {
-    opacity: 0.6;
+    opacity: 0.85;
     font-size: 11px;
     padding: 4px 8px;
     border: 1px solid transparent;
@@ -1097,8 +1167,15 @@ textarea {
     transition: all 0.2s ease;
 }
 
+.ghost-button.subtle:disabled,
+.ghost-button.subtle:disabled:hover {
+    opacity: 0.35;
+    background: transparent;
+    color: var(--text-muted, #666);
+}
+
 .ghost-button.subtle:hover {
-    opacity: 0.8;
+    opacity: 1;
     color: var(--text-secondary, #ccc);
     background: var(--bg-tertiary, #2a2a2a);
 }
@@ -1350,8 +1427,20 @@ textarea {
     transform: none;
 }
 
+#sentenceAutocomplete .suggestion-item.is-selected,
+.autocomplete-suggestions .suggestion-item.is-selected {
+    background: var(--accent);
+    color: var(--bg);
+}
+
+#sentenceAutocomplete .suggestion-item.is-selected span,
+#sentenceAutocomplete .suggestion-item.is-selected b {
+    color: inherit;
+    opacity: 1;
+}
+
 .results-grid:empty::after {
-    content: "Run a search to see matching clips. Saved results appear here.";
+    content: "Run a search to see matching clips.";
     color: var(--text-muted);
     text-align: center;
     padding: 40px;
@@ -1364,6 +1453,333 @@ textarea {
     color: var(--text-muted);
     text-align: center;
     padding: 16px;
+}
+
+/* Floating progress box of a running merge */
+.merge-progress {
+    position: fixed;
+    bottom: 20px;
+    right: 20px;
+    z-index: 10000;
+    width: 280px;
+    padding: 12px;
+    border-radius: 8px;
+    border: 1px solid var(--border-strong);
+    background: var(--bg-elevated);
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.7);
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+
+.merge-progress-header {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+
+.merge-progress .loading-spinner {
+    width: 20px;
+    height: 20px;
+    flex-shrink: 0;
+}
+
+.merge-progress-texts {
+    flex: 1;
+    min-width: 0;
+}
+
+.merge-progress-title {
+    margin: 0;
+    font-weight: 500;
+    font-size: 14px;
+}
+
+.merge-progress-detail {
+    margin: 2px 0 0 0;
+    font-size: 12px;
+    color: var(--text-muted);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.merge-progress-track {
+    height: 6px;
+    border-radius: 4px;
+    overflow: hidden;
+    background: rgba(255, 255, 255, 0.12);
+}
+
+.merge-progress-bar {
+    width: 0;
+    height: 100%;
+    background: var(--accent);
+    transition: width 0.3s ease;
+}
+
+.merge-progress-cancel {
+    align-self: flex-end;
+    padding: 4px 12px;
+    font-size: 12px;
+    min-height: 0;
+}
+
+@media (max-width: 1024px) {
+    .merge-progress {
+        left: 16px;
+        right: 16px;
+        width: auto;
+        bottom: calc(88px + env(safe-area-inset-bottom, 0px));      /* above the bottom navigation */
+    }
+}
+
+/* A search is running (its spinner may be below the fold) */
+button.is-busy {
+    position: relative;
+    opacity: 0.75;
+    cursor: progress;
+}
+
+button.is-busy::after {
+    content: "";
+    display: inline-block;
+    width: 0.8em;
+    height: 0.8em;
+    margin-left: 0.5em;
+    vertical-align: -0.1em;
+    border: 2px solid currentColor;
+    border-right-color: transparent;
+    border-radius: 50%;
+    animation: busy-spin 0.8s linear infinite;
+}
+
+@keyframes busy-spin {
+    to { transform: rotate(360deg); }
+}
+
+button.is-confirmed {
+    border-color: #4caf50;
+    color: #4caf50;
+}
+
+.phrase-more-note {
+    font-size: 11px;
+    color: var(--text-muted);
+}
+
+.field-hint {
+    display: block;
+    margin-top: 6px;
+    font-size: 12px;
+    color: var(--text-muted);
+}
+
+.field-hint kbd,
+.field-hint code {
+    font-family: inherit;
+    padding: 0 4px;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    color: var(--text);
+}
+
+/* Notices between result cards (failed renders, unmatched story segments) */
+.result-notice {
+    grid-column: 1 / -1;
+    padding: 10px 14px;
+    border-radius: var(--radius);
+    border: 1px solid rgba(242, 109, 120, 0.35);
+    background: rgba(242, 109, 120, 0.08);
+    color: var(--text);
+    font-size: 13px;
+    line-height: 1.4;
+    overflow-wrap: anywhere;
+}
+
+/* Clip stage: sample-accurate preview driven by static/clip-player.js */
+.clip-stage-host {
+    width: 100%;
+}
+
+.clip-stage {
+    position: relative;
+    width: 100%;
+    aspect-ratio: 16 / 9;
+    background: #000;
+    border-radius: 14px;
+    border: 1px solid var(--border);
+    overflow: hidden;
+    cursor: pointer;
+    outline: none;
+}
+
+@supports not (aspect-ratio: 16 / 9) {
+    .clip-stage {
+        height: 0;
+        padding-top: 56.25%;
+    }
+}
+
+.clip-stage[hidden] {
+    display: none;
+}
+
+.clip-stage:focus-visible {
+    border-color: var(--accent);
+}
+
+.clip-stage-video {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+    opacity: 0;
+    pointer-events: none;
+}
+
+.clip-stage-video.is-active {
+    opacity: 1;
+}
+
+.clip-stage-hud {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    display: flex;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 8px 12px 16px;
+    font-size: 12px;
+    color: #fff;
+    background: linear-gradient(rgba(0, 0, 0, 0.55), transparent);
+    pointer-events: none;
+}
+
+.clip-stage-title {
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.clip-stage-status {
+    flex: none;
+    font-variant-numeric: tabular-nums;
+    opacity: 0.85;
+}
+
+/* Volume, mute, fullscreen: the only parts of the HUD that take clicks */
+.clip-stage-controls {
+    flex: none;
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    margin: -3px -4px 0 0;
+    pointer-events: auto;
+    cursor: default;
+    opacity: 0.6;
+    transition: opacity 0.15s ease;
+}
+
+.clip-stage:hover .clip-stage-controls,
+.clip-stage:focus-within .clip-stage-controls {
+    opacity: 1;
+}
+
+.clip-stage-controls .clip-stage-button {
+    width: auto;
+    min-width: 0;
+    min-height: 0;
+    margin: 0;
+    padding: 4px 6px;
+    border: 0;
+    border-radius: 6px;
+    background: rgba(0, 0, 0, 0.45);
+    box-shadow: none;
+    color: #fff;
+    font-size: 13px;
+    line-height: 1;
+    cursor: pointer;
+}
+
+.clip-stage-controls .clip-stage-button:hover {
+    background: rgba(255, 255, 255, 0.22);
+}
+
+.clip-stage-controls .clip-stage-volume {
+    width: 72px;
+    min-width: 0;
+    height: 4px;
+    margin: 0;
+    padding: 0;
+    accent-color: var(--accent);
+    cursor: pointer;
+}
+
+.clip-stage:fullscreen {
+    width: 100%;
+    height: 100%;
+    padding-top: 0;
+    aspect-ratio: auto;
+    border: 0;
+    border-radius: 0;
+}
+
+.clip-stage-progress {
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    height: 3px;
+    background: rgba(255, 255, 255, 0.15);
+    pointer-events: none;
+}
+
+.clip-stage-progress > div {
+    width: 0;
+    height: 100%;
+    background: var(--accent);
+}
+
+/* Idle: a small replay badge. With a message (error): a readable overlay. */
+.clip-stage-hint {
+    position: absolute;
+    left: 10px;
+    bottom: 12px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 30px;
+    height: 30px;
+    padding: 0 9px;
+    border-radius: 15px;
+    font-size: 13px;
+    color: #fff;
+    background: rgba(0, 0, 0, 0.6);
+    pointer-events: none;
+}
+
+.clip-stage-hint:empty {
+    display: none;
+}
+
+.clip-stage.has-message .clip-stage-hint {
+    inset: 0;
+    height: auto;
+    padding: 0 24px;
+    border-radius: 0;
+    text-align: center;
+    line-height: 1.4;
+}
+
+.timeline-list-horizontal .timeline-item.is-playing,
+.phrase-container.is-playing {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 1px var(--accent);
 }
 
 /* Floating preview */
@@ -1403,14 +1819,6 @@ textarea {
     text-decoration-style: dotted;
     text-underline-offset: 3px;
     position: relative;
-}
-
-.floating-preview-video {
-    width: 100%;
-    border-radius: 14px;
-    background: #000;
-    border: 1px solid var(--border);
-    min-height: 220px;
 }
 
 /* Loading indicator */
@@ -1536,6 +1944,39 @@ textarea {
     width: 16px;
     height: 16px;
     background: var(--accent-strong);
+}
+
+.waveform-container {
+    touch-action: pan-y; /* horizontal drags trim, vertical ones still scroll the page */
+}
+
+.waveform-container.is-loading .waveform-canvas {
+    opacity: 0.5;
+}
+
+.waveform-container.has-error {
+    border-color: var(--danger);
+}
+
+.waveform-playhead {
+    position: absolute;
+    top: 30px;
+    bottom: 25px;
+    width: 2px;
+    margin-left: -1px;
+    background: #fff;
+    opacity: 0.9;
+    pointer-events: none;
+    z-index: 3;
+}
+
+.waveform-playhead[hidden] {
+    display: none;
+}
+
+.timeline-list-horizontal .waveform-playhead {
+    top: 25px;
+    bottom: 20px;
 }
 
 .waveform-label {
@@ -1852,12 +2293,25 @@ textarea {
     .timeline-list-horizontal {
         flex-direction: column;
         min-height: auto;
+        width: auto;
+    }
+
+    .timeline-list-horizontal:empty {
+        min-height: 96px;
     }
 
     .timeline-list-horizontal .timeline-item {
         flex: 1 1 auto;
         width: 100%;
         max-width: 100%;
+    }
+
+    .timeline-list-horizontal.drag-active .timeline-item.drop-before {
+        box-shadow: inset 0 4px 0 var(--accent);
+    }
+
+    .timeline-list-horizontal.drag-active .timeline-item.drop-after {
+        box-shadow: inset 0 -4px 0 var(--accent);
     }
 
     .timeline-scroll {
@@ -2071,21 +2525,30 @@ textarea {
         width: 100%;
         justify-content: flex-start;
         margin-top: 8px;
+        flex-wrap: wrap;
     }
 
+    /* Three buttons per row: six labels do not fit on one line of a phone */
     .timeline-horizontal .card-actions button {
-        flex: 1;
+        flex: 1 1 30%;
         min-width: 0;
+        white-space: normal;
+        line-height: 1.2;
     }
 
     /* Floating preview mobile - position at top */
-    .floating-preview {
-        width: calc(100% - 32px);
-        max-width: 100%;
-        left: 16px !important;
-        right: 16px;
-        top: 16px !important;
-        bottom: auto !important;
-        max-height: calc(100vh - 100px);
+    .floating-preview.is-inline {
+        position: static;
+        width: auto;
+        max-height: none;
+        overflow: visible;
+        padding: 0;
+        border: 0;
+        box-shadow: none;
+        background: transparent;
+    }
+
+    .floating-preview.is-inline .floating-preview-title {
+        display: none;      /* the card already shows the phrase */
     }
 }

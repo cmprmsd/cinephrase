@@ -8,6 +8,9 @@ Two modes are supported:
 2. Otherwise, provide an ASR transcript (e.g. Vosk/videogrep JSON) that contains
    per-word start/end times. The script will align the high-quality subtitle
    text to the ASR timings and emit a JSON compatible with `transcribe.py`.
+3. With `--interpolate` and no ASR transcript, word times are estimated by
+   spreading each cue's duration over its words (approximate, but enough to
+   find and then fine-trim a phrase).
 
 Usage examples:
 
@@ -26,6 +29,7 @@ from __future__ import annotations
 import argparse
 import html
 import json
+import os
 import re
 import unicodedata
 from dataclasses import dataclass
@@ -37,25 +41,18 @@ from typing import Dict, List, Optional, Sequence, Tuple
 # Regular expressions & constants
 # -----------------------------------------------------------------------------
 
-TIMESTAMP_LINE_RE = re.compile(
-    r"(?P<start>\d{1,2}:\d{2}:\d{2}(?:[.,]\d{1,3})?)\s*-->\s*"
-    r"(?P<end>\d{1,2}:\d{2}:\d{2}(?:[.,]\d{1,3})?)"
-)
-TIMED_TOKEN_RE = re.compile(
-    r"<(?P<ts>\d{1,2}:\d{2}:\d{2}(?:[.,]\d{1,3})?)>"
-    r"<c[^>]*>(?P<word>.*?)</c>",
-    re.DOTALL,
-)
-HAS_TIMED_TOKEN_RE = re.compile(r"<\d{1,2}:\d{2}:\d{2}(?:[.,]\d{1,3})?>")
-WORD_TOKEN_RE = re.compile(
-    r"[0-9A-Za-zÀ-ÖØ-öø-ÿßÄÖÜäöü]+(?:'[0-9A-Za-zÀ-ÖØ-öø-ÿßÄÖÜäöü]+)?",
-    re.UNICODE,
-)
+# WebVTT allows the hour field to be omitted ("00:01.000 --> 00:04.000").
+_TIMESTAMP = r"(?:\d{1,2}:)?\d{2}:\d{2}(?:[.,]\d{1,3})?"
+TIMESTAMP_LINE_RE = re.compile(rf"(?P<start>{_TIMESTAMP})\s*-->\s*(?P<end>{_TIMESTAMP})")
+# An inline word timestamp, with or without the <c> wrapper YouTube puts around the following text.
+INLINE_TIMESTAMP_RE = re.compile(rf"<({_TIMESTAMP})>")
+HAS_TIMED_TOKEN_RE = INLINE_TIMESTAMP_RE
+# Letters and digits of any script, with inner apostrophes (don't, don’t, rock'n'roll).
+WORD_TOKEN_RE = re.compile(r"[^\W_]+(?:['\u2019][^\W_]+)*")
 
 DEFAULT_TIME_MARGIN = 1.0  # seconds
 DEFAULT_MATCH_WINDOW = 80  # ASR words to scan per subtitle token
 FUZZY_RATIO_THRESHOLD = 0.82
-MIN_FALLBACK_MATCH_RATIO = 0.4
 
 
 # -----------------------------------------------------------------------------
@@ -96,9 +93,11 @@ class ASRWord:
 
 def _clean_text(text: str) -> str:
     """Normalise subtitle text by unescaping HTML entities and removing tags."""
+    # Tags first (<b>, <font color=..>, <v Speaker>, <c.colour>), then ASS overrides ({\\an8}), then entities:
+    # unescaping first would turn "&lt;3" into the start of a tag.
+    text = re.sub(r"<[^>]*>", "", text)
+    text = re.sub(r"\{\\[^}]*\}", "", text)
     text = html.unescape(text)
-    text = re.sub(r"</?c[^>]*>", "", text, flags=re.IGNORECASE)
-    text = re.sub(r"</?i>", "", text, flags=re.IGNORECASE)
     text = text.replace("\u2028", " ")
     return text.strip()
 
@@ -124,13 +123,23 @@ def _timestamp_to_seconds(value: str) -> float:
 # Subtitle parsing & inline timing handling
 # -----------------------------------------------------------------------------
 
+def _read_text(path: Path) -> str:
+    """Decode a subtitle file: UTF-8 (with or without BOM), UTF-16 with BOM, else Windows-1252."""
+    data = path.read_bytes()
+    if data.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return data.decode("utf-16")
+    try:
+        return data.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        return data.decode("cp1252", errors="replace")
+
+
 def parse_subtitle_file(path: Path) -> List[SubtitleCue]:
     """Parse SRT/VTT file into cues preserving raw text lines."""
     if not path.exists():
         raise FileNotFoundError(path)
 
-    with path.open("r", encoding="utf-8-sig") as handle:
-        raw_lines = [line.rstrip("\n\r") for line in handle]
+    raw_lines = _read_text(path).splitlines()
 
     cues: List[SubtitleCue] = []
     total = len(raw_lines)
@@ -167,7 +176,9 @@ def parse_subtitle_file(path: Path) -> List[SubtitleCue]:
         end = _timestamp_to_seconds(match.group("end"))
         idx += 1
 
-        while idx < total and raw_lines[idx].strip() == "":
+        # Skip whitespace-only filler lines (YouTube writes a single space), but not a truly empty line: that
+        # ends an empty cue, and skipping it would swallow the next cue's index number as text.
+        while idx < total and raw_lines[idx] != "" and raw_lines[idx].strip() == "":
             idx += 1
 
         text_lines: List[str] = []
@@ -197,27 +208,16 @@ def _split_text_into_words(text: str) -> List[str]:
 
 
 def _extract_timed_tokens(line: str, cue_start: float) -> List[TimedToken]:
+    """Split a line at its inline timestamps: text before the first one starts with the cue."""
+    parts = INLINE_TIMESTAMP_RE.split(line)
     tokens: List[TimedToken] = []
-    matches = list(TIMED_TOKEN_RE.finditer(line))
-
-    if not matches:
-        cleaned = _clean_text(line)
+    leading = _clean_text(parts[0])
+    if leading:
+        tokens.append(TimedToken(start=cue_start, text=leading))
+    for stamp, text in zip(parts[1::2], parts[2::2]):
+        cleaned = _clean_text(text)
         if cleaned:
-            tokens.append(TimedToken(start=cue_start, text=cleaned))
-        return tokens
-
-    prefix = line[: matches[0].start()]
-    prefix_text = _clean_text(prefix)
-    if prefix_text:
-        tokens.append(TimedToken(start=cue_start, text=prefix_text))
-
-    for match in matches:
-        token_text = _clean_text(match.group("word"))
-        if not token_text:
-            continue
-        token_start = _timestamp_to_seconds(match.group("ts"))
-        tokens.append(TimedToken(start=token_start, text=token_text))
-
+            tokens.append(TimedToken(start=_timestamp_to_seconds(stamp), text=cleaned))
     return tokens
 
 
@@ -253,13 +253,16 @@ def build_word_entries_from_inline(cue: SubtitleCue, allow_plain_fallback: bool 
         if not word_texts:
             continue
 
+        # Longer words take longer to say: spread the token's time by word length, not evenly.
         duration = max(next_start - token.start, 0.0)
-        segment_count = len(word_texts)
-        step = duration / segment_count if segment_count > 0 else 0.0
+        weights = [max(len(normalize_word(word_text)), 1) for word_text in word_texts]
+        total_weight = float(sum(weights))
+        elapsed = 0.0
 
-        for offset, word_text in enumerate(word_texts):
-            word_start = token.start + offset * step
-            word_end = token.start + (offset + 1) * step if step > 0 else max(next_start, word_start)
+        for word_text, weight in zip(word_texts, weights):
+            word_start = token.start + duration * (elapsed / total_weight)
+            elapsed += weight
+            word_end = token.start + duration * (elapsed / total_weight) if duration > 0 else max(next_start, word_start)
             words.append(
                 {
                     "word": word_text,
@@ -378,29 +381,35 @@ def load_asr_words(path: Path) -> List[ASRWord]:
 
 
 def match_words(srt_words: Sequence[SRTWord], asr_window: Sequence[ASRWord], search_window: int) -> Dict[int, int]:
+    """Map subtitle words to ASR words (indices into ``asr_window``), keeping both in order.
+
+    Exact matches are found by aligning the two word sequences as a whole. (Taking the first identical word
+    anywhere in the window, as a greedy scan does, jumps over the correct words whenever a common word such as
+    "the" was misheard at its real position.) Fuzzy matches are then only looked for between two anchors.
+    """
     mapping: Dict[int, int] = {}
-    asr_len = len(asr_window)
-    pointer = 0
+    srt_norms = [word.norm for word in srt_words]
+    asr_norms = [word.norm for word in asr_window]
+    matcher = SequenceMatcher(None, srt_norms, asr_norms, autojunk=False)
+    anchors = [(block.a + offset, block.b + offset)
+               for block in matcher.get_matching_blocks() for offset in range(block.size)]
+    for srt_idx, asr_idx in anchors:
+        mapping[srt_idx] = asr_idx
 
-    for srt_idx, srt_word in enumerate(srt_words):
-        best_idx = None
-        best_score = 0.0
-        search_limit = min(asr_len, pointer + max(search_window, 1))
-
-        for cand_idx in range(pointer, search_limit):
-            candidate = asr_window[cand_idx]
-            if srt_word.norm == candidate.norm:
-                best_idx = cand_idx
-                best_score = 1.0
-                break
-            score = SequenceMatcher(None, srt_word.norm, candidate.norm).ratio()
-            if score >= FUZZY_RATIO_THRESHOLD and score > best_score:
-                best_idx = cand_idx
-                best_score = score
-
-        if best_idx is not None:
-            mapping[srt_idx] = best_idx
-            pointer = best_idx + 1
+    bounds = [(-1, -1)] + anchors + [(len(srt_norms), len(asr_norms))]
+    for (srt_left, asr_left), (srt_right, asr_right) in zip(bounds, bounds[1:]):
+        pointer = asr_left + 1
+        for srt_idx in range(srt_left + 1, srt_right):
+            best_idx = None
+            best_score = 0.0
+            for cand_idx in range(pointer, min(asr_right, pointer + max(search_window, 1))):
+                score = SequenceMatcher(None, srt_norms[srt_idx], asr_norms[cand_idx]).ratio()
+                if score >= FUZZY_RATIO_THRESHOLD and score > best_score:
+                    best_idx = cand_idx
+                    best_score = score
+            if best_idx is not None:
+                mapping[srt_idx] = best_idx
+                pointer = best_idx + 1
 
     return mapping
 
@@ -477,15 +486,16 @@ def build_entries_from_alignment(
         if asr_idx < 0 or asr_idx >= len(asr_words):
             continue
         asr_word = asr_words[asr_idx]
-        start = max(cue.start, asr_word.start)
-        end = min(cue.end, asr_word.end)
-        if end < start:
-            end = start
-        known_times[srt_idx] = (start, end)
+        known_times[srt_idx] = (asr_word.start, max(asr_word.end, asr_word.start))
         confs[srt_idx] = asr_word.conf
         matched += 1
 
-    filled = interpolate_word_times(known_times, cue.start, cue.end)
+    # Matched words keep their measured times even where they reach outside the cue; the cue only bounds the
+    # words that have to be interpolated.
+    known = [value for value in known_times if value is not None]
+    segment_start = min([cue.start] + [start for start, _ in known])
+    segment_end = max([cue.end] + [end for _, end in known])
+    filled = interpolate_word_times(known_times, segment_start, segment_end)
     entries: List[dict] = []
     for idx, word in enumerate(srt_words):
         start, end = filled[idx]
@@ -528,24 +538,15 @@ def align_cues_with_asr(
         while window_end < asr_len and asr_words[window_end].start <= cue.end + time_margin:
             window_end += 1
 
-        if window_end <= pointer:
-            window_end = min(asr_len, pointer + match_window)
-
+        # Only ASR words inside the cue's time range are candidates. A cue without any (music, "[Musik]",
+        # speech the recogniser missed) simply stays unmatched and gets interpolated times; taking "the next
+        # words" instead consumed speech that belongs to later cues, and every following cue then missed too.
         window = asr_words[pointer:window_end]
         local_mapping = match_words(srt_words, window, match_window)
-
-        if len(local_mapping) < len(srt_words) * MIN_FALLBACK_MATCH_RATIO and window_end < asr_len:
-            extended_end = min(asr_len, window_end + match_window)
-            window = asr_words[pointer:extended_end]
-            local_mapping = match_words(srt_words, window, match_window)
-            window_end = extended_end
-
         global_mapping = {s_idx: pointer + local_idx for s_idx, local_idx in local_mapping.items()}
 
         if local_mapping:
             pointer = pointer + max(local_mapping.values()) + 1
-        else:
-            pointer = window_end
 
         entries, matched = build_entries_from_alignment(cue, srt_words, global_mapping, asr_words)
         matched_words += matched
@@ -583,7 +584,13 @@ def convert_subtitles(
     asr_path: Optional[Path] = None,
     time_margin: float = DEFAULT_TIME_MARGIN,
     match_window: int = DEFAULT_MATCH_WINDOW,
+    interpolate: bool = False,
 ) -> Tuple[List[dict], Dict[str, float]]:
+    """Build word-level transcript segments from a subtitle file.
+
+    Word times come from inline timestamps, from an ASR transcript (``asr_path``) or, with ``interpolate``,
+    from spreading every cue's duration over its words (approximate).
+    """
     cues = parse_subtitle_file(input_path)
 
     has_inline = any(
@@ -606,18 +613,30 @@ def convert_subtitles(
             "matched_words": sum(len(seg["words"]) for seg in segments),
             "mode": "inline",
         }
+    elif interpolate:
+        segments = cues_to_segments_with_inline_timing(cues)
+        stats = {
+            "segments": len(segments),
+            "words": sum(len(seg["words"]) for seg in segments),
+            "matched_words": 0,
+            "mode": "interpolated",
+        }
     else:
         raise ValueError(
-            "Subtitle file lacks per-word timing information. Provide an ASR JSON via --asr-json."
+            "Subtitle file lacks per-word timing information. Provide an ASR JSON via --asr-json "
+            "or accept estimated word times with --interpolate."
         )
 
     if not segments:
         raise ValueError(f"No segments could be extracted from {input_path}")
 
     if output_path:
+        # Write next to the target and rename, so an interrupted run cannot leave a truncated transcript.
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        with output_path.open("w", encoding="utf-8") as handle:
+        temp_path = output_path.with_name(output_path.name + ".tmp")
+        with temp_path.open("w", encoding="utf-8") as handle:
             json.dump(segments, handle, ensure_ascii=False, indent=2)
+        os.replace(temp_path, output_path)
 
     return segments, stats
 
@@ -649,6 +668,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help=f"Maximum ASR words to scan per subtitle token during alignment (default: {DEFAULT_MATCH_WINDOW}).",
     )
     parser.add_argument(
+        "--interpolate",
+        action="store_true",
+        help="Without inline timings and without --asr-json: estimate word times inside each cue (approximate).",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Parse inputs and print alignment statistics without writing a file.",
@@ -664,14 +688,23 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     output_path: Optional[Path] = args.output
     if output_path is None and not args.dry_run:
         output_path = input_path.with_suffix(".json")
+        if args.asr_json is not None and output_path.resolve() == args.asr_json.resolve():
+            parser.error(
+                f"the default output {output_path} is the --asr-json input and would be overwritten; "
+                "choose another file with -o"
+            )
 
-    segments, stats = convert_subtitles(
-        input_path,
-        output_path if not args.dry_run else None,
-        asr_path=args.asr_json,
-        time_margin=args.time_margin,
-        match_window=args.match_window,
-    )
+    try:
+        segments, stats = convert_subtitles(
+            input_path,
+            output_path if not args.dry_run else None,
+            asr_path=args.asr_json,
+            time_margin=args.time_margin,
+            match_window=args.match_window,
+            interpolate=args.interpolate,
+        )
+    except (OSError, ValueError) as exc:
+        parser.error(str(exc))
 
     total_words = stats.get("words", 0) or 0
     matched_words = stats.get("matched_words", 0) or 0
