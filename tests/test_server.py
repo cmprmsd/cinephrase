@@ -494,6 +494,21 @@ class SearchExportTest(ServerTestCase):
             os.remove(video)
             os.remove(os.path.join(self.library, 'subtitled.srt'))
 
+    def test_a_sibling_videos_transcript_is_not_borrowed(self):
+        video = os.path.join(self.library, 'show.mp4')
+        shutil.copy(self.source, video)
+        shutil.copy(os.path.join(self.library, 'talk.json'), os.path.join(self.library, 'show.part2.json'))
+        try:
+            self.assertFalse(server._has_own_transcript(video))
+            self.assertIsNone(server.load_transcript_sentences(video))
+            os.rename(os.path.join(self.library, 'show.part2.json'), os.path.join(self.library, 'show.en.json'))
+            self.assertTrue(server._has_own_transcript(video))          # <name>.<language>.json is its own
+            self.assertTrue(server.load_transcript_sentences(video))
+        finally:
+            for name in ('show.mp4', 'show.part2.json', 'show.en.json'):
+                if os.path.exists(os.path.join(self.library, name)):
+                    os.remove(os.path.join(self.library, name))
+
     def test_transcripts_are_cached_until_the_file_changes(self):
         first = server.load_transcript_sentences(self.source)
         self.assertIs(first, server.load_transcript_sentences(self.source))

@@ -21,7 +21,7 @@ from typing import List, Optional, Sequence, Tuple
 
 from flask import Flask, jsonify, render_template, request, send_from_directory, Response, stream_with_context
 from werkzeug.exceptions import HTTPException
-from videogrep import parse_transcript
+from videogrep import find_transcript, parse_transcript
 from srt_word_boundaries import convert_subtitles
 import render_pipeline
 
@@ -1728,6 +1728,25 @@ def _cached_transcript(video_path):
     return sentences, index
 
 
+def _has_own_transcript(video_path):
+    """True if videogrep's lookup finds a transcript that belongs to this video.
+
+    videogrep matches by prefix, so "talk.mp4" would pick up "talk.part2.json" of another video and be cut at
+    that video's timestamps. Only "<name>.<ext>" and "<name>.<language>.<ext>" count.
+    """
+    try:
+        found = find_transcript(video_path)
+    except Exception:
+        return False
+    if not found:
+        return False
+    stem = Path(video_path).stem
+    name = Path(found).name
+    if not name.startswith(stem + '.'):
+        return False
+    return re.fullmatch(r'(?:[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8})?\.)?(?:json|vtt|srt|transcript)', name[len(stem) + 1:]) is not None
+
+
 def load_transcript_sentences(video_path: str) -> Optional[List[dict]]:
     """Transcript segments of a video (cached; callers must not modify the returned list)."""
     return _cached_transcript(video_path)[0]
@@ -1749,7 +1768,7 @@ def _read_transcript_sentences(video_path: str) -> Optional[List[dict]]:
     # corpus but cannot be searched, so keep looking for something better before settling for it.
     text_only = None
     try:
-        sentences = parse_transcript(video_path)
+        sentences = parse_transcript(video_path) if _has_own_transcript(video_path) else None
         if sentences and extract_sentences_from_segments(sentences):
             if any(isinstance(segment, dict) and segment.get('words') for segment in sentences):
                 return sentences
