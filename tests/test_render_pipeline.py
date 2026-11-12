@@ -236,6 +236,48 @@ class RenderAccuracyTest(unittest.TestCase):
         self.assertEqual(summary['encoder'], 'libx264')
         self.assertEqual(len(_frame_times(output)), sum(s.frames for s in segments))
 
+    def _variant(self, name, *arguments):
+        path = os.path.join(self.work, name)
+        if not os.path.exists(path):
+            subprocess.run(['ffmpeg', '-v', 'error', '-y', *arguments, path], check=True)
+        return path
+
+    def test_rotated_video_keeps_its_orientation(self):
+        rotated = self._variant('rotated.mp4', '-display_rotation', '90', '-i', self.source, '-c', 'copy')
+        info = rp.probe_media(rotated)
+        self.assertEqual((info.width, info.height), (180, 320))           # upright size, not the coded 320x180
+        output, summary = self._render([rp.Segment(media=rotated, start=1.0, duration=1.0, title='portrait')])
+        self.assertEqual((summary['width'], summary['height']), (180, 320))
+        self.assertEqual(rp.probe_media(output).width, 180)
+
+    def test_source_without_audio_gets_silence(self):
+        silent = self._variant('noaudio.mp4', '-i', self.source, '-an', '-c', 'copy')
+        segments = [rp.Segment(media=silent, start=1.0, duration=0.5, title='mute'),
+                    rp.Segment(media=self.source, start=self.words[0][0], duration=0.4, title='sound')]
+        output, summary = self._render(segments)
+        merged = _decode_mono(output)
+        self.assertLess(np.abs(merged[: int(0.45 * SR)]).max(), 0.01)
+        self.assertGreater(np.abs(merged[int(0.5 * SR): int(0.9 * SR)]).max(), 0.1)
+        self.assertEqual(summary['samples'], round(0.9 * SR))
+
+    def test_preview_audio_of_a_silent_video_is_silence(self):
+        silent = self._variant('noaudio.mp4', '-i', self.source, '-an', '-c', 'copy')
+        pcm = rp.extract_pcm(silent, 1.0, 0.5)
+        self.assertEqual(len(pcm), round(0.5 * SR) * rp.BYTES_PER_FRAME)
+        self.assertEqual(set(pcm), {0})
+        self.assertGreater(len(rp.extract_pcm(silent)), SR * rp.BYTES_PER_FRAME)       # whole file
+        with self.assertRaises(rp.RenderError):
+            rp.extract_pcm(os.path.join(self.work, 'missing.mp4'), 0.0, 1.0)
+
+    def test_source_without_picture_gets_black_frames(self):
+        audio_only = self._variant('audio.m4a', '-i', self.source, '-vn', '-c', 'copy')
+        segments = [rp.Segment(media=audio_only, start=self.words[1][0], duration=0.6, title='voice only'),
+                    rp.Segment(media=self.source, start=2.0, duration=0.4, title='picture')]
+        output, summary = self._render(segments)
+        self.assertEqual(len(_frame_times(output)), summary['frames'])
+        self.assertEqual(summary['frames'], 25)
+        self.assertEqual((summary['width'], summary['height']), (320, 180))
+
     def test_work_directory_is_removed(self):
         work_root = os.path.join(self.work, 'tmp_cleanup')
         list(rp.render_timeline(self._segments(count=2), os.path.join(self.work, 'clean.mp4'), work_root))

@@ -77,11 +77,23 @@ def _to_float(value) -> Optional[float]:
     return number if math.isfinite(number) else None
 
 
+def _rotation(stream: dict) -> int:
+    """Display rotation of a video stream in degrees (display matrix side data, or the older rotate tag)."""
+    candidates = [side.get('rotation') for side in stream.get('side_data_list') or [] if isinstance(side, dict)]
+    candidates.append((stream.get('tags') or {}).get('rotate'))
+    for value in candidates:
+        number = _to_float(value)
+        if number is not None:
+            return int(round(number)) % 360
+    return 0
+
+
 def probe_media(path: str) -> MediaInfo:
     """Read the stream properties the planner needs with a single ffprobe call."""
     command = [
         'ffprobe', '-v', 'error',
-        '-show_entries', 'stream=codec_type,width,height,r_frame_rate,avg_frame_rate,duration:format=duration',
+        '-show_entries', 'stream=codec_type,width,height,r_frame_rate,avg_frame_rate,duration'
+                         ':stream_tags=rotate:stream_side_data=rotation:format=duration',
         '-of', 'json', path,
     ]
     try:
@@ -109,11 +121,16 @@ def probe_media(path: str) -> MediaInfo:
             fps = average or fps
         if fps is not None and fps > 120:
             fps = None
+    width = int(video.get('width') or 0) if video else 0
+    height = int(video.get('height') or 0) if video else 0
+    if video and _rotation(video) % 180 == 90:
+        # ffmpeg rotates such video (phone footage) upright while decoding: report the size it will have.
+        width, height = height, width
     return MediaInfo(
         has_video=video is not None,
         has_audio=audio is not None,
-        width=int(video.get('width') or 0) if video else 0,
-        height=int(video.get('height') or 0) if video else 0,
+        width=width,
+        height=height,
         fps=fps,
         duration=duration,
         audio_duration=(_to_float(audio.get('duration')) if audio else None) or duration,
@@ -307,7 +324,16 @@ def extract_pcm(media: str, start: Optional[float] = None, duration: Optional[fl
         samples = round(output_seconds(duration, speed) * AUDIO_RATE)
         if samples <= 0:
             return b''
-    result = _run(audio_command(media, start, duration, speed, samples), 'Audio extraction', timeout=120)
+    try:
+        result = _run(audio_command(media, start, duration, speed, samples), 'Audio extraction', timeout=120)
+    except RenderError:
+        info = probe_media(media)
+        if info.has_audio:
+            raise
+        # A video without an audio track previews (and merges) as silence.
+        if samples is None:
+            samples = round(output_seconds(info.duration or 0.0, speed) * AUDIO_RATE)
+        return bytes(samples * BYTES_PER_FRAME)
     pcm = result.stdout
     return pcm[:len(pcm) - len(pcm) % BYTES_PER_FRAME]
 
