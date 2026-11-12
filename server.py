@@ -454,6 +454,7 @@ def create_project():
         'id': str(uuid.uuid4()),
         'name': base_payload['name'],
         'data': base_payload['data'],
+        'revision': 1,
         'createdAt': now,
         'updatedAt': now
     }
@@ -471,6 +472,7 @@ def get_project(project_id):
     project = find_project(projects, project_id)
     if not project:
         return jsonify({'error': 'Project not found'}), 404
+    project.setdefault('revision', 0)
     return jsonify(project)
 
 
@@ -482,6 +484,15 @@ def update_project(project_id):
         project = find_project(projects, project_id)
         if not project:
             return jsonify({'error': 'Project not found'}), 404
+
+        # Optimistic locking: a client that says which revision its copy is based on is refused when the
+        # project has been saved from elsewhere since (another tab, a tab left open yesterday), instead of
+        # silently replacing the newer timeline with its old one.
+        revision = sanitize_int(project.get('revision'), 0)
+        base_revision = payload.get('baseRevision')
+        if base_revision is not None and sanitize_int(base_revision, -1) != revision:
+            return jsonify({'error': 'The project was changed elsewhere', 'project': {**project, 'revision': revision}}), 409
+        project['revision'] = revision + 1
 
         if 'name' in payload:
             project['name'] = normalize_project_name(payload['name'], project.get('name', 'Untitled Project'))

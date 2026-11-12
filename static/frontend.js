@@ -22,6 +22,7 @@ let activeProject = null;
 let autosaveTimer = null;
 let autosaveRevision = 0;      // bumped by every change of the active project
 let autosaveRequest = null;     // the save that is on the wire, if any
+let autosaveFailed = false;     // the last save attempt did not reach the server (or was refused)
 let isApplyingProject = false;
 
 const elements = {};
@@ -43,6 +44,23 @@ let sentenceAutocompleteState = {
 // Floating preview state
 let floatingPreviewContainer = null;
 let currentSelectedCard = null;
+
+// localStorage / sessionStorage throw when site data is blocked or the quota is exceeded: the app must still work.
+function readStored(storage, key) {
+    try {
+        return storage.getItem(key);
+    } catch (error) {
+        return null;
+    }
+}
+
+function writeStored(storage, key, value) {
+    try {
+        storage.setItem(key, value);
+    } catch (error) {
+        /* not essential */
+    }
+}
 
 // Helper function to get correct URL for video files
 function getVideoUrl(filePath) {
@@ -151,7 +169,7 @@ function switchMobileSection(sectionName) {
 
     // Store active section
     try {
-        sessionStorage.setItem('mobileActiveSection', sectionName);
+        writeStored(window.sessionStorage, 'mobileActiveSection', sectionName);
     } catch (e) {
         // Ignore storage errors
     }
@@ -183,7 +201,7 @@ function initializeMobileNavigation() {
                 const currentSection = document.querySelector('[data-mobile-section].mobile-active');
                 if (!currentSection) {
                     // Restore from sessionStorage or default to search
-                    const savedSection = sessionStorage.getItem('mobileActiveSection') || 'search';
+                    const savedSection = readStored(window.sessionStorage, 'mobileActiveSection') || 'search';
                     switchMobileSection(savedSection);
                 }
             } else {
@@ -198,7 +216,7 @@ function initializeMobileNavigation() {
     // Initialize on load
     if (isMobileLayout()) {
         // Restore saved section or default to search
-        const savedSection = sessionStorage.getItem('mobileActiveSection') || 'search';
+        const savedSection = readStored(window.sessionStorage, 'mobileActiveSection') || 'search';
         switchMobileSection(savedSection);
     }
     // Desktop layout doesn't need mobile-active classes - CSS handles it
@@ -234,6 +252,7 @@ function initializeSearchTabs() {
 }
 
 function resetCorpusState() {
+    corpusRequestToken += 1;        // answers of requests that are still on the way are for the old file list
     sentences = [];
     combinedTranscriptions = {}; // Clear combined transcriptions
     if (elements.loadSentencesButton) {
@@ -467,20 +486,11 @@ function bindEventListeners() {
             
             // Update fill bar position
             if (silenceRangeFill) {
-                const slider = silenceRangeFill.parentElement;
-                const sliderWidth = slider.offsetWidth;
-                const padding = 9; // 9px padding on each side
-                const trackWidth = sliderWidth - (padding * 2);
-                
+                // Pure CSS maths (9px track padding on each side): correct even while the slider is hidden
                 const minPercent = (minMs - minRange) / (maxRange - minRange);
                 const maxPercent = (maxMs - minRange) / (maxRange - minRange);
-                
-                const leftPos = padding + (minPercent * trackWidth);
-                const rightPos = padding + (maxPercent * trackWidth);
-                const width = rightPos - leftPos;
-                
-                silenceRangeFill.style.left = `${leftPos}px`;
-                silenceRangeFill.style.width = `${width}px`;
+                silenceRangeFill.style.left = `calc(9px + (100% - 18px) * ${minPercent})`;
+                silenceRangeFill.style.width = `calc((100% - 18px) * ${maxPercent - minPercent})`;
             }
         };
 
@@ -767,7 +777,7 @@ function updateProjectControlsState() {
 
     toggledControls.forEach(key => {
         if (elements[key]) {
-            elements[key].disabled = !hasProject;
+            elements[key].disabled = !hasProject || (key === 'timelineMergeButton' && mergeRunning);
         }
     });
 
@@ -786,7 +796,13 @@ function updateProjectControlsState() {
     }
 }
 
+let libraryLoadFailed = false;
+
 async function fetchLibraryFiles() {
+    const button = elements.refreshFilesButton;
+    if (button) {
+        button.disabled = true;
+    }
     try {
         const response = await fetch('/get_files');
         if (!response.ok) {
@@ -794,9 +810,15 @@ async function fetchLibraryFiles() {
         }
         const data = await response.json();
         libraryFiles = Array.isArray(data) ? data : [];
-        renderFilePickers();
+        libraryLoadFailed = false;
     } catch (error) {
         console.error('Error fetching files:', error);
+        libraryLoadFailed = true;
+    } finally {
+        if (button) {
+            button.disabled = false;
+        }
+        renderFilePickers();
     }
 }
 
@@ -815,7 +837,7 @@ async function bootstrapProjects() {
 
         if (projectList.length) {
             // Try to restore the last selected project from localStorage
-            const savedProjectId = localStorage.getItem('lastSelectedProjectId');
+            const savedProjectId = readStored(window.localStorage, 'lastSelectedProjectId');
             let projectToLoad = null;
             
             if (savedProjectId) {
@@ -847,28 +869,58 @@ async function loadProject(projectId) {
     if (!projectId) {
         return;
     }
+    const previous = activeProject;
     try {
-        await flushAutosave();
+        // Leaving a project: its pending changes have to be on the server first.
+        if (previous && !(await flushAutosave())) {
+            const discard = confirm(`The latest changes to "${previous.name || 'Untitled Project'}" could not be saved.\n\nSwitch anyway and lose them?`);
+            if (!discard) {
+                renderProjectPicker();
+                return;
+            }
+        }
+        // Nothing of the previous project may arrive in the next one (search results, a story, a preview)
+        cancelActiveSearch();
         stopClipPlayback();
+        hideFloatingPreview();
         setAutosaveStatus('Loading project…', 'saving');
         const response = await fetch(`/api/projects/${projectId}`);
+        if (response.status === 404) {
+            projectList = projectList.filter(item => item.id !== projectId);
+        }
         if (!response.ok) {
             throw new Error(`Failed to load project: ${response.status}`);
         }
         const project = await response.json();
+        // Edits made while the request was on the wire still belong to the previous project
+        if (previous && activeProject === previous) {
+            await flushAutosave();
+        }
+        cancelAutosave();
+        autosaveFailed = false;
         activeProject = project;
-        
-        // Save the selected project ID to localStorage for restoration on F5
-        localStorage.setItem('lastSelectedProjectId', projectId);
-        
+        try {
+            applyProjectToUI(project);
+        } catch (error) {
+            // Do not stay half-way in a project that cannot be shown
+            activeProject = previous;
+            if (previous) {
+                applyProjectToUI(previous);
+            }
+            throw error;
+        }
+        writeStored(window.localStorage, 'lastSelectedProjectId', projectId);
         updateProjectListEntry(project);
         renderProjectPicker();
-        applyProjectToUI(project);
         // Autoload corpus after project is loaded
         handleLoadSentences();
     } catch (error) {
         console.error('Failed to load project', error);
-        setAutosaveStatus('Failed to load project', 'error');
+        renderProjectPicker();      // the picker must show the project that is really open
+        setAutosaveStatus(
+            activeProject ? `Could not open the project - still in "${activeProject.name || 'Untitled Project'}"` : 'Failed to load project',
+            'error'
+        );
     }
 }
 
@@ -944,9 +996,12 @@ async function handleDeleteProject() {
             await autosaveRequest;
         }
         cancelAutosave();
+        cancelActiveSearch();
         stopClipPlayback();
+        hideFloatingPreview();
         const response = await fetch(`/api/projects/${activeProject.id}`, { method: 'DELETE' });
-        if (!response.ok) {
+        // 404: already deleted elsewhere, which is what was asked for
+        if (!response.ok && response.status !== 404) {
             throw new Error(`Failed to delete project: ${response.status}`);
         }
 
@@ -973,7 +1028,15 @@ function applyProjectToUI(project) {
     }
 
     isApplyingProject = true;
+    try {
+        applyProjectData(project);
+    } finally {
+        // A render error must not leave autosave switched off for good
+        isApplyingProject = false;
+    }
+}
 
+function applyProjectData(project) {
     const data = project.data || {};
 
     if (elements.projectSelect) {
@@ -1021,8 +1084,9 @@ function applyProjectToUI(project) {
 
     // Restore story prompt and settings
     const storyPromptInput = document.getElementById('storyPromptInput');
-    if (storyPromptInput && data.storyPrompt) {
-        storyPromptInput.value = data.storyPrompt;
+    if (storyPromptInput) {
+        // Always assign: the previous project's prompt must not stay in the field
+        storyPromptInput.value = typeof data.storyPrompt === 'string' ? data.storyPrompt : '';
     }
     
     const maxStorySegmentsInput = document.getElementById('maxStorySegments');
@@ -1061,8 +1125,6 @@ function applyProjectToUI(project) {
     renderTimeline(data.timeline);
     updateProjectControlsState();
     setAutosaveStatus('All changes saved', 'ready');
-
-    isApplyingProject = false;
 }
 
 function clearWorkspaceInputs() {
@@ -1071,6 +1133,12 @@ function clearWorkspaceInputs() {
     }
     if (elements.sentenceInput) {
         elements.sentenceInput.value = '';
+    }
+    if (elements.storyPromptInput) {
+        elements.storyPromptInput.value = '';
+    }
+    if (elements.llmResponseInput) {
+        elements.llmResponseInput.value = '';
     }
     if (elements.projectSentenceList) {
         elements.projectSentenceList.innerHTML = '';
@@ -1160,17 +1228,28 @@ function scheduleAutosave(immediate = false) {
     autosaveTimer = setTimeout(runAutosave, immediate ? 0 : AUTOSAVE_DELAY);
 }
 
-function putProject(project, keepalive = false) {
-    const body = JSON.stringify({
+// Browsers only let a request outlive the page (keepalive) while its body is below 64 KiB.
+const KEEPALIVE_BYTES = 60000;
+
+function projectSaveBody(project, force = false) {
+    const payload = {
         name: normalizeProjectName(project.name),
         data: project.data || {}
-    });
+    };
+    // The server refuses the save if the project has changed since this revision (another tab or window).
+    if (!force && Number.isInteger(project.revision)) {
+        payload.baseRevision = project.revision;
+    }
+    return JSON.stringify(payload);
+}
+
+function putProject(project, { keepalive = false, force = false } = {}) {
+    const body = projectSaveBody(project, force);
     return fetch(`/api/projects/${project.id}`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body,
-        // keepalive lets the request outlive the page, but browsers cap such bodies at 64 KiB.
-        keepalive: keepalive && body.length < 60000
+        keepalive: keepalive && new Blob([body]).size < KEEPALIVE_BYTES
     });
 }
 
@@ -1192,29 +1271,38 @@ async function runAutosave(keepalive = false) {
     const revision = autosaveRevision;
     setAutosaveStatus('Saving…', 'saving');
     autosaveRequest = (async () => {
-        let failed = false;
-        let gone = false;
+        let outcome = 'saved';
+        let serverProject = null;
         try {
-            const response = await putProject(project, keepalive === true);
-            gone = response.status === 404;
-            if (!response.ok) {
+            const response = await putProject(project, { keepalive: keepalive === true });
+            if (response.status === 404) {
+                outcome = 'gone';
+            } else if (response.status === 409) {
+                outcome = 'conflict';
+                serverProject = (await response.json().catch(() => ({}))).project || null;
+            } else if (!response.ok) {
                 throw new Error(`Autosave failed: ${response.status}`);
+            } else {
+                const updated = await response.json();
+                project.updatedAt = updated.updatedAt;
+                project.revision = updated.revision;
+                updateProjectListEntry(project);
+                refreshActiveProjectOption();
             }
-            const updated = await response.json();
-            project.updatedAt = updated.updatedAt;
-            updateProjectListEntry(project);
-            refreshActiveProjectOption();
         } catch (error) {
-            failed = true;
+            outcome = 'failed';
             console.error('Autosave failed', error);
         }
         autosaveRequest = null;
         if (project !== activeProject) {
             return;
         }
-        if (gone) {
-            setAutosaveStatus('This project no longer exists on the server', 'error');
-        } else if (failed) {
+        autosaveFailed = outcome !== 'saved';
+        if (outcome === 'gone') {
+            handleProjectDeletedElsewhere(project);
+        } else if (outcome === 'conflict') {
+            handleProjectChangedElsewhere(project, serverProject);
+        } else if (outcome === 'failed') {
             setAutosaveStatus('Autosave failed, retrying…', 'error');
             autosaveTimer = setTimeout(runAutosave, 5000);
         } else if (autosaveRevision !== revision) {
@@ -1229,17 +1317,76 @@ async function runAutosave(keepalive = false) {
     return autosaveRequest;
 }
 
-/** Write pending changes now (before switching, duplicating or leaving the project). */
+/** The same project was saved from another tab or window after this one loaded it. */
+function handleProjectChangedElsewhere(project, serverProject) {
+    setAutosaveStatus('Changed in another tab or window', 'error');
+    if (!serverProject) {
+        return;
+    }
+    const takeTheirs = confirm(
+        `"${project.name || 'Untitled Project'}" was changed in another tab or window after this one loaded it.\n\n` +
+        'OK: load that newer version here (changes made in this tab since then are dropped).\n' +
+        'Cancel: keep this tab\'s version and overwrite the other one.'
+    );
+    if (project !== activeProject) {
+        return;
+    }
+    autosaveFailed = false;
+    if (takeTheirs) {
+        cancelAutosave();
+        stopClipPlayback();
+        activeProject = serverProject;
+        applyProjectToUI(serverProject);
+        updateProjectListEntry(serverProject);
+        refreshActiveProjectOption();
+    } else {
+        project.revision = serverProject.revision;
+        scheduleAutosave(true);
+    }
+}
+
+/** The project no longer exists on the server (deleted in another tab): keep the work or move on. */
+async function handleProjectDeletedElsewhere(project) {
+    setAutosaveStatus('This project was deleted elsewhere', 'error');
+    projectList = projectList.filter(item => item.id !== project.id);
+    const keep = confirm(`"${project.name || 'Untitled Project'}" was deleted in another tab or window.\n\nOK: keep this tab's copy as a new project.\nCancel: discard it.`);
+    if (project !== activeProject) {
+        return;
+    }
+    try {
+        cancelAutosave();
+        autosaveFailed = false;
+        activeProject = null;
+        if (keep) {
+            const created = await createProjectOnServer(project.name, project.data);
+            projectList.push(buildProjectSummary(created));
+            await loadProject(created.id);
+        } else if (projectList.length) {
+            await loadProject(projectList[0].id);
+        } else {
+            await handleCreateProject();
+        }
+    } catch (error) {
+        console.error('Could not recover from the deleted project', error);
+        setAutosaveStatus('Failed to load projects', 'error');
+    }
+}
+
+/**
+ * Write pending changes now (before switching, duplicating or leaving the project).
+ * Resolves to false if they could not be saved.
+ */
 async function flushAutosave() {
     for (let attempt = 0; attempt < 3; attempt++) {
         if (autosaveRequest) {
             await autosaveRequest;
         }
         if (!autosaveTimer) {
-            return;
+            break;
         }
         await runAutosave();
     }
+    return !autosaveTimer && !autosaveRequest && !autosaveFailed;
 }
 
 function cancelAutosave() {
@@ -1247,16 +1394,44 @@ function cancelAutosave() {
     autosaveTimer = null;
 }
 
-// Closing or hiding the tab within the autosave delay must not lose the last edits.
-function saveBeforeLeaving() {
-    if (activeProject && autosaveTimer) {
+function hasUnsavedChanges() {
+    return Boolean(activeProject) && (autosaveTimer !== null || autosaveRequest !== null);
+}
+
+// Hiding the tab: save now rather than after the autosave delay.
+document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden' && activeProject && autosaveTimer) {
         runAutosave(true);
     }
-}
-window.addEventListener('pagehide', saveBeforeLeaving);
-document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'hidden') {
-        saveBeforeLeaving();
+});
+
+// Leaving the page within the autosave delay must not lose the last edits.
+window.addEventListener('pagehide', () => {
+    if (!hasUnsavedChanges()) {
+        return;
+    }
+    if (!autosaveRequest) {
+        runAutosave(true);
+    } else if (autosaveTimer) {
+        // A save is on the wire but does not contain the latest edits: send the current state as well. Both
+        // are based on the same revision, so this one skips the revision check.
+        cancelAutosave();
+        putProject(activeProject, { keepalive: true, force: true }).catch(() => { /* the page is going away */ });
+    }
+});
+
+// A project too large for a keepalive request cannot be saved while the page unloads: ask before leaving.
+window.addEventListener('beforeunload', event => {
+    if (hasUnsavedChanges() && new Blob([projectSaveBody(activeProject)]).size >= KEEPALIVE_BYTES) {
+        event.preventDefault();
+        event.returnValue = '';
+    }
+});
+
+// Back from the back/forward cache: the project may have been saved since (see pagehide), so reload it.
+window.addEventListener('pageshow', event => {
+    if (event.persisted && activeProject) {
+        loadProject(activeProject.id);
     }
 });
 
@@ -1406,9 +1581,6 @@ function handleSaveSentence() {
         return;
     }
 
-    // Expose current groups globally so progress UI can show group context
-    window.currentSentenceGroups = sentenceGroups;
-
     const entries = Array.isArray(activeProject.data?.sentences) ? [...activeProject.data.sentences] : [];
     // Add all sentence groups to saved sentences if not already present
     let updated = false;
@@ -1443,22 +1615,30 @@ function renderFilePickers() {
     const availableFragment = document.createDocumentFragment();
     const chosenFragment = document.createDocumentFragment();
 
+    const librarySet = new Set(libraryFiles);
     chosenFiles.forEach(file => {
         const option = new Option(file, file);
-        if (!libraryFiles.includes(file)) {
+        if (!libraryLoadFailed && !librarySet.has(file)) {
             option.textContent = `${file} (missing)`;
             option.dataset.missing = 'true';
         }
         chosenFragment.appendChild(option);
     });
 
-    if (libraryFiles.length) {
-        libraryFiles.forEach(file => {
-            if (!chosenSet.has(file)) {
-                availableFragment.appendChild(new Option(file, file));
-            }
-        });
+    if (libraryLoadFailed) {
+        const notice = new Option('Could not load the library - click Refresh', '');
+        notice.disabled = true;
+        availableFragment.appendChild(notice);
+    } else if (!libraryFiles.length) {
+        const notice = new Option('No videos found in the library folder(s)', '');
+        notice.disabled = true;
+        availableFragment.appendChild(notice);
     }
+    libraryFiles.forEach(file => {
+        if (!chosenSet.has(file)) {
+            availableFragment.appendChild(new Option(file, file));
+        }
+    });
 
     elements.availableFileSelector.innerHTML = '';
     elements.availableFileSelector.appendChild(availableFragment);
@@ -1503,6 +1683,8 @@ function handleRemoveFiles() {
         data.selectedFiles = current.filter(file => !removeSet.has(file));
     });
     renderFilePickers();
+    resetCorpusState();
+    handleLoadSentences();
 }
 
 function handleClearFiles() {
@@ -1556,7 +1738,8 @@ function renderCollections() {
         return;
     }
     
-    elements.collectionsList.innerHTML = '';
+    // The hint lives inside the list: keep it attached, replace only the items
+    elements.collectionsList.replaceChildren(elements.collectionsEmpty);
     
     if (collections.length === 0) {
         elements.collectionsEmpty.style.display = 'block';
@@ -1736,13 +1919,20 @@ function getSilencePreferences() {
         minSilence = 0;
     }
 
+    // An emptied field means "default" (10 s / 2 words), not 0
     let maxSilence = elements.maxSilenceInput ? parseFloat(elements.maxSilenceInput.value) : 10;
-    if (!Number.isFinite(maxSilence) || maxSilence < minSilence) {
+    if (!Number.isFinite(maxSilence)) {
+        maxSilence = 10;
+    }
+    if (maxSilence < minSilence) {
         maxSilence = minSilence;
     }
 
     let threshold = elements.silenceWordThresholdInput ? parseInt(elements.silenceWordThresholdInput.value, 10) : 2;
-    if (!Number.isInteger(threshold) || threshold < 1) {
+    if (!Number.isInteger(threshold)) {
+        threshold = 2;
+    }
+    if (threshold < 1) {
         threshold = 1;
     }
 
@@ -1768,6 +1958,7 @@ function showSearchLoading(message, onCancel) {
         return;
     }
     hideSearchLoading();
+    revealResultsSection();
 
     const loadingDiv = document.createElement('div');
     loadingDiv.id = 'searchLoadingIndicator';
@@ -1797,25 +1988,16 @@ function showSearchLoading(message, onCancel) {
 }
 
 function hideSearchLoading() {
-    if (!elements.resultsContainer) {
-        return;
-    }
-    
     const loadingDiv = document.getElementById('searchLoadingIndicator');
     if (loadingDiv) {
         loadingDiv.remove();
     }
-    
-    // Auto-jump to results on mobile after search completes
+}
+
+/** On the narrow layout only one section is visible: bring the one with the search feedback to the front. */
+function revealResultsSection() {
     if (isMobileLayout()) {
-        // Check if there are any results
-        const hasResults = elements.resultsContainer && elements.resultsContainer.children.length > 0;
-        if (hasResults) {
-            // Small delay to ensure results are rendered
-            setTimeout(() => {
-                switchMobileSection('results');
-            }, 300);
-        }
+        switchMobileSection('results');
     }
 }
 
@@ -1994,6 +2176,8 @@ function showNoResults(message) {
         return;
     }
     
+    revealResultsSection();
+
     // Remove any existing no results message
     const existingMessage = document.getElementById('noResultsMessage');
     if (existingMessage) {
@@ -2893,6 +3077,9 @@ function handleGenerateStory() {
     const debugMode = debugModeCheckbox ? debugModeCheckbox.checked : false;
 
     // Clear previous results before generating new story
+    cancelActiveSearch();
+    stopClipPlayback();
+    hideFloatingPreview();
     if (elements.resultsContainer) {
         elements.resultsContainer.innerHTML = '';
     }
@@ -2905,8 +3092,9 @@ function handleGenerateStory() {
         data.debugMode = debugMode;
     });
 
-    // Show loading indicator
-    showSearchLoading(`Generating story with AI...`, null);
+    // The LLM can take minutes: the request can be cancelled, and a project switch discards its answer
+    const search = beginSearch();
+    showSearchLoading(`Generating story with AI...`, cancelActiveSearch);
 
     // Call backend to generate story
     fetch('/generate_story', {
@@ -2920,11 +3108,15 @@ function handleGenerateStory() {
             maxSegments: maxStorySegments,
             preferLongSegments: preferLongSegments,
             debugMode: debugMode
-        })
+        }),
+        signal: search.controller.signal
     })
         .then(async response => ({ ok: response.ok, status: response.status, data: await response.json().catch(() => ({})) }))
         .then(({ ok, status, data }) => {
-        hideSearchLoading();
+        if (!search.isCurrent) {
+            return;
+        }
+        finishSearch(search);
 
         // The server explains what went wrong (LLM unreachable, timeout, model missing, invalid answer).
         if (!ok || data.error) {
@@ -2958,9 +3150,12 @@ function handleGenerateStory() {
         }
         })
         .catch(error => {
-        hideSearchLoading();
+        if (!search.isCurrent) {
+            return;     // cancelled, or the project was switched
+        }
+        finishSearch(search);
         console.error('[Client] ❌ Error generating story:', error);
-        showNoResults('An error occurred while generating the story. Please try again.');
+        showNoResults(`The story could not be generated: ${error.message}`);
     });
 }
 
@@ -2992,10 +3187,17 @@ function handleCopyLLMPrompt() {
     const preferLongSegmentsCheckbox = document.getElementById('preferLongSegments');
     const preferLongSegments = preferLongSegmentsCheckbox ? preferLongSegmentsCheckbox.checked : true;
     
-    // Show loading indicator
-    showSearchLoading(`Generating LLM prompt...`, null);
-    
-    // Call backend to generate prompt (without calling Ollama)
+    // Feedback on the button itself: the results list has nothing to do with copying a prompt
+    const button = elements.copyLLMPromptButton;
+    const label = button ? button.textContent : '';
+    const setButton = (text, disabled) => {
+        if (button) {
+            button.textContent = text;
+            button.disabled = disabled;
+        }
+    };
+    setButton('Building prompt…', true);
+
     fetch('/generate_story_prompt', {
         method: 'POST',
         headers: {
@@ -3010,30 +3212,25 @@ function handleCopyLLMPrompt() {
     })
     .then(response => response.json().catch(() => ({ error: `the server answered with HTTP ${response.status}` })))
     .then(data => {
-        hideSearchLoading();
-        
-        if (data.error) {
-            console.error('Prompt generation error:', data.error);
-            alert(`Error: ${data.error}`);
-            return;
+        if (data.error || !data.prompt) {
+            throw new Error(data.error || 'the server returned no prompt');
         }
-        
-        if (!data.prompt) {
-            alert('Failed to generate prompt.');
-            return;
-        }
-        
-        navigator.clipboard.writeText(data.prompt).then(() => {
-            alert('LLM prompt generated and copied to clipboard!');
-        }).catch(err => {
-            console.error('Failed to copy prompt:', err);
-            alert('Prompt generated but failed to copy to clipboard.');
-        });
+        return navigator.clipboard.writeText(data.prompt).then(
+            () => {
+                setButton('Copied!', true);
+                setTimeout(() => setButton(label, false), 1500);
+            },
+            () => {
+                // Clipboard access can be refused (no focus, insecure origin): let the user copy it by hand
+                setButton(label, false);
+                window.prompt('Copy the LLM prompt:', data.prompt);
+            }
+        );
     })
     .catch(error => {
-        hideSearchLoading();
+        setButton(label, false);
         console.error('[Client] ❌ Error generating prompt:', error);
-        alert('An error occurred while generating the prompt. Please try again.');
+        alert(`The prompt could not be generated: ${error.message}`);
     });
 }
 
@@ -3116,10 +3313,11 @@ function handleProcessInsertedResponse() {
     // Hide the insert response container
     handleCancelInsertResponse();
     cancelActiveSearch();
+    stopClipPlayback();
+    hideFloatingPreview();
     if (elements.resultsContainer) {
         elements.resultsContainer.innerHTML = '';
     }
-    showSearchLoading(`Processing ${sentenceQueries.length} sentences...`, null);
 
     // Now search for each source_segment and add to results
     // Each source_segment will be searched separately and create a separate result card
@@ -3134,9 +3332,14 @@ async function processStorySentences(sentenceQueries, selectedFiles, explanation
     const allSegments = [];
     const unmatched = [];
     let requestCounter = 0;
+    const search = beginSearch();
+    showSearchLoading(`Processing ${sentenceQueries.length} sentences...`, cancelActiveSearch);
 
     for (const [sentenceText, searchQueries] of sentenceQueries) {
         for (const searchQuery of searchQueries) {
+            if (!search.isCurrent) {
+                return;     // cancelled, or the project was switched
+            }
             requestCounter += 1;
             let segment = null;
             try {
@@ -3150,7 +3353,8 @@ async function processStorySentences(sentenceQueries, selectedFiles, explanation
                         sentenceSearchCounter: requestCounter,
                         includePartialMatches: false,
                         maxResultsPerSegment: 1
-                    })
+                    }),
+                    signal: search.controller.signal
                 });
                 if (!response.ok) {
                     throw new Error(`HTTP ${response.status}`);
@@ -3173,7 +3377,10 @@ async function processStorySentences(sentenceQueries, selectedFiles, explanation
         }
     }
 
-    hideSearchLoading();
+    if (!search.isCurrent) {
+        return;
+    }
+    finishSearch(search);
     if (allSegments.length > 0) {
         displayStorySegments(allSegments, explanation);
     } else {
@@ -3845,6 +4052,9 @@ document.addEventListener('mousemove', (event) => {
 async function handleLoadSentences() {
     try {
         const total = await loadSentences();
+        if (total === null) {
+            return;
+        }
         if (elements.loadSentencesButton) {
             const label = total ? `${CORPUS_RELOAD_BUTTON_TEXT} (${total})` : `${CORPUS_RELOAD_BUTTON_TEXT} (empty)`;
             elements.loadSentencesButton.textContent = label;
@@ -3890,7 +4100,11 @@ function buildCombinedTranscriptions() {
     }
 }
 
+let corpusRequestToken = 0;
+
+/** Load the corpus of the project's files. Resolves to null when a newer request has replaced this one. */
 async function loadSentences() {
+    const token = ++corpusRequestToken;
     const projectData = activeProject && typeof activeProject === 'object' ? activeProject.data : null;
     const selectedFiles = projectData && Array.isArray(projectData.selectedFiles) ? projectData.selectedFiles : [];
     const response = await fetch('/get_sentences', {
@@ -3904,6 +4118,9 @@ async function loadSentences() {
         throw new Error(`Failed to load sentences: ${response.status}`);
     }
     const data = await response.json();
+    if (token !== corpusRequestToken) {
+        return null;    // the project or its files changed while this was loading
+    }
     sentences = Array.isArray(data.sentences)
         ? data.sentences.map(normalizeCorpusEntry).filter(Boolean)
         : [];
@@ -5515,8 +5732,8 @@ function renderTimeline(entriesParam) {
             infoIcon.className = 'info-icon';
             infoIcon.title = `Original Source: ${entry.sourceVideo || entry.originalSource || 'Unknown'}\n` +
                 `Current Clip: ${entry.file}\n` +
-                `Start: ${entry.originalStart?.toFixed(2) || '0.00'}s\n` +
-                `End: ${entry.originalEnd?.toFixed(2) || 'N/A'}s`;
+                `Start: ${Number.isFinite(Number(entry.originalStart)) ? Number(entry.originalStart).toFixed(2) : '0.00'}s\n` +
+                `End: ${Number.isFinite(Number(entry.originalEnd)) && entry.originalEnd !== null ? Number(entry.originalEnd).toFixed(2) : 'N/A'}s`;
             infoIcon.textContent = 'ⓘ';
             infoIcon.style.cursor = 'pointer';
             infoIcon.style.fontSize = '0.8em';
@@ -5781,12 +5998,13 @@ function updateTimeline(mutator, options) {
         return;
     }
     recordTimelineUndo();
+    // Adding, removing and moving clips is saved right away, not after the typing delay
     updateProjectData(data => {
         if (!Array.isArray(data.timeline)) {
             data.timeline = [];
         }
         mutator(data.timeline);
-    }, options);
+    }, { immediate: true, ...options });
     renderTimeline();
 }
 
@@ -5974,9 +6192,12 @@ function playTimeline() {
     }
 }
 
+let mergeRunning = false;
+
 function setMergeBusy(busy) {
+    mergeRunning = busy;
     if (elements.timelineMergeButton) {
-        elements.timelineMergeButton.disabled = busy;
+        elements.timelineMergeButton.disabled = busy || !activeProject;
     }
 }
 
@@ -6002,7 +6223,7 @@ function showMergedDownloadLink(mergedPath) {
  */
 function mergeTimeline() {
     const entries = getTimelineEntries().filter(entry => entry && (entry.originalClipPath || entry.file) && entry.enabled !== false);
-    if (!entries.length) {
+    if (!entries.length || mergeRunning) {
         return;
     }
     const videosToMerge = entries.map(entry => {

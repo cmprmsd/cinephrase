@@ -70,6 +70,19 @@ class ProjectStoreTest(ServerTestCase):
         self.assertEqual(self.client.delete(f"/api/projects/{project['id']}").status_code, 200)
         self.assertEqual(self.client.get(f"/api/projects/{project['id']}").status_code, 404)
 
+    def test_stale_copies_cannot_overwrite_newer_saves(self):
+        project = self._create()
+        url = f"/api/projects/{project['id']}"
+        self.assertEqual(project['revision'], 1)
+        first = self.client.put(url, json={'baseRevision': 1, 'data': {'timeline': ['a', 'b']}})
+        self.assertEqual((first.status_code, first.get_json()['revision']), (200, 2))
+        stale = self.client.put(url, json={'baseRevision': 1, 'data': {'timeline': []}})      # the other tab
+        self.assertEqual(stale.status_code, 409)
+        self.assertEqual(stale.get_json()['project']['data']['timeline'], ['a', 'b'])
+        self.assertEqual(self.client.get(url).get_json()['data']['timeline'], ['a', 'b'])
+        forced = self.client.put(url, json={'data': {'timeline': ['c']}})                    # no base: last writer wins
+        self.assertEqual((forced.status_code, forced.get_json()['revision']), (200, 3))
+
     def test_damaged_store_is_not_overwritten_with_an_empty_one(self):
         first = self._create('Keep me')
         self._create('Second')                      # the second write leaves the first state in .bak
