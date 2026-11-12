@@ -361,9 +361,9 @@ function highlightPrefixMatch(text, query) {
 }
 
 // Helper to escape HTML entities
-function escapeHtml(text) {
-    if (typeof text !== 'string') return '';
-    return text
+/** Escape a value for use in HTML text and in quoted attribute values. */
+function escapeHtml(value) {
+    return String(value ?? '')
         .replace(/&/g, '&amp;')
         .replace(/</g, '&lt;')
         .replace(/>/g, '&gt;')
@@ -1568,33 +1568,32 @@ function renderCollections() {
             <div class="collection-item-header">
                 <div class="collection-item-info">
                     <div class="collection-item-name">${escapeHtml(collection.name)}</div>
-                    <div class="collection-item-meta">${fileCount} file${fileCount !== 1 ? 's' : ''} • ${createdDate}</div>
+                    <div class="collection-item-meta">${fileCount} file${fileCount !== 1 ? 's' : ''} • ${escapeHtml(createdDate)}</div>
                 </div>
                 <div class="collection-item-actions">
-                    <button class="collection-load-button ghost-button" data-collection-id="${collection.id}" title="Load into project">
-                        Load
+                    <button class="collection-load-button collection-add-button ghost-button" data-collection-id="${escapeHtml(collection.id)}" title="Add this collection's files to the project">
+                        Add
                     </button>
-                    <button class="collection-delete-button ghost-button danger" data-collection-id="${collection.id}" title="Delete collection">
+                    <button class="collection-load-button collection-replace-button ghost-button" data-collection-id="${escapeHtml(collection.id)}" title="Replace the project's files with this collection">
+                        Replace
+                    </button>
+                    <button class="collection-delete-button ghost-button danger" data-collection-id="${escapeHtml(collection.id)}" title="Delete collection">
                         Delete
                     </button>
                 </div>
             </div>
         `;
         
-        const loadButton = collectionItem.querySelector('.collection-load-button');
+        const addButton = collectionItem.querySelector('.collection-add-button');
+        const replaceButton = collectionItem.querySelector('.collection-replace-button');
         const deleteButton = collectionItem.querySelector('.collection-delete-button');
         
-        loadButton.addEventListener('click', () => handleLoadCollection(collection.id));
+        addButton.addEventListener('click', () => handleLoadCollection(collection.id, false));
+        replaceButton.addEventListener('click', () => handleLoadCollection(collection.id, true));
         deleteButton.addEventListener('click', () => handleDeleteCollection(collection.id));
         
         elements.collectionsList.appendChild(collectionItem);
     });
-}
-
-function escapeHtml(text) {
-    const div = document.createElement('div');
-    div.textContent = text;
-    return div.innerHTML;
 }
 
 async function handleCreateCollection() {
@@ -1616,6 +1615,10 @@ async function handleCreateCollection() {
     }
     
     const collectionName = name.trim();
+    const existing = collections.find(collection => collection.name === collectionName);
+    if (existing && !confirm(`A collection named "${collectionName}" already exists. Update it with the current ${projectFiles.length} file(s)?`)) {
+        return;
+    }
     
     try {
         const response = await fetch('/api/collections', {
@@ -1625,12 +1628,13 @@ async function handleCreateCollection() {
             },
             body: JSON.stringify({
                 name: collectionName,
-                files: projectFiles
+                files: projectFiles,
+                overwrite: Boolean(existing)
             })
         });
         
         if (!response.ok) {
-            const error = await response.json();
+            const error = await response.json().catch(() => ({}));
             alert(error.error || 'Failed to create collection');
             return;
         }
@@ -1642,7 +1646,7 @@ async function handleCreateCollection() {
     }
 }
 
-async function handleLoadCollection(collectionId) {
+async function handleLoadCollection(collectionId, replace = false) {
     if (!activeProject) {
         alert('Please create or select a project first');
         return;
@@ -1655,27 +1659,23 @@ async function handleLoadCollection(collectionId) {
     }
     
     const collectionFiles = Array.isArray(collection.files) ? collection.files : [];
-    
     if (collectionFiles.length === 0) {
         alert('Collection is empty');
         return;
     }
     
     const currentFiles = Array.isArray(activeProject?.data?.selectedFiles) ? activeProject.data.selectedFiles : [];
-    const currentCount = currentFiles.length;
-    
-    // Ask user if they want to replace or merge
-    const message = `Load collection "${collection.name}"?\n\n` +
-        `Collection contains: ${collectionFiles.length} file(s)\n` +
-        `Current project has: ${currentCount} file(s)\n\n` +
-        `Click OK to add collection files to existing files\n` +
-        `Click Cancel to replace all files with collection`;
-    
-    const shouldMerge = confirm(message);
+    // Replacing drops the current file list: ask, and treat Cancel/Escape as "do nothing".
+    if (replace && currentFiles.length > 0 &&
+        !confirm(`Replace the ${currentFiles.length} file(s) of this project with the ${collectionFiles.length} file(s) of "${collection.name}"?`)) {
+        return;
+    }
     
     updateProjectData(data => {
-        if (shouldMerge) {
-            // Merge: add files that aren't already in the project
+        if (replace) {
+            data.selectedFiles = [...collectionFiles];
+        } else {
+            // Add the files that are not in the project yet
             const current = Array.isArray(data.selectedFiles) ? data.selectedFiles : [];
             const currentSet = new Set(current);
             collectionFiles.forEach(file => {
@@ -1684,9 +1684,6 @@ async function handleLoadCollection(collectionId) {
                 }
             });
             data.selectedFiles = current;
-        } else {
-            // Replace: set files to collection files
-            data.selectedFiles = [...collectionFiles];
         }
     });
     
@@ -2935,11 +2932,6 @@ function handleGenerateStory() {
         // Display the generated story segments
         console.log(`[Client] ✓ Received ${data.segments.length} story segments from AI`);
         
-        // Store LLM prompt for copying (from debug info)
-        if (data.debug && data.debug.prompt) {
-            window.lastLLMPrompt = data.debug.prompt;
-        }
-        
         // Display debug information if available
         if (data.debug) {
             console.log('[Client] 🔍 DEBUG INFO:', data.debug);
@@ -2947,6 +2939,9 @@ function handleGenerateStory() {
         }
         
         displayStorySegments(data.segments, data.story_explanation);
+        if (Array.isArray(data.unmatched) && data.unmatched.length) {
+            showResultNotice(`${data.unmatched.length} segment(s) of the story were not found in the selected videos: ${data.unmatched.map(item => `"${item}"`).join(', ')}`);
+        }
         })
         .catch(error => {
         hideSearchLoading();
@@ -2956,21 +2951,10 @@ function handleGenerateStory() {
 }
 
 // Store prompt when generating (before API call)
-let lastLLMPromptData = null;
 
 function handleCopyLLMPrompt() {
-    // If we already have a prompt from a previous generation, use it
-    if (window.lastLLMPrompt) {
-        navigator.clipboard.writeText(window.lastLLMPrompt).then(() => {
-            alert('LLM prompt copied to clipboard!');
-        }).catch(err => {
-            console.error('Failed to copy prompt:', err);
-            alert('Failed to copy prompt to clipboard.');
-        });
-        return;
-    }
-    
-    // Otherwise, generate the prompt without calling Ollama
+    // Always build the prompt from the current story prompt, files and options. (A prompt cached from an
+    // earlier run was copied even after any of them had changed.)
     if (!activeProject || !elements.storyPromptInput) {
         alert('Please enter a story prompt first.');
         return;
@@ -2991,6 +2975,8 @@ function handleCopyLLMPrompt() {
     // Get configuration options
     const maxStorySegmentsInput = document.getElementById('maxStorySegments');
     const maxStorySegments = maxStorySegmentsInput ? parseInt(maxStorySegmentsInput.value, 10) : 10;
+    const preferLongSegmentsCheckbox = document.getElementById('preferLongSegments');
+    const preferLongSegments = preferLongSegmentsCheckbox ? preferLongSegmentsCheckbox.checked : true;
     
     // Show loading indicator
     showSearchLoading(`Generating LLM prompt...`, null);
@@ -3004,10 +2990,11 @@ function handleCopyLLMPrompt() {
         body: JSON.stringify({
             prompt: prompt,
             files: selectedFiles,
-            maxSegments: maxStorySegments
+            maxSegments: maxStorySegments,
+            preferLongSegments: preferLongSegments
         })
     })
-    .then(response => response.json())
+    .then(response => response.json().catch(() => ({ error: `the server answered with HTTP ${response.status}` })))
     .then(data => {
         hideSearchLoading();
         
@@ -3022,8 +3009,6 @@ function handleCopyLLMPrompt() {
             return;
         }
         
-        // Store the prompt and copy it
-        window.lastLLMPrompt = data.prompt;
         navigator.clipboard.writeText(data.prompt).then(() => {
             alert('LLM prompt generated and copied to clipboard!');
         }).catch(err => {
@@ -3089,40 +3074,39 @@ function handleProcessInsertedResponse() {
         return;
     }
     
-    // Process the response similar to backend processing
-    // Support both "sentences" and "storyline" keys (some LLMs use different formats)
-    const explanation = storyData.explanation || '';
-    const sentences = storyData.sentences || storyData.storyline || [];
-    
-    if (!sentences.length) {
-        alert('No sentences found in the response. Expected "sentences" or "storyline" array.');
-        return;
-    }
-    
-    // Hide the insert response container
-    handleCancelInsertResponse();
-    
-    // Show loading indicator
-    showSearchLoading(`Processing ${sentences.length} sentences...`, null);
-    
-    // Process each sentence: extract source_segments for searching
-    // Each sentence may have multiple source_segments that need to be searched separately
+    // Same tolerance as the server (parse_story_response): "sentences" or "storyline"; objects with
+    // sentence + source_segments (a list or a single string) or bare strings; anything else is ignored.
+    const explanation = typeof storyData.explanation === 'string' ? storyData.explanation : '';
+    const rawSentences = [storyData.sentences, storyData.storyline].find(Array.isArray) || [];
+    const text = value => (typeof value === 'string' ? value.trim() : '');
     const sentenceQueries = [];
-    for (const sentenceObj of sentences) {
-        if (typeof sentenceObj === 'string') {
-            // Legacy format: just a string (use as both sentence and search query)
-            sentenceQueries.push([sentenceObj, [sentenceObj]]);
-        } else if (sentenceObj.sentence && sentenceObj.source_segments) {
-            // New format: object with sentence and source_segments
-            // source_segments are the actual corpus segments to search for
-            const sourceSegments = Array.isArray(sentenceObj.source_segments) 
-                ? sentenceObj.source_segments 
-                : [sentenceObj.source_segments];
-            // Store as [sentence_text, [source_segment1, source_segment2, ...]]
-            sentenceQueries.push([sentenceObj.sentence, sourceSegments]);
+    for (const item of rawSentences) {
+        const entry = typeof item === 'string' ? { sentence: item } : item;
+        if (!entry || typeof entry !== 'object') {
+            continue;
+        }
+        const segments = (Array.isArray(entry.source_segments) ? entry.source_segments : [entry.source_segments])
+            .map(text)
+            .filter(Boolean);
+        const sentence = text(entry.sentence) || segments.join(' ');
+        if (sentence) {
+            sentenceQueries.push([sentence, segments.length ? segments : [sentence]]);
         }
     }
-    
+
+    if (!sentenceQueries.length) {
+        alert('No sentences found in the response. Expected a "sentences" array.');
+        return;
+    }
+
+    // Hide the insert response container
+    handleCancelInsertResponse();
+    cancelActiveSearch();
+    if (elements.resultsContainer) {
+        elements.resultsContainer.innerHTML = '';
+    }
+    showSearchLoading(`Processing ${sentenceQueries.length} sentences...`, null);
+
     // Now search for each source_segment and add to results
     // Each source_segment will be searched separately and create a separate result card
     processStorySentences(sentenceQueries, selectedFiles, explanation);
@@ -3198,7 +3182,7 @@ function displayDebugInfo(debugData) {
     let debugHTML = '<strong style="color: #ffc800;">🔍 DEBUG MODE</strong><br><br>';
     
     if (debugData.corpus_entry_count !== undefined) {
-        debugHTML += `<strong>Corpus Entries:</strong> ${debugData.corpus_entry_count}<br><br>`;
+        debugHTML += `<strong>Corpus Entries:</strong> ${escapeHtml(debugData.corpus_entry_count)}<br><br>`;
     }
     
     if (debugData.corpus) {
@@ -3242,7 +3226,7 @@ function displayDebugInfo(debugData) {
     }
     
     if (debugData.selected_indices) {
-        debugHTML += `<strong>Selected Indices (legacy format):</strong> [${debugData.selected_indices.join(', ')}]<br>`;
+        debugHTML += `<strong>Selected Indices (legacy format):</strong> [${escapeHtml([].concat(debugData.selected_indices).join(', '))}]<br>`;
     }
     
     debugDiv.innerHTML = debugHTML;
@@ -3253,12 +3237,6 @@ function displayDebugInfo(debugData) {
     } else {
         elements.resultsContainer.appendChild(debugDiv);
     }
-}
-
-function escapeHtml(text) {
-    const div = document.createElement('div');
-    div.textContent = text;
-    return div.innerHTML;
 }
 
 function displayStorySegments(segments, storyExplanation) {
@@ -4363,7 +4341,7 @@ function updateSentenceAutocomplete() {
         let sourceHtml = '';
         if (entry.source) {
             const fileName = entry.source.split('/').pop() || entry.source;
-            sourceHtml = `<span class="suggestion-source">${fileName}</span>`;
+            sourceHtml = `<span class="suggestion-source">${escapeHtml(fileName)}</span>`;
         }
         
         suggestionItem.innerHTML = `${prevHtml}${highlightedCurrent}${nextHtml}${sourceHtml}`;

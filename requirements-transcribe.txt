@@ -1,0 +1,7 @@
+# Optional: only needed to create transcripts (videogrep --transcribe with Vosk, or Whisper).
+# The cinephrase server does not import any of these.
+vosk~=0.3.45
+torch>=2.0.0
+openai-whisper>=20231117
+transformers>=4.35.0
+librosa>=0.10.0

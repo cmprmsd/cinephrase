@@ -542,9 +542,15 @@ def save_collection():
     with COLLECTIONS_LOCK:
         collections = read_collections()
         
-        # Check if name already exists
-        if any(c.get('name') == name for c in collections):
-            return jsonify({'error': 'Collection with this name already exists'}), 400
+        # Same name: update that collection when the client asked for it, refuse otherwise
+        existing = next((c for c in collections if c.get('name') == name), None)
+        if existing is not None:
+            if not data.get('overwrite'):
+                return jsonify({'error': 'Collection with this name already exists'}), 400
+            existing['files'] = files
+            existing['updatedAt'] = datetime.utcnow().isoformat() + 'Z'
+            write_collections(collections)
+            return jsonify({'status': 'updated', 'collection': existing})
         
         collection = {
             'id': str(uuid.uuid4()),
@@ -712,11 +718,25 @@ def cancel_search():
     return jsonify({'status': 'ok', 'cancelled': search_id})
 
 
-def build_story_llm_prompt(user_prompt, selected_files, max_segments):
+def build_story_llm_prompt(user_prompt, selected_files, max_segments, prefer_long_segments=True):
     """
     Build the LLM prompt for story generation.
     Returns tuple: (llm_prompt, corpus_entries, corpus_text)
     """
+    if prefer_long_segments:
+        length_rule = ("4. Prefer using longer segments when they fit naturally, but you can break them apart and "
+                       "recombine parts if needed for grammatical correctness.")
+        length_hints = ("- Use entire segments as-is (prefer longer segments when possible)\n"
+                        "- Combine parts from different segments\n"
+                        "- Rearrange words/phrases from the corpus to create grammatically correct sentences\n"
+                        "- Focus on using longer segments where they fit naturally\n"
+                        "- Find a good balance between long segments and short segments to create a coherent story.")
+    else:
+        length_rule = ("4. Segments of any length are fine: break them apart and recombine parts freely if that "
+                       "serves the story.")
+        length_hints = ("- Use entire segments as-is\n"
+                        "- Combine parts from different segments\n"
+                        "- Rearrange words/phrases from the corpus to create grammatically correct sentences")
     # Load corpus from selected files
     corpus_entries = []
     
@@ -775,14 +795,10 @@ CRITICAL RULES - YOU MUST FOLLOW THESE:
 1. Use ONLY words that appear in the corpus segments above. Do NOT invent, translate, or add any words that are not in the corpus.
 2. Maintain the EXACT language of the corpus. If the corpus is in German, your sentences must be in German. If it's in English, use English. Do NOT translate.
 3. You can rearrange and combine words/phrases from the corpus, but every word must come from the segments provided.
-4. Prefer using longer segments when they fit naturally, but you can break them apart and recombine parts if needed for grammatical correctness.
+{length_rule}
 
 Task: Create up to {max_segments} sentences that form a coherent story/narrative matching the user's prompt. You can:
-- Use entire segments as-is (prefer longer segments when possible)
-- Combine parts from different segments
-- Rearrange words/phrases from the corpus to create grammatically correct sentences
-- Focus on using longer segments where they fit naturally
-- Find a good balance between long segments and short segments to create a coherent story.
+{length_hints}
 
 Important: Every single word in your sentences must exist in the corpus segments above. Do not translate, do not invent new words, do not change the language.
 
@@ -818,6 +834,67 @@ Example:
     
     return llm_prompt, corpus_entries, corpus_text
 
+def parse_story_response(llm_response, corpus_entries):
+    """Read the LLM's story answer. Returns (explanation, sentence_queries, selected_indices, raw_sentences).
+
+    ``sentence_queries`` is a list of (sentence, [corpus segments to search]). Models rarely follow the format
+    to the letter, so this tolerates text around the JSON object, a single string instead of a list of
+    segments, bare strings instead of objects and the old index-based format. Raises ValueError if there is no
+    JSON object at all.
+    """
+    story_data = None
+    decoder = json.JSONDecoder()
+    position = llm_response.find('{')
+    while position != -1:
+        try:
+            candidate, _end = decoder.raw_decode(llm_response, position)
+        except json.JSONDecodeError:
+            candidate = None
+        if isinstance(candidate, dict):
+            story_data = candidate
+            break
+        position = llm_response.find('{', position + 1)
+    if story_data is None:
+        raise ValueError('The LLM did not return a JSON object')
+
+    def as_text(value):
+        return value.strip() if isinstance(value, str) else ''
+
+    explanation = as_text(story_data.get('explanation'))
+    raw_sentences = story_data.get('sentences')
+    if not isinstance(raw_sentences, list):
+        raw_sentences = []
+    selected_indices = None
+    sentence_queries = []
+
+    if not raw_sentences:
+        # Legacy format: 1-based indices into the corpus
+        indices = story_data.get('segments')
+        if isinstance(indices, list) and indices:
+            selected_indices = indices
+            for index in indices:
+                if isinstance(index, int) and not isinstance(index, bool) and 1 <= index <= len(corpus_entries):
+                    sentence_text = corpus_entries[index - 1]['text']
+                    sentence_queries.append((sentence_text, [sentence_text]))
+    for item in raw_sentences:
+        if isinstance(item, str):
+            item = {'sentence': item}
+        if not isinstance(item, dict):
+            continue
+        sentence_text = as_text(item.get('sentence'))
+        segments = item.get('source_segments')
+        if isinstance(segments, str):
+            segments = [segments]
+        if not isinstance(segments, list):
+            segments = []
+        search_queries = [as_text(segment) for segment in segments if as_text(segment)]
+        if not sentence_text and search_queries:
+            sentence_text = ' '.join(search_queries)
+        if sentence_text:
+            sentence_queries.append((sentence_text, search_queries or [sentence_text]))
+    return explanation, sentence_queries, selected_indices, raw_sentences
+
+
 @app.route('/generate_story_prompt', methods=['POST'])
 def generate_story_prompt():
     """
@@ -836,7 +913,8 @@ def generate_story_prompt():
     if not selected_files:
         return jsonify({'error': 'No files selected'}), 400
     
-    llm_prompt, corpus_entries, corpus_text = build_story_llm_prompt(prompt, selected_files, max_segments)
+    llm_prompt, corpus_entries, corpus_text = build_story_llm_prompt(
+        prompt, selected_files, max_segments, prefer_long_segments=data.get('preferLongSegments', True) is not False)
     
     if llm_prompt is None:
         return jsonify({'error': 'No corpus data found in selected files'}), 400
@@ -868,7 +946,8 @@ def generate_story():
     print(f"[Story] Max segments: {max_segments}, Prefer long: {prefer_long_segments}")
     
     # Build LLM prompt using shared function
-    llm_prompt, corpus_entries, corpus_text = build_story_llm_prompt(prompt, selected_files, max_segments)
+    llm_prompt, corpus_entries, corpus_text = build_story_llm_prompt(
+        prompt, selected_files, max_segments, prefer_long_segments=prefer_long_segments is not False)
     
     if llm_prompt is None:
         return jsonify({'error': 'No corpus data found in selected files'}), 400
@@ -925,59 +1004,15 @@ def generate_story():
             print(llm_response)
             print("="*80 + "\n")
         
-        # Parse LLM response
-        # Try to extract JSON from the response
-        import re
-        json_match = re.search(r'\{[\s\S]*\}', llm_response)
-        if not json_match:
-            print(f"[Story] ❌ No JSON found in LLM response: '{llm_response}'")
-            return jsonify({'error': f'LLM did not return valid JSON. Response: {llm_response[:200]}'}), 500
-        
-        story_data = json.loads(json_match.group())
-        explanation = story_data.get('explanation', '')
-        llm_sentences_data = story_data.get('sentences', [])
-        selected_indices = None  # For debug info
-        
-        # Support multiple formats for backward compatibility
-        sentence_queries = []  # List of (sentence_text, search_queries) tuples
-        
-        if not llm_sentences_data:
-            # Try legacy format with segment indices
-            selected_indices = story_data.get('segments', [])
-            if selected_indices:
-                print(f"[Story] Using legacy format: mapping {len(selected_indices)} segment indices")
-                for idx in selected_indices:
-                    if 1 <= idx <= len(corpus_entries):
-                        sentence_text = corpus_entries[idx - 1]['text']
-                        sentence_queries.append((sentence_text, [sentence_text]))
-        else:
-            # Parse new format: sentences is array of objects with sentence and source_segments
-            # Or old format: sentences is array of strings
-            for item in llm_sentences_data:
-                if isinstance(item, dict):
-                    # New format: object with sentence and source_segments
-                    sentence_text = item.get('sentence', '').strip()
-                    source_segments = item.get('source_segments', [])
-                    
-                    if sentence_text and source_segments:
-                        # Use source_segments for searching (exact corpus matches)
-                        search_queries = [seg.strip() for seg in source_segments if seg.strip()]
-                        if search_queries:
-                            sentence_queries.append((sentence_text, search_queries))
-                        else:
-                            # Fallback: use the sentence itself if no source_segments provided
-                            sentence_queries.append((sentence_text, [sentence_text]))
-                    elif sentence_text:
-                        # Has sentence but no source_segments - use sentence as search query
-                        sentence_queries.append((sentence_text, [sentence_text]))
-                elif isinstance(item, str):
-                    # Old format: just a string
-                    sentence_text = item.strip()
-                    if sentence_text:
-                        sentence_queries.append((sentence_text, [sentence_text]))
-        
+        try:
+            explanation, sentence_queries, selected_indices, llm_sentences_data = parse_story_response(
+                llm_response, corpus_entries)
+        except ValueError as exc:
+            print(f"[Story] ❌ {exc}: '{llm_response[:300]}'")
+            return jsonify({'error': f'{exc}. Response: {llm_response[:200]}'}), 502
+
         if not sentence_queries:
-            return jsonify({'error': 'LLM did not provide any valid sentences'}), 500
+            return jsonify({'error': 'The LLM did not provide any usable sentences'}), 502
         
         print(f"[Story] LLM created {len(sentence_queries)} sentences:")
         for i, (sentence_text, search_queries) in enumerate(sentence_queries, 1):
@@ -988,6 +1023,7 @@ def generate_story():
         # Now search for each sentence using its source_segments
         # This uses the sentence search without partial matches to find exact matches
         story_results = []
+        unmatched_segments = []
         story_counter = 0  # Counter for story generation
         
         for sentence_text, search_queries in sentence_queries:
@@ -1061,6 +1097,9 @@ def generate_story():
                         story_counter += 1
                         print(f"[Story] ✓ Found and exported {len(result['files'])} clip(s) for search query: '{search_query[:50]}...'")
                         break  # Only take first result from this search_query
+                    else:
+                        # The LLM used words that are not spoken (in this order) in the selected videos
+                        unmatched_segments.append(search_query)
                     
             except Exception as e:
                 print(f"[Story] Error searching for sentence '{sentence_text[:50]}...': {e}")
@@ -1071,7 +1110,8 @@ def generate_story():
         
         response_data = {
             'segments': story_results,
-            'story_explanation': explanation
+            'story_explanation': explanation,
+            'unmatched': unmatched_segments
         }
         
         # Include debug information if debug mode is enabled

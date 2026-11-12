@@ -213,6 +213,53 @@ class ClipEndpointsTest(ServerTestCase):
         self.assertIn('trimmed to nothing', events[-1]['error'])
 
 
+class StoryResponseTest(ServerTestCase):
+    CORPUS = [{'text': 'first corpus sentence'}, {'text': 'second corpus sentence'}]
+
+    def parse(self, text):
+        return server.parse_story_response(text, self.CORPUS)
+
+    def test_json_with_text_around_it(self):
+        text = 'Sure! Here is the story:\n```json\n{"explanation": "why", "sentences": [{"sentence": "A b", "source_segments": ["a", "b"]}]}\n```\nHope {this} helps'
+        explanation, queries, indices, _raw = self.parse(text)
+        self.assertEqual((explanation, queries, indices), ('why', [('A b', ['a', 'b'])], None))
+
+    def test_off_format_answers_do_not_crash_or_search_single_letters(self):
+        _, queries, _, _ = self.parse(json.dumps({'sentences': [
+            {'sentence': 'One', 'source_segments': 'in der'},          # string instead of list
+            {'sentence': 'Two', 'source_segments': ['in der', 7, '']}, # junk items
+            {'sentence': None, 'source_segments': ['only segments']},  # no sentence
+            {'sentence': 'Four'},                                      # no segments
+            'Five',                                                    # bare string
+            42,
+        ]}))
+        self.assertEqual(queries, [('One', ['in der']), ('Two', ['in der']), ('only segments', ['only segments']),
+                                   ('Four', ['Four']), ('Five', ['Five'])])
+
+    def test_legacy_index_format(self):
+        _, queries, indices, _ = self.parse('{"segments": [2, "x", 99, true, 1]}')
+        self.assertEqual(queries, [('second corpus sentence', ['second corpus sentence']),
+                                   ('first corpus sentence', ['first corpus sentence'])])
+        self.assertEqual(indices, [2, 'x', 99, True, 1])
+
+    def test_no_json_is_an_error(self):
+        for text in ('I cannot do that.', '{broken', '[1, 2]'):
+            with self.assertRaises(ValueError):
+                self.parse(text)
+
+    def test_prompt_honours_prefer_long_segments(self):
+        original = server.load_transcript_sentences
+        server.load_transcript_sentences = lambda path: [{'content': 'a sentence that is long enough', 'words': []}]
+        try:
+            long_prompt = server.build_story_llm_prompt('story', ['x.mp4'], 5, prefer_long_segments=True)[0]
+            any_prompt = server.build_story_llm_prompt('story', ['x.mp4'], 5, prefer_long_segments=False)[0]
+        finally:
+            server.load_transcript_sentences = original
+        self.assertIn('Prefer using longer segments', long_prompt)
+        self.assertNotIn('longer segments', any_prompt)
+        self.assertIn('x.mp4: a sentence that is long enough', any_prompt)
+
+
 class MatchingTest(ServerTestCase):
     WORDS = 'the quick brown fox jumps over the lazy dog and the quick red fox sleeps'.split()
 
