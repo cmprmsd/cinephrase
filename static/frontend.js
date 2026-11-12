@@ -294,18 +294,6 @@ function escapeRegExp(value) {
     return typeof value === 'string' ? value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') : '';
 }
 
-function highlightMatch(text, query) {
-    if (typeof text !== 'string' || typeof query !== 'string' || !query.trim()) {
-        return text || '';
-    }
-    const pattern = escapeRegExp(query.trim());
-    if (!pattern) {
-        return text;
-    }
-    const regex = new RegExp(pattern, 'gi');
-    return text.replace(regex, match => `<b>${match}</b>`);
-}
-
 // Highlight only the prefix match at word boundaries (faster, no fuzzy)
 function highlightPrefixMatch(text, query) {
     if (typeof text !== 'string' || typeof query !== 'string' || !query.trim()) {
@@ -2103,7 +2091,6 @@ function updateSearchLoadingMessage(message, segmentData) {
             displayMessage = `${prefix}: ${displayMessage}`;
         }
 
-        console.log(`[updateSearchLoadingMessage] Updating message: "${displayMessage}"`);
         messageEl.textContent = displayMessage;
     } else {
         console.warn('[updateSearchLoadingMessage] Message element not found');
@@ -3830,14 +3817,6 @@ function addSegmentResult(segmentData) {
     createResultCard(segmentData);
 }
 
-function updateDropdowns(data) {
-    if (!Array.isArray(data)) {
-        console.error('Received data is not an array:', data);
-        return;
-    }
-    data.forEach(createResultCard);
-}
-
 // ---------------------------------------------------------------------------------------------------------
 // Floating preview (next to the result card that is being auditioned)
 // ---------------------------------------------------------------------------------------------------------
@@ -5239,10 +5218,6 @@ function handleTimelineDrop(event) {
 
 function getTimelineEntries() {
     return Array.isArray(activeProject?.data?.timeline) ? activeProject.data.timeline : [];
-}
-
-function stopTimelineItemDragFromInput(event) {
-    event.stopPropagation();
 }
 
 function setTimelineTrimValue(entryId, field, value) {
