@@ -36,9 +36,13 @@ let sentenceAutocompleteState = {
     currentAcceptedText: '',
     isVisible: false,
     isTabCompletion: false,  // Flag to track if change came from Tab
+    keyboardSelection: false, // the highlighted suggestion was chosen with the arrow keys (not just hovered)
+    pasted: false,            // the last edit was a paste: never rewrite pasted text
+    timer: null,              // pending refresh after typing
     // Auto-semicolon undo support
     lastAutoSemicolon: null,  // { previousValue: string, timestamp: number } or null
-    skipAutoSemicolon: false  // Flag to skip auto-semicolon after undo
+    skipAutoSemicolon: false, // Flag to skip auto-semicolon after undo
+    noSplitPrefix: ''         // group the user restored with Backspace: not split again while it is being extended
 };
 
 // Floating preview state
@@ -255,6 +259,8 @@ function resetCorpusState() {
     corpusRequestToken += 1;        // answers of requests that are still on the way are for the old file list
     sentences = [];
     combinedTranscriptions = {}; // Clear combined transcriptions
+    sentenceAutocompleteState.suggestions = [];     // they belong to the corpus that is gone
+    hideSentenceAutocomplete();
     if (elements.loadSentencesButton) {
         elements.loadSentencesButton.textContent = CORPUS_DEFAULT_BUTTON_TEXT;
         elements.loadSentencesButton.disabled = false;
@@ -555,64 +561,72 @@ function bindEventListeners() {
         elements.sentenceInput.parentElement.style.position = 'relative';
         elements.sentenceInput.parentElement.appendChild(sentenceAutocompleteContainer);
 
-        elements.sentenceInput.addEventListener('input', (e) => {
+        const onSentenceInput = event => {
+            if (event && event.isComposing) {
+                return;     // an IME composition is in progress: handled on compositionend
+            }
             const currentValue = elements.sentenceInput.value.trim();
             // Reset accepted text if user manually edited (not from Tab completion)
             if (!sentenceAutocompleteState.isTabCompletion) {
                 sentenceAutocompleteState.currentAcceptedText = currentValue;
             }
             sentenceAutocompleteState.isTabCompletion = false;  // Reset flag
-            
+            sentenceAutocompleteState.pasted = Boolean(event && event.inputType === 'insertFromPaste');
+
             // Clear auto-semicolon undo state on manual input (but not if it just happened)
             // Check if this input is NOT from the auto-semicolon we just set (within 50ms)
             const autoSemicolon = sentenceAutocompleteState.lastAutoSemicolon;
             if (autoSemicolon && (Date.now() - autoSemicolon.timestamp > 50)) {
                 sentenceAutocompleteState.lastAutoSemicolon = null;
             }
-            
+
             updateProjectData(data => {
                 data.currentSentence = currentValue;
             });
-            updateSentenceAutocomplete();
-        });
-        
+            scheduleSentenceAutocomplete();
+        };
+        elements.sentenceInput.addEventListener('input', onSentenceInput);
+        elements.sentenceInput.addEventListener('compositionend', onSentenceInput);
+
         elements.sentenceInput.addEventListener('keydown', event => {
+            if (event.isComposing || event.keyCode === 229) {
+                return;     // keys that belong to an IME composition (Enter confirms a candidate)
+            }
             if (event.key === 'Enter') {
                 event.preventDefault();
-                // If a suggestion is selected, use it; otherwise search with current input
-                if (sentenceAutocompleteState.isVisible && 
-                    sentenceAutocompleteState.selectedIndex >= 0 && 
-                    sentenceAutocompleteState.suggestions[sentenceAutocompleteState.selectedIndex]) {
-                    const selectedEntry = sentenceAutocompleteState.suggestions[sentenceAutocompleteState.selectedIndex];
+                cancelScheduledSentenceAutocomplete();
+                // A suggestion chosen with the arrow keys is taken over; a merely hovered one is not.
+                const selected = sentenceAutocompleteState.isVisible && sentenceAutocompleteState.keyboardSelection
+                    ? sentenceAutocompleteState.suggestions[sentenceAutocompleteState.selectedIndex]
+                    : null;
+                if (selected) {
                     // Get the text without context prefix (main text only)
-                    let textToInsert = selectedEntry.current;
-                    if (selectedEntry.prevContext && textToInsert.toLowerCase().startsWith(selectedEntry.prevContext.toLowerCase())) {
-                        textToInsert = textToInsert.substring(selectedEntry.prevContext.length).trimStart();
+                    let textToInsert = selected.current;
+                    if (selected.prevContext && textToInsert.toLowerCase().startsWith(selected.prevContext.toLowerCase())) {
+                        textToInsert = textToInsert.substring(selected.prevContext.length).trimStart();
                     }
                     selectSentenceSuggestion(textToInsert);
-                    // After selecting suggestion, trigger search
-                    handleSentenceSearch();
-                } else {
-                    handleSentenceSearch();
                 }
+                handleSentenceSearch();
                 hideSentenceAutocomplete();
             } else if (event.key === 'Tab') {
-                event.preventDefault();
-                // If autocomplete not visible, try to show it first
+                if (event.shiftKey || event.ctrlKey || event.altKey || event.metaKey) {
+                    return;                             // leave the field as usual
+                }
+                cancelScheduledSentenceAutocomplete();
+                updateSentenceAutocomplete();           // suggestions for the text as it is right now
                 if (!sentenceAutocompleteState.isVisible) {
-                    updateSentenceAutocomplete();
+                    return;                             // nothing to complete: Tab moves to the next control
                 }
-                // Accept next word if we have suggestions
-                if (sentenceAutocompleteState.suggestions.length > 0) {
-                    acceptNextWord();
+                event.preventDefault();
+                acceptNextWord();
+            } else if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+                if (sentenceAutocompleteState.isVisible) {
+                    event.preventDefault();             // otherwise the caret moves between the lines
+                    navigateSentenceAutocomplete(event.key === 'ArrowDown' ? 1 : -1);
                 }
-            } else if (event.key === 'ArrowDown') {
-                event.preventDefault();
-                navigateSentenceAutocomplete(1);
-            } else if (event.key === 'ArrowUp') {
-                event.preventDefault();
-                navigateSentenceAutocomplete(-1);
             } else if (event.key === 'Escape') {
+                cancelScheduledSentenceAutocomplete();
                 hideSentenceAutocomplete();
             } else if (event.key === 'Backspace') {
                 // Check if we can undo an auto-semicolon insertion
@@ -4064,6 +4078,50 @@ async function handleLoadSentences() {
     }
 }
 
+/** A word as the search compares it: lower case, typographic apostrophes/dashes folded, punctuation stripped. */
+function normalizeSearchToken(word) {
+    return String(word || '').normalize('NFKC').toLowerCase()
+        .replace(/[\u2019\u2018\u02bc\u00b4`]/g, "'")
+        .replace(/[\u2010-\u2014]/g, '-')
+        .replace(/\u00ad/g, '')
+        .replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, '');
+}
+
+function searchTokens(text) {
+    return String(text || '').split(/\s+/).map(normalizeSearchToken).filter(Boolean);
+}
+
+/**
+ * Whether the words of `text` are spoken one after the other somewhere in the corpus (the last one may be
+ * unfinished). Punctuation and transcript segment boundaries do not matter, exactly as in the search itself.
+ */
+function isSpokenContiguously(text) {
+    const tokens = searchTokens(text);
+    if (!tokens.length) {
+        return false;
+    }
+    const needle = ` ${tokens.join(' ')}`;
+    return Object.values(combinedTranscriptions).some(entry => entry.tokenText.includes(needle));
+}
+
+/** The word that follows `text` where it is spoken in the corpus (as written in the transcript), or null. */
+function nextSpokenWord(text) {
+    const tokens = searchTokens(text);
+    if (!tokens.length) {
+        return null;
+    }
+    for (const entry of Object.values(combinedTranscriptions)) {
+        let at = entry.tokens.indexOf(tokens[0]);
+        while (at !== -1 && at + tokens.length < entry.tokens.length) {
+            if (tokens.every((token, offset) => entry.tokens[at + offset] === token)) {
+                return entry.words[at + tokens.length];
+            }
+            at = entry.tokens.indexOf(tokens[0], at + 1);
+        }
+    }
+    return null;
+}
+
 function buildCombinedTranscriptions() {
     // Group sentences by source file and combine them into one long transcription
     combinedTranscriptions = {};
@@ -4082,15 +4140,25 @@ function buildCombinedTranscriptions() {
             fileSegments[file].push(entry.current);
         }
     });
+    sentences.forEach(entry => {
+        if (entry) {
+            entry.tokens = searchTokens(entry.current);     // once, not on every keystroke
+        }
+    });
     
     // Combine segments for each file into one long transcription
     for (const [file, segments] of Object.entries(fileSegments)) {
         // Join all segments with spaces to create one long transcription
         const combined = segments.join(' ');
+        const words = combined.split(/\s+/).filter(word => normalizeSearchToken(word));
+        const tokens = words.map(normalizeSearchToken);
         combinedTranscriptions[file] = {
             text: combined,
             normalized: combined.toLowerCase(),
-            segments: segments // Keep original segments for reference
+            segments: segments, // Keep original segments for reference
+            words,                                  // words that count for the search, as written
+            tokens,                                 // the same words as the search compares them
+            tokenText: ` ${tokens.join(' ')} `
         };
     }
 }
@@ -4124,6 +4192,28 @@ async function loadSentences() {
 }
 
 // Sentence autocomplete functions
+
+/** Set the sentence field from code (completion, auto-split, undo) and store it like typed text. */
+function setSentenceInput(value) {
+    elements.sentenceInput.value = value;
+    updateProjectData(data => {
+        data.currentSentence = value.trim();
+    });
+}
+
+/** Refresh the suggestions shortly after the last keystroke (the corpus can be large). */
+function scheduleSentenceAutocomplete() {
+    cancelScheduledSentenceAutocomplete();
+    sentenceAutocompleteState.timer = setTimeout(() => {
+        sentenceAutocompleteState.timer = null;
+        updateSentenceAutocomplete();
+    }, 120);
+}
+
+function cancelScheduledSentenceAutocomplete() {
+    clearTimeout(sentenceAutocompleteState.timer);
+    sentenceAutocompleteState.timer = null;
+}
 function updateSentenceAutocomplete() {
     if (!elements.sentenceInput || !sentenceAutocompleteContainer || !sentences || sentences.length === 0) {
         hideSentenceAutocomplete();
@@ -4203,86 +4293,41 @@ function updateSentenceAutocomplete() {
         sentenceAutocompleteState.currentAcceptedText = inputValue;
     }
     
-    // Get checkbox states
-    const includePartialMatchesCheckbox = document.getElementById('includePartialMatches');
-    const includePartialMatches = includePartialMatchesCheckbox ? includePartialMatchesCheckbox.checked : false;
-    const allPartialMatchesCheckbox = document.getElementById('allPartialMatches');
-    const allPartialMatches = allPartialMatchesCheckbox ? allPartialMatchesCheckbox.checked : false;
-    
     // Filter and prioritize autocompletion suggestions
     // Use simple approach like updateAutocomplete - show all matches that contain input
     const MAX_SUGGESTIONS = 100;
     const suggestions = [];
     
-    // Helper function to check if input matches at word boundaries
-    // Always requires word boundary matching for the last word to avoid substring matches
-    // (e.g., "euch" should match "euch" but not "beleuchten")
-    function matchesAtWordBoundary(text, input, hasTrailingSpace) {
-        const inputWords = input.split(/\s+/);
-        const textWords = text.split(/\s+/);
-        const lastInputWord = inputWords[inputWords.length - 1];
-        
-        // Check if input matches at word boundaries
-        for (let i = 0; i <= textWords.length - inputWords.length; i++) {
+    // Whether the typed words occur in a segment one after the other, compared like the search compares
+    // them (punctuation ignored). The last word may be unfinished unless a space was typed after it;
+    // a word never matches inside another one ("euch" does not match "beleuchten").
+    const inputTokens = searchTokens(normalizedInput);
+    function matchesAtWordBoundary(textTokens) {
+        if (!inputTokens.length) {
+            return false;
+        }
+        const last = inputTokens.length - 1;
+        for (let start = 0; start <= textTokens.length - inputTokens.length; start++) {
             let matches = true;
-            for (let j = 0; j < inputWords.length; j++) {
-                const textWord = textWords[i + j];
-                const inputWord = inputWords[j];
-                
-                if (j === inputWords.length - 1) {
-                    // Last word: must start with input word (word boundary match)
-                    // This prevents "euch" from matching "beleuchten"
-                    if (!textWord.startsWith(inputWord)) {
-                        matches = false;
-                        break;
-                    }
-                    // If there's a trailing space, the word must be complete (exact match)
-                    if (hasTrailingSpace && textWord !== inputWord) {
-                        matches = false;
-                        break;
-                    }
-                } else {
-                    // Previous words: must match exactly
-                    if (textWord !== inputWord) {
-                        matches = false;
-                        break;
-                    }
-                }
+            for (let offset = 0; offset <= last && matches; offset++) {
+                const textToken = textTokens[start + offset];
+                matches = offset < last || hasTrailingSpace
+                    ? textToken === inputTokens[offset]
+                    : textToken.startsWith(inputTokens[offset]);
             }
             if (matches) {
                 return true;
             }
         }
-        
         return false;
     }
-    
-    // Helper function to handle wildcard matching
-    function matchesWithWildcards(text, input) {
-        // Check for wildcards in input
-        const hasSingleWildcard = input.includes('*') && !input.includes('**');
-        const hasDoubleWildcard = input.includes('**');
-        
-        if (!hasSingleWildcard && !hasDoubleWildcard) {
-            // No wildcards, use exact matching
-            return text.includes(input);
-        }
-        
-        // Convert wildcard pattern to regex
-        let pattern = input.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); // Escape special chars
-        
-        if (hasDoubleWildcard) {
-            // ** matches any sequence of words (including spaces)
-            pattern = pattern.replace(/\*\*/g, '.*');
-        } else {
-            // * matches within a single word (no spaces)
-            pattern = pattern.replace(/\*/g, '[^\\s]*');
-        }
-        
-        const regex = new RegExp(pattern, 'i'); // Case insensitive
-        return regex.test(text);
-    }
-    
+
+    // Wildcards: * stands for the rest of a word, ** for any text
+    const hasWildcards = normalizedInput.includes('*');
+    const wildcardPattern = hasWildcards
+        ? new RegExp(normalizedInput.split('**').map(part => part.split('*').map(escapeRegExp).join('[^\\s]*')).join('.*'), 'i')
+        : null;
+
     // Collect all matches that contain the input (like updateAutocomplete)
     const allMatches = [];
     const continuingSegments = [];
@@ -4298,12 +4343,7 @@ function updateSentenceAutocomplete() {
         if (currentAccepted && normalizedInput.startsWith(currentAccepted) && segmentNormalized.startsWith(currentAccepted)) {
             continuingSegments.push(entry);
         }
-        // Check for wildcard patterns first
-        else if (matchesWithWildcards(segmentNormalized, normalizedInput)) {
-            allMatches.push(entry);
-        }
-        // All other segments that match the input (with word boundary checking if trailing space)
-        else if (matchesAtWordBoundary(segmentNormalized, normalizedInput, hasTrailingSpace)) {
+        else if (wildcardPattern ? wildcardPattern.test(segmentNormalized) : matchesAtWordBoundary(entry.tokens || [])) {
             allMatches.push(entry);
         }
     });
@@ -4313,9 +4353,6 @@ function updateSentenceAutocomplete() {
     allMatches.sort((a, b) => {
         const aText = a.currentNormalized || a.current?.toLowerCase() || '';
         const bText = b.currentNormalized || b.current?.toLowerCase() || '';
-        
-        // Check if we're using wildcards
-        const hasWildcards = normalizedInput.includes('*');
         
         if (hasWildcards) {
             // For wildcard searches, prioritize exact matches, then by length
@@ -4387,9 +4424,16 @@ function updateSentenceAutocomplete() {
     const currentSemicolonIndex = currentInputValue.lastIndexOf(';');
     const activeGroupCheck = currentSemicolonIndex === -1 ? currentInputValue : currentInputValue.slice(currentSemicolonIndex + 1).trim();
     
-    const shouldSkipAutoSemicolon = sentenceAutocompleteState.skipAutoSemicolon || 
+    // A group restored with Backspace stays whole while the user keeps extending it
+    if (sentenceAutocompleteState.noSplitPrefix && !normalizedInput.startsWith(sentenceAutocompleteState.noSplitPrefix)) {
+        sentenceAutocompleteState.noSplitPrefix = '';
+    }
+    const shouldSkipAutoSemicolon = sentenceAutocompleteState.skipAutoSemicolon ||
+                                   Boolean(sentenceAutocompleteState.noSplitPrefix) ||
+                                   sentenceAutocompleteState.pasted ||
+                                   hasWildcards ||
                                    (activeGroupCheck.match(/[.!?]\s+[A-ZÄÖÜ]/));
-    
+
     sentenceAutocompleteState.skipAutoSemicolon = false; // Reset flag
     
     // Special handling for multi-sentence contexts: always check for next sentence suggestions
@@ -4454,9 +4498,10 @@ function updateSentenceAutocomplete() {
         }
     }
     
-    originalSuggestionsLength = suggestions.length;
-    
-    if (suggestions.length === 0 && inputWords.length > 1 && !previouslyHadPrefixMatch && !shouldSkipAutoSemicolon) {
+    // The split is only right at a real dead end: not when the words are spoken one after the other across
+    // punctuation or a transcript segment boundary (the search finds such phrases).
+    if (suggestions.length === 0 && inputWords.length > 1 && !previouslyHadPrefixMatch && !shouldSkipAutoSemicolon
+            && !isSpokenContiguously(inputValue)) {
         const lastWord = inputWords[inputWords.length - 1] || '';
         if (lastWord) {
             const fullInput = elements.sentenceInput.value;
@@ -4509,7 +4554,7 @@ function updateSentenceAutocomplete() {
                 // We are explicitly breaking out of the previous Tab chain
                 // and starting a new group from the last word.
                 sentenceAutocompleteState.isTabCompletion = false;
-                elements.sentenceInput.value = newValue;
+                setSentenceInput(newValue);
                 sentenceAutocompleteState.currentAcceptedText = newGroup;
 
                 // Restart autocomplete for the new group
@@ -4527,7 +4572,8 @@ function updateSentenceAutocomplete() {
     // Update state
     sentenceAutocompleteState.suggestions = suggestions;
     sentenceAutocompleteState.selectedIndex = -1;
-    
+    sentenceAutocompleteState.keyboardSelection = false;
+
     // Render suggestions - match styling from Sentence Suggestions
     sentenceAutocompleteContainer.innerHTML = '';
     suggestions.forEach((entry, index) => {
@@ -4536,6 +4582,7 @@ function updateSentenceAutocomplete() {
         suggestionItem.style.cssText = 'padding: 8px 12px; cursor: pointer; border-bottom: 1px solid var(--border);';
         suggestionItem.addEventListener('mouseenter', () => {
             sentenceAutocompleteState.selectedIndex = index;
+            sentenceAutocompleteState.keyboardSelection = false;
             updateSentenceAutocompleteSelection();
         });
         
@@ -4611,6 +4658,7 @@ function navigateSentenceAutocomplete(direction) {
     }
     
     sentenceAutocompleteState.selectedIndex += direction;
+    sentenceAutocompleteState.keyboardSelection = true;
     
     if (sentenceAutocompleteState.selectedIndex < -1) {
         sentenceAutocompleteState.selectedIndex = sentenceAutocompleteState.suggestions.length - 1;
@@ -4683,7 +4731,7 @@ function acceptNextWord() {
                     }
 
                     sentenceAutocompleteState.isTabCompletion = true;
-                    elements.sentenceInput.value = newFullValue;
+                    setSentenceInput(newFullValue);
                     sentenceAutocompleteState.currentAcceptedText = newGroupValue;
                     updateSentenceAutocomplete();
                     return;
@@ -4745,53 +4793,12 @@ function acceptNextWord() {
         }
     }
     
-    // If still no word found, search within combined transcriptions directly
+    // If still no word found, continue where these words are spoken in a transcript (whole words only,
+    // also across segment boundaries)
     if (!bestNextWord) {
-        // Search combined transcriptions for matches
-        for (const [file, transcription] of Object.entries(combinedTranscriptions)) {
-            if (!transcription || !transcription.normalized) continue;
-            
-            const combinedNormalized = transcription.normalized;
-            const combinedText = transcription.text;
-            
-            // Check if combined transcription contains the input
-            if (combinedNormalized.includes(normalizedInput)) {
-                // Find the position of the input
-                const matchIndex = combinedNormalized.indexOf(normalizedInput);
-                if (matchIndex !== -1) {
-                    // Get the text after the match
-                    const afterMatch = combinedText.substring(matchIndex + normalizedInput.length).trim();
-                    if (afterMatch) {
-                        const nextWord = afterMatch.split(/\s+/)[0];
-                        if (nextWord) {
-                            bestNextWord = nextWord;
-                            // Extract a portion for display
-                            const words = combinedText.split(/\s+/);
-                            const normalizedWords = combinedNormalized.split(/\s+/);
-                            const inputWords = normalizedInput.split(/\s+/);
-                            
-                            // Find word index
-                            let wordIndex = 0;
-                            let charCount = 0;
-                            for (let i = 0; i < normalizedWords.length; i++) {
-                                if (charCount + normalizedWords[i].length >= matchIndex) {
-                                    wordIndex = i;
-                                    break;
-                                }
-                                charCount += normalizedWords[i].length + 1;
-                            }
-                            
-                            const startWord = Math.max(0, wordIndex);
-                            const endWord = Math.min(words.length, wordIndex + inputWords.length + 15);
-                            bestSegment = words.slice(startWord, endWord).join(' ');
-                            break;
-                        }
-                    }
-                }
-            }
-        }
+        bestNextWord = nextSpokenWord(currentInput);
     }
-    
+
     // If still no word found, check if current input is a complete segment
     // If so, look for segments that might continue with a space (new segment starting)
     if (!bestNextWord) {
@@ -4878,64 +4885,27 @@ function acceptNextWord() {
         // Set flag to indicate this is Tab completion
         sentenceAutocompleteState.isTabCompletion = true;
 
-        elements.sentenceInput.value = newFullValue;
+        setSentenceInput(newFullValue);
 
         // Update accepted text for next Tab press (track only the active group)
         sentenceAutocompleteState.currentAcceptedText = newGroupValue;
 
         // Update suggestions for the new input
         updateSentenceAutocomplete();
-    } else if (currentInput) {
-        // No more completions found for current sequence
-        // Close current group (if any) with a semicolon and start a new group
-        const fullInput = elements.sentenceInput.value;
-        const lastSemicolonIndex = fullInput.lastIndexOf(';');
-        const before = lastSemicolonIndex === -1 ? '' : fullInput.slice(0, lastSemicolonIndex + 1); // includes semicolon
-        const currentGroup = lastSemicolonIndex === -1 ? fullInput : fullInput.slice(lastSemicolonIndex + 1);
-        const groupTrimmed = currentGroup.trim();
-
-        if (groupTrimmed) {
-            const groupWords = groupTrimmed.split(/\s+/);
-            const lastWord = groupWords[groupWords.length - 1] || '';
-
-            // Build prefix with the finished group and a semicolon
-            let prefix = '';
-            if (before) {
-                // There were previous groups, append this finished group after a space if needed
-                const beforeClean = before.endsWith(';') ? before : before + ';';
-                prefix = `${beforeClean} ${groupTrimmed}; `;
-            } else {
-                // This is the first group
-                prefix = `${groupTrimmed}; `;
-            }
-
-            // Start a new group from the last word/partial
-            const newGroup = lastWord;
-            const newValue = `${prefix}${newGroup}`.trimEnd();
-
-            sentenceAutocompleteState.isTabCompletion = true;
-            elements.sentenceInput.value = newValue;
-
-            // Accepted text for the new cycle is only the new group
-            sentenceAutocompleteState.currentAcceptedText = newGroup;
-
-            // Refresh suggestions for the new group (text after last comma)
-            updateSentenceAutocomplete();
-        }
     }
+    // No continuation: the text stays as it is (a new group is started by typing ";").
 }
 
 function selectSentenceSuggestion(sentence) {
     if (!elements.sentenceInput) {
         return;
     }
-    
-    elements.sentenceInput.value = sentence;
+    const value = elements.sentenceInput.value;
+    const lastSemicolonIndex = value.lastIndexOf(';');
+    setSentenceInput(lastSemicolonIndex === -1 ? sentence : `${value.slice(0, lastSemicolonIndex + 1)} ${sentence}`);
     sentenceAutocompleteState.currentAcceptedText = sentence;
-    updateProjectData(data => {
-        data.currentSentence = sentence;
-    });
     hideSentenceAutocomplete();
+    elements.sentenceInput.focus();
 }
 
 function undoAutoSemicolon() {
@@ -4958,7 +4928,7 @@ function undoAutoSemicolon() {
     sentenceAutocompleteState.skipAutoSemicolon = true;
     
     // Restore the previous value
-    elements.sentenceInput.value = autoSemicolon.previousValue;
+    setSentenceInput(autoSemicolon.previousValue);
     sentenceAutocompleteState.lastAutoSemicolon = null;
     
     // Reset accepted text to match restored state
@@ -4967,7 +4937,8 @@ function undoAutoSemicolon() {
         ? autoSemicolon.previousValue 
         : autoSemicolon.previousValue.slice(lastSemicolonIndex + 1);
     sentenceAutocompleteState.currentAcceptedText = activeGroup.trim();
-    
+    sentenceAutocompleteState.noSplitPrefix = activeGroup.trim().toLowerCase();
+
     // Refresh autocomplete (skipAutoSemicolon flag will prevent re-insertion)
     updateSentenceAutocomplete();
     
