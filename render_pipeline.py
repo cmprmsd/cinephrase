@@ -23,8 +23,10 @@ import shutil
 import struct
 import subprocess
 import tempfile
+import threading
+import time
 from collections import Counter
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from fractions import Fraction
 from typing import Callable, Dict, Iterator, List, Optional, Sequence, Tuple
@@ -42,6 +44,10 @@ FFMPEG_TIMEOUT = 600
 
 class RenderError(RuntimeError):
     """A user-presentable rendering failure."""
+
+
+class RenderCancelled(RenderError):
+    """The merge was stopped on purpose (the client went away or asked for it)."""
 
 
 # --------------------------------------------------------------------------------------------------------------
@@ -92,7 +98,7 @@ def probe_media(path: str) -> MediaInfo:
     """Read the stream properties the planner needs with a single ffprobe call."""
     command = [
         'ffprobe', '-v', 'error',
-        '-show_entries', 'stream=codec_type,width,height,r_frame_rate,avg_frame_rate,duration'
+        '-show_entries', 'stream=codec_type,width,height,sample_aspect_ratio,r_frame_rate,avg_frame_rate,duration'
                          ':stream_tags=rotate:stream_side_data=rotation:format=duration',
         '-of', 'json', path,
     ]
@@ -123,8 +129,12 @@ def probe_media(path: str) -> MediaInfo:
             fps = None
     width = int(video.get('width') or 0) if video else 0
     height = int(video.get('height') or 0) if video else 0
+    # Report the size the picture is displayed at: non-square pixels (DVD, HDV) widen it ...
+    pixel_aspect = _parse_rate(str(video.get('sample_aspect_ratio') or '').replace(':', '/')) if video else None
+    if pixel_aspect and pixel_aspect != 1:
+        width = int(width * pixel_aspect) // 2 * 2
     if video and _rotation(video) % 180 == 90:
-        # ffmpeg rotates such video (phone footage) upright while decoding: report the size it will have.
+        # ... and ffmpeg rotates phone footage upright while decoding.
         width, height = height, width
     return MediaInfo(
         has_video=video is not None,
@@ -153,6 +163,11 @@ class Segment:
     samples: int = 0
     frames: int = 0
     info: Optional[MediaInfo] = field(default=None, repr=False)
+
+
+def too_short(duration: float) -> bool:
+    """Whether a cut is below the minimum length. Tolerant of float noise: the client's limit is exactly 20 ms."""
+    return duration < MIN_SEGMENT_SECONDS - 1e-6
 
 
 def clamp_speed(value) -> float:
@@ -261,6 +276,8 @@ def video_command(segment: Segment, fps: Fraction, width: int, height: int, enco
     # start_time=0 pins the first frame to t=0 (the first decoded frame can sit up to one frame after the seek
     # point); tpad clones the last frame if the source runs out, -frames:v then cuts to the planned count.
     filters.append(f'fps={_rate(fps)}:start_time=0:round=near')
+    # Non-square pixels are stretched to their display shape first; the cover scale then works on what is seen.
+    filters.append('scale=trunc(iw*sar/2)*2:ih')
     filters.append(f'scale={width}:{height}:force_original_aspect_ratio=increase')
     filters.append(f'crop={width}:{height}')
     filters.append('setsar=1')
@@ -286,17 +303,44 @@ def black_command(frames: int, fps: Fraction, width: int, height: int, encoder_a
             *encoder_args, '-video_track_timescale', '90000', output]
 
 
-def _run(command: Sequence[str], what: str, timeout: int = FFMPEG_TIMEOUT) -> subprocess.CompletedProcess:
+def _run(command: Sequence[str], what: str, timeout: int = FFMPEG_TIMEOUT,
+         should_stop: Optional[Callable[[], bool]] = None) -> subprocess.CompletedProcess:
+    """Run ffmpeg/ffprobe to the end. ``should_stop`` is polled so a cancelled merge kills its encodes."""
     try:
-        result = subprocess.run(command, capture_output=True, timeout=timeout)
-    except subprocess.TimeoutExpired as exc:
-        raise RenderError(f'{what}: ffmpeg timed out after {timeout}s') from exc
+        process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     except OSError as exc:
         raise RenderError(f'{what}: could not start ffmpeg ({exc})') from exc
-    if result.returncode != 0:
-        detail = (result.stderr or b'').decode(errors='ignore').strip().splitlines()
+    deadline = time.monotonic() + timeout
+    try:
+        while True:
+            try:
+                stdout, stderr = process.communicate(timeout=0.25 if should_stop else timeout)
+                break
+            except subprocess.TimeoutExpired:
+                if should_stop and should_stop():
+                    raise RenderCancelled(f'{what}: cancelled') from None
+                if time.monotonic() >= deadline:
+                    raise RenderError(f'{what}: ffmpeg timed out after {timeout}s') from None
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.communicate()
+    if process.returncode != 0:
+        detail = (stderr or b'').decode(errors='ignore').strip().splitlines()
         raise RenderError(f'{what}: {" | ".join(detail[-3:]) or "ffmpeg failed"}')
-    return result
+    return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+
+
+def count_video_frames(path: str) -> int:
+    """Number of video frames in a file written by this module (0 if it has no picture)."""
+    command = ['ffprobe', '-v', 'error', '-select_streams', 'v:0', '-count_packets',
+               '-show_entries', 'stream=nb_read_packets', '-of', 'csv=p=0', path]
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, timeout=60)
+    except (subprocess.SubprocessError, OSError):
+        return 0
+    first = (result.stdout or '').strip().split('\n')[0].strip().rstrip(',')
+    return int(first) if first.isdigit() else 0
 
 
 # --------------------------------------------------------------------------------------------------------------
@@ -417,7 +461,7 @@ def render_timeline(
             probe_cache[segment.media] = probe_media(segment.media)
         segment.info = probe_cache[segment.media]
         segment.speed = clamp_speed(segment.speed)
-        if segment.duration < MIN_SEGMENT_SECONDS:
+        if too_short(segment.duration):
             raise RenderError(f'Clip "{segment.title}" is trimmed to nothing ({segment.duration * 1000:.0f} ms).')
 
     infos = [segment.info for segment in segments]
@@ -436,7 +480,7 @@ def render_timeline(
         def audio_path(index: int) -> str:
             return os.path.join(work_dir, f'a{index:05d}.pcm')
 
-        def render_audio(index: int) -> None:
+        def render_audio(index: int, stopped: Callable[[], bool]) -> None:
             segment = segments[index]
             target = audio_path(index)
             if segment.samples <= 0:
@@ -444,58 +488,84 @@ def render_timeline(
                 return
             if segment.info.has_audio:
                 _run(audio_command(segment.media, segment.start, segment.duration, segment.speed,
-                                   segment.samples, target), f'Audio of "{segment.title}"')
+                                   segment.samples, target), f'Audio of "{segment.title}"', should_stop=stopped)
             else:
-                _run(silence_command(segment.samples, target), f'Silence for "{segment.title}"')
+                _run(silence_command(segment.samples, target), f'Silence for "{segment.title}"', should_stop=stopped)
             actual = os.path.getsize(target)
             expected = segment.samples * BYTES_PER_FRAME
             if actual != expected:
                 raise RenderError(f'Audio of "{segment.title}" has {actual // BYTES_PER_FRAME} samples, '
                                   f'expected {segment.samples}.')
 
-        def render_video(index: int, encoder: EncoderChoice) -> None:
+        def render_video(index: int, encoder: EncoderChoice, stopped: Callable[[], bool]) -> None:
             segment = segments[index]
             if segment.frames <= 0:
                 return
             args = _encoder_args(encoder)
-            if segment.info.has_video:
-                command = video_command(segment, target_fps, width, height, args, video_path(index))
-            else:
-                command = black_command(segment.frames, target_fps, width, height, args, video_path(index))
+            target = video_path(index)
+            black = black_command(segment.frames, target_fps, width, height, args, target)
             use_slot = bool(encoder[0]) and gpu_slots is not None
             if use_slot:
                 gpu_slots.acquire()
             try:
-                _run(command, f'Video of "{segment.title}"')
+                if segment.info.has_video:
+                    _run(video_command(segment, target_fps, width, height, args, target),
+                         f'Video of "{segment.title}"', should_stop=stopped)
+                    # A cut behind the end of the picture track (audio runs longer, cover art) yields no frame
+                    # at all, and a missing piece would pull every later picture forward: fill it with black.
+                    if count_video_frames(target) == 0:
+                        _run(black, f'Picture for "{segment.title}"', should_stop=stopped)
+                else:
+                    _run(black, f'Picture for "{segment.title}"', should_stop=stopped)
             finally:
                 if use_slot:
                     gpu_slots.release()
+            frames = count_video_frames(target)
+            if frames != segment.frames:
+                raise RenderError(f'Video of "{segment.title}" has {frames} frames, expected {segment.frames}.')
 
-        def run_stage(job: Callable[[int], None], workers: int, label: str, done_offset: int, units: int):
+        def run_stage(job: Callable[[int, Callable[[], bool]], None], workers: int, label: str, done_offset: int,
+                      units: int):
+            # One stop signal per stage: set when the stage is left early for any reason (an error, a cancel,
+            # the client closing the connection), so encodes still running are killed instead of finishing.
+            stop = threading.Event()
+            finished = False
             completed = 0
+            message = f'{label} 0/{total}'
             with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
-                futures = {pool.submit(job, index): index for index in range(total)}
+                futures = {pool.submit(job, index, stop.is_set): index for index in range(total)}
+                pending = set(futures)
                 try:
-                    for future in as_completed(futures):
+                    while pending:
+                        done, pending = wait(pending, timeout=1.0, return_when=FIRST_COMPLETED)
                         if is_cancelled():
-                            raise RenderError('Merge cancelled.')
-                        future.result()
-                        completed += 1
-                        yield {'stage': 'processing_videos',
-                               'message': f'{label} {completed}/{total}: {segments[futures[future]].title}',
+                            raise RenderCancelled('Merge cancelled.')
+                        for future in done:
+                            future.result()
+                            completed += 1
+                            message = f'{label} {completed}/{total}: {segments[futures[future]].title}'
+                        # Also sent when nothing finished in this second: a closed connection is only noticed
+                        # when something is written to it.
+                        yield {'stage': 'processing_videos', 'message': message,
                                'progress': done_offset + completed, 'total': units}
+                    finished = True
                 finally:
-                    for future in futures:
-                        future.cancel()
+                    if not finished:
+                        stop.set()
+                        for future in futures:
+                            future.cancel()
 
         units = total * 2 + 1
         yield from run_stage(render_audio, max_workers, 'Audio', 0, units)
 
         encoder: EncoderChoice = gpu_encoder if gpu_encoder and gpu_encoder[0] else (None, ())
         try:
-            yield from run_stage(lambda index: render_video(index, encoder), max_workers, 'Video', total, units)
+            yield from run_stage(lambda index, stopped: render_video(index, encoder, stopped), max_workers,
+                                 'Video', total, units)
+        except RenderCancelled:
+            raise
         except RenderError as exc:
-            if not encoder[0] or is_cancelled():
+            if not encoder[0]:
                 raise
             # All pieces must come from one encoder to be joined without re-encoding: redo them on the CPU.
             # (Only this merge falls back; a busy GPU must not switch the whole server to CPU encoding.)
@@ -506,7 +576,8 @@ def render_timeline(
                 except OSError:
                     pass
             encoder = (None, ())
-            yield from run_stage(lambda index: render_video(index, encoder), max_workers, 'Video (CPU)', total, units)
+            yield from run_stage(lambda index, stopped: render_video(index, encoder, stopped), max_workers,
+                                 'Video (CPU)', total, units)
 
         yield {'stage': 'merging', 'message': 'Joining clips...', 'progress': total * 2, 'total': units}
 
@@ -533,7 +604,9 @@ def render_timeline(
         if total_frames > 0:
             command += ['-map', '0:v:0', '-map', '1:a:0', '-c:v', 'copy']
         command += ['-c:a', 'aac', '-b:a', '192k', '-movflags', '+faststart', temp_output]
-        _run(command, 'Joining clips', timeout=max(FFMPEG_TIMEOUT, total * 30))
+        _run(command, 'Joining clips', timeout=max(FFMPEG_TIMEOUT, total * 30), should_stop=is_cancelled)
+        if total_frames > 0 and count_video_frames(temp_output) != total_frames:
+            raise RenderError('Joined video has an unexpected number of frames.')
 
         os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
         os.replace(temp_output, output_path)

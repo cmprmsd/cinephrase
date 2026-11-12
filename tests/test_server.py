@@ -170,6 +170,31 @@ class ClipEndpointsTest(ServerTestCase):
         self.assertAlmostEqual(server.get_video_duration(self.source), 6.0, delta=0.2)
         self.assertAlmostEqual(server.get_video_fps(self.source), 25.0, places=3)
 
+    def _preview_clip_of(self, name, *arguments):
+        source = os.path.join(self.library, name)
+        subprocess.run(['ffmpeg', '-v', 'error', '-y', *arguments, source], check=True)
+        clip = os.path.join(self.root, 'temp', 'formats', name + '.clip.mp4')
+        server.render_preview_clip(source, 0.5, 1.5, clip)
+        shape = subprocess.run(['ffprobe', '-v', 'error', '-select_streams', 'v:0', '-count_packets', '-show_entries',
+                                'stream=pix_fmt,nb_read_packets', '-of', 'default=nw=1', clip],
+                               capture_output=True, text=True).stdout
+        return source, dict(line.split('=', 1) for line in shape.split())
+
+    def test_preview_clip_of_a_variable_rate_source_uses_its_average_rate(self):
+        # jittered timestamps on a 90 kHz timebase: ffprobe calls that "90000 fps"
+        source, clip = self._preview_clip_of(
+            'vfr.mp4', '-f', 'lavfi', '-i', 'testsrc=s=320x180:r=30:d=3', '-f', 'lavfi', '-i', 'sine=d=3',
+            '-vf', "settb=1/90000,setpts='PTS+random(0)*0.012/TB'", '-fps_mode', 'vfr', '-enc_time_base', '1/90000',
+            '-video_track_timescale', '90000', '-c:v', 'libx264', '-preset', 'ultrafast', '-c:a', 'aac', '-shortest')
+        self.assertAlmostEqual(float(server.get_video_fps(source)), 30.0, delta=0.5)
+        self.assertLess(int(clip['nb_read_packets']), 40)             # one second of picture, not 90000 frames
+
+    def test_preview_clip_of_a_high_bit_depth_source_plays_in_browsers(self):
+        _, clip = self._preview_clip_of(
+            'deep.mkv', '-f', 'lavfi', '-i', 'testsrc=s=320x180:r=25:d=2', '-f', 'lavfi', '-i', 'sine=d=2',
+            '-pix_fmt', 'yuv444p10le', '-c:v', 'libx264', '-preset', 'ultrafast', '-c:a', 'aac', '-shortest')
+        self.assertEqual(clip['pix_fmt'], 'yuv420p')
+
     def test_clip_audio_is_exactly_as_long_as_the_cut(self):
         query = 'clip={clip}&source={source}&original_start={originalStart}&original_end={originalEnd}'.format(
             **{key: (value if not isinstance(value, str) else __import__('urllib.parse').parse.quote(value))

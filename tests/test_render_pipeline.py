@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 import wave
 from fractions import Fraction
@@ -277,6 +278,65 @@ class RenderAccuracyTest(unittest.TestCase):
         self.assertEqual(len(_frame_times(output)), summary['frames'])
         self.assertEqual(summary['frames'], 25)
         self.assertEqual((summary['width'], summary['height']), (320, 180))
+
+    def test_cut_behind_the_end_of_the_picture_does_not_shift_later_clips(self):
+        # picture track of 2 s, sound of 6 s: a cut at 4 s gets no frame from ffmpeg at all
+        short_picture = self._variant('shortpicture.mp4', '-i', self.source, '-map', '0:v:0', '-map', '0:a:0',
+                                      '-c:a', 'copy', '-c:v', 'libx264', '-preset', 'ultrafast', '-frames:v', '50',
+                                      '-t', '6')
+        segments = [rp.Segment(media=self.source, start=1.0, duration=1.0, title='before'),
+                    rp.Segment(media=short_picture, start=4.0, duration=1.0, title='no picture left'),
+                    rp.Segment(media=self.source, start=2.0, duration=1.0, title='after')]
+        for order in (segments, [segments[1], segments[0]]):
+            output, summary = self._render(list(order))
+            times = _frame_times(output)
+            self.assertEqual(len(times), summary['frames'])
+            self.assertEqual(summary['frames'], 25 * len(order))
+            self.assertAlmostEqual(times[-1], len(order) - 0.04, places=3)
+
+    def test_non_square_pixels_keep_their_shape(self):
+        # 720x576 stored, shown as 16:9 (pixel aspect 64:45), like a DVD
+        dvd = self._variant('dvd.mp4', '-i', self.source, '-vf', 'scale=720:576,setsar=64/45',
+                            '-c:v', 'libx264', '-preset', 'ultrafast', '-c:a', 'copy', '-t', '3')
+        info = rp.probe_media(dvd)
+        self.assertEqual((info.width, info.height), (1024, 576))
+        output, summary = self._render([rp.Segment(media=dvd, start=0.5, duration=0.4, title='dvd')])
+        self.assertEqual((summary['width'], summary['height']), (1024, 576))
+        shape = subprocess.run(['ffprobe', '-v', 'error', '-select_streams', 'v:0', '-show_entries',
+                                'stream=width,height,sample_aspect_ratio', '-of', 'csv=p=0', output],
+                               capture_output=True, text=True).stdout.strip().rstrip(',')
+        self.assertEqual(shape, '1024,576,1:1')
+
+    def test_cancelling_stops_the_running_encodes(self):
+        # 4K at 60 fps from a small source: each segment takes far longer than this test is allowed to
+        segments = [rp.Segment(media=self.source, start=0.5, duration=6.0, title=f'slow {index}')
+                    for index in range(4)]
+        work_root = os.path.join(self.work, 'tmp_cancel')
+        output = os.path.join(self.work, 'cancelled.mp4')
+        events = rp.render_timeline(segments, output, work_root, resolution=(3840, 2160), fps=Fraction(60),
+                                    max_workers=2)
+        for event in events:
+            if event['message'].startswith('Video'):
+                break
+        started = time.monotonic()
+        events.close()                      # what the web server does when the browser closes the connection
+        self.assertLess(time.monotonic() - started, 5.0)
+        self.assertEqual(os.listdir(work_root), [])
+        self.assertFalse(os.path.exists(output))
+
+        flag = {'cancel': False}
+        events = rp.render_timeline(segments, output, work_root, resolution=(3840, 2160), fps=Fraction(60),
+                                    max_workers=2, is_cancelled=lambda: flag['cancel'])
+        with self.assertRaises(rp.RenderCancelled):
+            for event in events:
+                flag['cancel'] = event['message'].startswith('Video')
+        self.assertEqual(os.listdir(work_root), [])
+
+    def test_twenty_milliseconds_is_long_enough(self):
+        # what remains of a clip trimmed to the client's limit, as floating point leaves it
+        self.assertFalse(rp.too_short(405.489 - 403.1 - 0.482 - 1.887))
+        self.assertFalse(rp.too_short(0.02))
+        self.assertTrue(rp.too_short(0.019))
 
     def test_work_directory_is_removed(self):
         work_root = os.path.join(self.work, 'tmp_cleanup')

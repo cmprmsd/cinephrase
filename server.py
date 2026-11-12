@@ -1584,24 +1584,15 @@ def get_video_duration_ms(video_path):
 
 
 def get_video_fps(video_path):
-    """Get the fps of a video file using ffprobe."""
-    if not os.path.exists(video_path):
-        return None
+    """Frame rate of a video as a Fraction, or None if unknown.
+
+    Variable-rate files (phones, screen recordings) report a timebase such as 90000/1 as their "rate"; the probe
+    falls back to the average rate for those, so clips are not encoded with thousands of duplicated frames.
+    """
     try:
-        fps_command = ['ffprobe', '-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=r_frame_rate',
-                       '-of', 'default=noprint_wrappers=1:nokey=1', video_path]
-        fps_result = subprocess.run(fps_command, capture_output=True, text=True, timeout=10)
-        if fps_result.returncode == 0 and fps_result.stdout.strip():
-            # fps might be in format like "24000/1001" or "25/1"
-            fps_str = fps_result.stdout.strip().splitlines()[0].strip().rstrip(',')
-            if '/' in fps_str:
-                num, den = fps_str.split('/')
-                return float(num) / float(den) if float(den) else None
-            else:
-                return float(fps_str)
-    except (subprocess.TimeoutExpired, ValueError, subprocess.SubprocessError, OSError) as e:
-        print(f"Error getting video fps for {video_path}: {e}")
-    return None
+        return cached_probe(video_path).fps
+    except (render_pipeline.RenderError, OSError):
+        return None
 
 
 def extract_silence_preferences(payload, default_min=0.0, default_max=10.0):
@@ -1871,7 +1862,7 @@ def build_merge_segments(video_info):
         start_trim = max(0.0, sanitize_float(video.get('startTrim'), 0.0)) / 1000.0
         end_trim = max(0.0, sanitize_float(video.get('endTrim'), 0.0)) / 1000.0
         duration = seconds - start_trim - end_trim
-        if duration < render_pipeline.MIN_SEGMENT_SECONDS:
+        if render_pipeline.too_short(duration):
             raise render_pipeline.RenderError(
                 f'Clip {index + 1} ("{title}") is trimmed to nothing: {seconds * 1000:.0f} ms long, '
                 f'trims {start_trim * 1000:.0f} + {end_trim * 1000:.0f} ms.')
@@ -1960,8 +1951,9 @@ def clip_file_name(clip_group_name, source, clip_start, clip_end):
     return f'{clip_group_name}_{key}.mp4'
 
 
+# Messages that mean the GPU encoder itself is unusable (as opposed to one input it could not take).
 GPU_FAILURE_MARKERS = (
-    'nvenc', 'no capable devices', 'incompatible client key', 'openencodesessionex failed', 'no device',
+    'cannot load', 'nvidia driver', 'no capable devices', 'incompatible client key', 'openencodesessionex failed', 'no device',
     'failed to initialize', 'error while opening encoder', 'could not open encoder', 'encoder initialization',
     'invalid parameter',
 )
@@ -1972,6 +1964,7 @@ def _clip_export_command(source_path, clip_start, clip_end, fps, video_args, out
         'ffmpeg', '-v', 'error', '-nostdin', '-y',
         '-ss', f'{clip_start:.6f}', '-i', source_path, '-t', f'{clip_end - clip_start:.6f}',
         *video_args,
+        '-pix_fmt', 'yuv420p',       # 10-bit and 4:4:4 sources otherwise give H.264 profiles browsers cannot play
         '-c:a', 'aac', '-ac', '2',   # stereo: mono and 5.1 sources otherwise play wrong in browsers
         '-r', str(fps),
         '-f', 'mp4', output_path,
@@ -2668,7 +2661,7 @@ def clip_audio():
     end_trim_ms = max(0.0, sanitize_float(request.args.get('end_trim_ms'), 0.0))
     speed = render_pipeline.clamp_speed(request.args.get('speed'))
     duration = seconds - (start_ms + end_trim_ms) / 1000.0
-    if duration < render_pipeline.MIN_SEGMENT_SECONDS:
+    if render_pipeline.too_short(duration):
         return jsonify({'error': 'Trim values leave nothing to play'}), 400
     try:
         pcm = cached_pcm(media, base + start_ms / 1000.0, duration, speed)
