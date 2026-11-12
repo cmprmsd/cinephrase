@@ -3141,6 +3141,8 @@ function handleGenerateStory() {
 
     // The LLM can take minutes: the request can be cancelled, and a project switch discards its answer
     const search = beginSearch();
+    // Named by the client so Cancel can reach the request (it has no progress events to learn an id from)
+    search.serverId = generateId('story');
     showSearchLoading(`Generating story with AI...`, cancelActiveSearch);
 
     // Call backend to generate story
@@ -3154,7 +3156,8 @@ function handleGenerateStory() {
             files: selectedFiles,
             maxSegments: maxStorySegments,
             preferLongSegments: preferLongSegments,
-            debugMode: debugMode
+            debugMode: debugMode,
+            search_id: search.serverId
         }),
         signal: search.controller.signal
     })

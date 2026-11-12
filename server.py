@@ -963,10 +963,39 @@ def generate_story_prompt():
 def generate_story():
     """
     Use Ollama LLM to generate a story by selecting segments from the corpus.
+
+    The client may name a ``search_id``; /cancel_search with that id stops the work after the LLM has answered
+    (the LLM request itself cannot be interrupted) instead of exporting clips nobody waits for.
     """
-    import requests
-    
     data = request_json_object()
+    search_id = data.get('search_id') if isinstance(data.get('search_id'), str) and data.get('search_id') else None
+    if search_id:
+        with SKIP_LOCK:
+            SKIP_SEGMENTS[search_id] = set()
+        with CANCEL_LOCK:
+            CANCELLED_SEARCHES.discard(search_id)
+    try:
+        return _generate_story(data, search_id)
+    except SearchCancelled:
+        print("[Story] ❌ Cancelled by the user")
+        return jsonify({'cancelled': True, 'segments': [], 'unmatched': []})
+    finally:
+        if search_id:
+            with SKIP_LOCK:
+                SKIP_SEGMENTS.pop(search_id, None)
+            with CANCEL_LOCK:
+                CANCELLED_SEARCHES.discard(search_id)
+
+
+def _generate_story(data, search_id):
+    import requests
+
+    def stop_if_cancelled():
+        if search_id:
+            with CANCEL_LOCK:
+                if search_id in CANCELLED_SEARCHES:
+                    raise SearchCancelled()
+
     prompt = data.get('prompt') if isinstance(data.get('prompt'), str) else ''
     prompt = prompt.strip()
     selected_files = library_files_only(data.get('files'))
@@ -1032,6 +1061,7 @@ def generate_story():
         result = response.json()
         llm_response = result.get('response', '')
         
+        stop_if_cancelled()
         print(f"[Story] Received LLM response ({len(llm_response)} chars)")
         print(f"[Story] LLM response: {llm_response}")
         
@@ -1093,7 +1123,7 @@ def generate_story():
                         min_silence=0.0,
                         max_silence=10.0,
                         silence_word_threshold=2,
-                        search_id=None,  # No search_id needed for story generation
+                        search_id=search_id,  # lets Cancel stop the exports
                         include_partial_matches=False,  # No partial matches - exact match only
                         all_partial_matches=False,  # No partial matches for story generation
                         max_results_per_segment=1  # Only need first match per segment
@@ -1139,7 +1169,9 @@ def generate_story():
                     else:
                         # The LLM used words that are not spoken (in this order) in the selected videos
                         unmatched_segments.append(search_query)
-                    
+
+            except SearchCancelled:
+                raise
             except Exception as e:
                 print(f"[Story] Error searching for sentence '{sentence_text[:50]}...': {e}")
                 traceback.print_exc()
@@ -1196,6 +1228,8 @@ def generate_story():
     except requests.exceptions.RequestException as e:
         print(f"[Story] ❌ Ollama API error: {e}")
         return jsonify({'error': f'LLM request failed: {str(e)}'}), 502
+    except SearchCancelled:
+        raise
     except Exception as e:
         print(f"[Story] ❌ Error: {e}")
         traceback.print_exc()

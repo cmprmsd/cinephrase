@@ -11,6 +11,7 @@ import sys
 import tempfile
 import unittest
 import wave
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -455,6 +456,33 @@ class SearchExportTest(ServerTestCase):
         again = next(e for e in self._search(sentence_groups=['hello']) if e.get('files'))
         self.assertEqual({item['file'] for item in again['files']}, set(by_path))
         self.assertEqual(stamp, {path: os.path.getmtime(server.resolve_media_path(path)) for path in by_path})  # reused
+
+    def test_cancel_stops_a_story_once_the_llm_has_answered(self):
+        answer = json.dumps({'explanation': 'why', 'sentences': [
+            {'sentence': 'Hello there', 'source_segments': ['hello there']}]})
+
+        def llm(cancel):
+            def post(url, json=None, timeout=None):
+                if cancel:      # the user presses Cancel while the LLM is busy
+                    self.assertEqual(self.client.post('/cancel_search', json={'search_id': 'story_1'}).status_code, 200)
+                reply = mock.Mock()
+                reply.json.return_value = {'response': answer}
+                return reply
+            return post
+
+        request = {'prompt': 'a greeting', 'files': [self.source], 'search_id': 'story_1'}
+        with mock.patch('requests.post', llm(cancel=False)):
+            story = self.client.post('/generate_story', json=request).get_json()
+        self.assertEqual([segment['phrase'] for segment in story['segments']], ['hello there'])
+
+        rendered = []
+        with mock.patch('requests.post', llm(cancel=True)), \
+                mock.patch.object(server, 'render_preview_clip', lambda *args, **kwargs: rendered.append(args)):
+            story = self.client.post('/generate_story', json=request).get_json()
+        self.assertTrue(story.get('cancelled'))
+        self.assertEqual((story['segments'], rendered), ([], []))
+        # the id is forgotten with the request: a late cancel cannot hit a later story
+        self.assertEqual(self.client.post('/cancel_search', json={'search_id': 'story_1'}).status_code, 404)
 
     def test_groups_without_a_match_are_reported_and_the_search_id_comes_first(self):
         events = self._search(sentence_groups=['hello there', 'no such words'])
