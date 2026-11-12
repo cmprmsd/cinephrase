@@ -230,6 +230,12 @@ class RenderAccuracyTest(unittest.TestCase):
         with self.assertRaises(rp.RenderError):
             list(rp.render_timeline(missing, os.path.join(self.work, 'gone.mp4'), self.work))
 
+    def test_falls_back_to_cpu_when_the_gpu_encoder_fails(self):
+        segments = self._segments(count=3)
+        output, summary = self._render(segments, gpu_encoder=('no_such_gpu_encoder', ['-preset', 'p5']))
+        self.assertEqual(summary['encoder'], 'libx264')
+        self.assertEqual(len(_frame_times(output)), sum(s.frames for s in segments))
+
     def test_work_directory_is_removed(self):
         work_root = os.path.join(self.work, 'tmp_cleanup')
         list(rp.render_timeline(self._segments(count=2), os.path.join(self.work, 'clean.mp4'), work_root))

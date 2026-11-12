@@ -210,6 +210,34 @@ DEFAULT_PROJECT_STATE = {
     }
 }
 
+# Quality-targeted arguments for the merge, per GPU encoder (the detection arguments only prove the encoder
+# works; "-preset p4" alone encodes at the encoder's small default bitrate).
+MERGE_GPU_QUALITY_ARGS = {
+    'h264_nvenc': ['-preset', 'p5', '-rc', 'vbr', '-cq', '19', '-b:v', '0'],
+    'hevc_nvenc': ['-preset', 'p5', '-rc', 'vbr', '-cq', '21', '-b:v', '0'],
+    'h264_qsv': ['-preset', 'medium', '-global_quality', '19'],
+    'h264_amf': ['-quality', 'quality', '-rc', 'cqp', '-qp_i', '19', '-qp_p', '19'],
+    'h264_videotoolbox': ['-allow_sw', '1', '-q:v', '60'],
+}
+_MERGE_GPU_CACHE = {}
+
+
+def get_merge_gpu_encoder():
+    """GPU encoder and arguments for merges: the quality set if this machine accepts it, else the detected set."""
+    encoder, detected_args = get_gpu_encoder()
+    if not encoder:
+        return (None, ())
+    if encoder not in _MERGE_GPU_CACHE:
+        quality_args = MERGE_GPU_QUALITY_ARGS.get(encoder)
+        if quality_args and test_gpu_encoder(encoder, quality_args):
+            _MERGE_GPU_CACHE[encoder] = quality_args
+            print(f"[GPU] Merge uses {encoder} with {quality_args}")
+        else:
+            _MERGE_GPU_CACHE[encoder] = list(detected_args or [])
+            print(f"[GPU] Merge uses {encoder} with the detection arguments {detected_args}")
+    return (encoder, _MERGE_GPU_CACHE[encoder])
+
+
 def get_max_workers():
     """
     Get optimal number of worker threads (real CPU cores only, excluding hyperthreading).
@@ -535,9 +563,9 @@ DEFAULT_CLIP_END_PADDING = 0.45
 MAX_CLIPS_PER_SEGMENT = 25
 CLIP_METADATA_FILENAME = 'metadata.json'
 
-# Merge output format. None = follow the timeline (most common source resolution / frame rate).
-# Overridden by --merge-resolution / --merge-fps.
-MERGE_RESOLUTION = (1920, 1080)
+# Merge output format. None = follow the timeline (most common source resolution / frame rate), so portrait or
+# 720p libraries are not cropped or upscaled. Overridden by --merge-resolution / --merge-fps.
+MERGE_RESOLUTION = None
 MERGE_FPS = None
 
 
@@ -1513,11 +1541,13 @@ def get_video_duration(video_path):
     if not os.path.exists(video_path):
         return None
     try:
-        duration_command = f'ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "{video_path}"'
-        duration_result = subprocess.run(duration_command, shell=True, capture_output=True, text=True, timeout=10)
+        # Argument list, no shell: file names may contain $, quotes or backticks.
+        duration_command = ['ffprobe', '-v', 'error', '-show_entries', 'format=duration',
+                            '-of', 'default=noprint_wrappers=1:nokey=1', video_path]
+        duration_result = subprocess.run(duration_command, capture_output=True, text=True, timeout=10)
         if duration_result.returncode == 0 and duration_result.stdout.strip():
             return float(duration_result.stdout.strip())
-    except (subprocess.TimeoutExpired, ValueError, subprocess.SubprocessError) as e:
+    except (subprocess.TimeoutExpired, ValueError, subprocess.SubprocessError, OSError) as e:
         print(f"Error getting video duration for {video_path}: {e}")
     return None
 
@@ -1535,17 +1565,18 @@ def get_video_fps(video_path):
     if not os.path.exists(video_path):
         return None
     try:
-        fps_command = f'ffprobe -v error -select_streams v:0 -show_entries stream=r_frame_rate -of default=noprint_wrappers=1:nokey=1 "{video_path}"'
-        fps_result = subprocess.run(fps_command, shell=True, capture_output=True, text=True, timeout=10)
+        fps_command = ['ffprobe', '-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=r_frame_rate',
+                       '-of', 'default=noprint_wrappers=1:nokey=1', video_path]
+        fps_result = subprocess.run(fps_command, capture_output=True, text=True, timeout=10)
         if fps_result.returncode == 0 and fps_result.stdout.strip():
             # fps might be in format like "24000/1001" or "25/1"
-            fps_str = fps_result.stdout.strip()
+            fps_str = fps_result.stdout.strip().splitlines()[0].strip().rstrip(',')
             if '/' in fps_str:
                 num, den = fps_str.split('/')
-                return float(num) / float(den)
+                return float(num) / float(den) if float(den) else None
             else:
                 return float(fps_str)
-    except (subprocess.TimeoutExpired, ValueError, subprocess.SubprocessError) as e:
+    except (subprocess.TimeoutExpired, ValueError, subprocess.SubprocessError, OSError) as e:
         print(f"Error getting video fps for {video_path}: {e}")
     return None
 
@@ -1790,9 +1821,8 @@ def merge_videos_stream():
                 TEMP_DIR,
                 resolution=MERGE_RESOLUTION,
                 fps=MERGE_FPS,
-                gpu_encoder=get_gpu_encoder(),
+                gpu_encoder=get_merge_gpu_encoder(),
                 gpu_slots=GPU_ENCODING_SEMAPHORE,
-                on_gpu_failure=disable_gpu_encoder,
                 max_workers=get_max_workers(),
             )
             summary = {}
@@ -3623,8 +3653,8 @@ if __name__ == '__main__':
     parser.add_argument(
         '--merge-resolution',
         type=str,
-        default='1920x1080',
-        help="Merged video size as WIDTHxHEIGHT, or 'auto' for the most common source resolution (default: 1920x1080)"
+        default='auto',
+        help="Merged video size as WIDTHxHEIGHT (e.g. 1920x1080), or 'auto' for the most common source resolution (default: auto)"
     )
     parser.add_argument(
         '--merge-fps',

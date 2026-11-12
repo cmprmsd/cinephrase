@@ -126,7 +126,7 @@
             video.preload = 'auto';
             video.disablePictureInPicture = true;
             element.appendChild(video);
-            slots.push({ video, index: -1, url: '', ready: null, usable: false, token: 0 });
+            slots.push({ video, index: -1, url: '', ready: null, usable: false, token: 0, cancelLoad: null });
         }
 
         const hud = document.createElement('div');
@@ -200,6 +200,7 @@
                     || slots.find(candidate => candidate !== stage.active && candidate.index < 0)
                     || slots.find(candidate => candidate !== stage.active && candidate.index < index - 1);
                 if (!slot) return Promise.resolve(false);
+                if (slot.cancelLoad) slot.cancelLoad();
                 slot.index = index;
                 slot.usable = false;
                 const token = ++slot.token;
@@ -214,8 +215,11 @@
                         video.removeEventListener('seeked', onSeeked);
                         video.removeEventListener('error', onError);
                         clearTimeout(timer);
+                        if (slot.cancelLoad === cancel) slot.cancelLoad = null;
                         resolve(ok);
                     };
+                    const cancel = () => finish(false);
+                    slot.cancelLoad = cancel;
                     const onSeeked = () => finish(true);
                     const seek = () => {
                         const limit = Number.isFinite(video.duration) ? Math.max(0, video.duration - 0.01) : startSeconds;
@@ -278,12 +282,10 @@
             release() {
                 slots.forEach(slot => {
                     slot.video.pause();
-                    if (slot !== stage.active) {
-                        slot.index = -1;
-                        slot.token++;
-                    }
+                    if (slot.cancelLoad) slot.cancelLoad();
+                    slot.token++;
+                    slot.index = -1;
                 });
-                if (stage.active) stage.active.index = -1;
             }
         };
 
@@ -501,7 +503,10 @@
                 node.start(when, offset, duration);
                 if (index === items.length - 1) {
                     // requestAnimationFrame stops in background tabs: let the last source end the session too.
-                    node.onended = () => setTimeout(() => finish(current, true), 60);
+                    node.onended = () => {
+                        const outputLag = Math.max(0, context.currentTime - audibleTime());
+                        setTimeout(() => finish(current, true), outputLag * 1000 + 60);
+                    };
                 }
                 current.sources.push(node);
                 current.plan[index] = { when, duration, offset };

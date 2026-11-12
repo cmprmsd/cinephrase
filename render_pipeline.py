@@ -370,7 +370,6 @@ def render_timeline(
     fps: Optional[Fraction] = None,
     gpu_encoder: EncoderChoice = (None, ()),
     gpu_slots: Optional[object] = None,
-    on_gpu_failure: Optional[Callable[[], None]] = None,
     max_workers: int = 4,
     is_cancelled: Callable[[], bool] = lambda: False,
 ) -> Iterator[Dict[str, object]]:
@@ -473,9 +472,8 @@ def render_timeline(
             if not encoder[0] or is_cancelled():
                 raise
             # All pieces must come from one encoder to be joined without re-encoding: redo them on the CPU.
+            # (Only this merge falls back; a busy GPU must not switch the whole server to CPU encoding.)
             print(f'[Merge] GPU encoder {encoder[0]} failed ({exc}); re-encoding all segments with libx264')
-            if on_gpu_failure:
-                on_gpu_failure()
             for index in range(total):
                 try:
                     os.remove(video_path(index))
