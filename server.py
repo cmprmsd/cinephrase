@@ -1643,13 +1643,16 @@ TRANSCRIPT_CACHE_FILES = 512
 
 
 def _transcript_signature(video_path):
-    """Identity of the JSON transcript next to a video (None while there is none)."""
-    json_path = Path(video_path).with_suffix('.json')
-    try:
-        stat = json_path.stat()
-    except OSError:
-        return None
-    return (str(json_path), stat.st_mtime_ns, stat.st_size)
+    """Identity of the transcript/subtitle files next to a video (None while there are none)."""
+    signature = []
+    for suffix in ('.json', '.vtt', '.srt'):
+        candidate = Path(video_path).with_suffix(suffix)
+        try:
+            stat = candidate.stat()
+        except OSError:
+            continue
+        signature.append((suffix, stat.st_mtime_ns, stat.st_size))
+    return tuple(signature) or None
 
 
 def _cached_transcript(video_path):
@@ -1691,37 +1694,42 @@ def _read_transcript_sentences(video_path: str) -> Optional[List[dict]]:
         if sentences:
             return sentences
     
-    # If no JSON found, try parse_transcript, but validate the format
+    # No JSON: videogrep's own transcript formats. Sentence-level text without word timings can feed the
+    # corpus but cannot be searched, so keep looking for something better before settling for it.
+    text_only = None
     try:
         sentences = parse_transcript(video_path)
-        if sentences:
-            # Validate that these sentences can be extracted
-            # If they can't be extracted, they're not useful, so continue to subtitle conversion
-            test_extraction = extract_sentences_from_segments(sentences)
-            if test_extraction:
+        if sentences and extract_sentences_from_segments(sentences):
+            if any(isinstance(segment, dict) and segment.get('words') for segment in sentences):
                 return sentences
+            text_only = sentences
     except FileNotFoundError:
         pass
     except Exception as exc:
         print(f"Failed to parse transcript via videogrep for '{video_path}': {exc}")
 
-    subtitle_candidates = _find_related_files(video_path, ['.vtt', '.srt'])
-    for subtitle_path in subtitle_candidates:
+    for subtitle_path in _find_related_files(video_path, ['.vtt', '.srt']):
+        output_path = subtitle_path.with_suffix('.json')
         try:
-            output_path = subtitle_path.with_suffix('.json')
-        except ValueError:
-            output_path = subtitle_path.parent / f"{subtitle_path.stem}.json"
-        try:
+            # Subtitles with inline word timestamps (YouTube VTT) are converted once and stored as JSON
             segments, _stats = convert_subtitles(subtitle_path, output_path)
+        except ValueError:
+            try:
+                # Plain subtitles: estimate word times inside each cue. Good enough to find a phrase (the
+                # clip is padded and trimmed by hand anyway); kept in memory so a real transcript can replace it.
+                segments, _stats = convert_subtitles(subtitle_path, None, interpolate=True)
+                print(f"Using estimated word timings from '{subtitle_path.name}' (no word-level transcript)")
+            except Exception as exc:
+                print(f"Failed to convert subtitles '{subtitle_path}' for '{video_path}': {exc}")
+                continue
         except Exception as exc:
             print(f"Failed to convert subtitles '{subtitle_path}' for '{video_path}': {exc}")
             continue
         if segments:
             return segments
-        generated = _load_json_transcript(output_path)
-        if generated:
-            return generated
 
+    if text_only:
+        return text_only
     print(f"No subtitle data available for '{video_path}'")
     return None
 

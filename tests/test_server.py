@@ -404,6 +404,23 @@ class SearchExportTest(ServerTestCase):
         self.assertEqual(events[-1]['total_silences'], 2)
         self.assertEqual(sorted(round(item['silence_end'] - item['silence_start'], 2) for item in clips), [2.7, 3.4])
 
+    def test_plain_subtitles_make_a_video_searchable(self):
+        video = os.path.join(self.library, 'subtitled.mp4')
+        shutil.copy(self.source, video)
+        with open(os.path.join(self.library, 'subtitled.srt'), 'w', encoding='utf-8') as handle:
+            handle.write('1\n00:00:02,000 --> 00:00:04,000\nGood morning everybody\n\n2\n00:00:06,000 --> 00:00:07,000\nSee you\n')
+        try:
+            index = server.load_word_index(video)
+            self.assertEqual([word['normalized_word'] for word in index.words], ['good', 'morning', 'everybody', 'see', 'you'])
+            match = server.find_matches_for_segment('morning everybody', index)[0]
+            self.assertGreater(match['start'], 2.0)
+            self.assertAlmostEqual(match['end'], 4.0, places=3)
+            self.assertFalse(os.path.exists(os.path.join(self.library, 'subtitled.json')))   # nothing written
+            self.assertIs(server.load_word_index(video), index)                                # cached
+        finally:
+            os.remove(video)
+            os.remove(os.path.join(self.library, 'subtitled.srt'))
+
     def test_transcripts_are_cached_until_the_file_changes(self):
         first = server.load_transcript_sentences(self.source)
         self.assertIs(first, server.load_transcript_sentences(self.source))
