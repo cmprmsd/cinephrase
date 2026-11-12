@@ -213,5 +213,212 @@ class ClipEndpointsTest(ServerTestCase):
         self.assertIn('trimmed to nothing', events[-1]['error'])
 
 
+class MatchingTest(ServerTestCase):
+    WORDS = 'the quick brown fox jumps over the lazy dog and the quick red fox sleeps'.split()
+
+    def _sentences(self, gap=0.1):
+        words, cursor = [], 1.0
+        for word in self.WORDS:
+            words.append({'word': word, 'start': round(cursor, 3), 'end': round(cursor + 0.3, 3)})
+            cursor += 0.3 + gap
+        return [{'content': ' '.join(self.WORDS[:9]), 'start': 1.0, 'end': words[8]['end'], 'words': words[:9]},
+                {'content': ' '.join(self.WORDS[9:]), 'start': words[9]['start'], 'end': words[-1]['end'], 'words': words[9:]}]
+
+    def test_phrases_are_found_across_sentence_boundaries_and_in_order(self):
+        sentences = self._sentences()
+        matches = server.find_matches_for_segment('the quick', sentences)
+        self.assertEqual([round(m['start'], 3) for m in matches], [1.0, 5.0])
+        self.assertEqual(len(server.find_matches_for_segment('dog and the', sentences)), 1)
+        self.assertEqual(server.find_matches_for_segment('quick fox', sentences), [])
+        self.assertEqual(server.find_matches_for_segment('', sentences), [])
+
+    def test_index_gives_the_same_result_as_the_raw_transcript(self):
+        sentences = self._sentences()
+        index = server.WordIndex(sentences)
+        for phrase in ('the', 'fox', 'the quick', 'quick brown fox jumps', 'sleeps', 'missing'):
+            self.assertEqual(server.find_matches_for_segment(phrase, index, 0.0, 10.0, 2),
+                             server.find_matches_for_segment(phrase, sentences, 0.0, 10.0, 2))
+
+    def test_single_words_respect_the_silence_window_and_longer_phrases_do_not(self):
+        sentences = self._sentences(gap=0.1)
+        self.assertEqual(server.find_matches_for_segment('fox', sentences, min_duration=0.5, max_duration=10.0), [])
+        self.assertEqual(len(server.find_matches_for_segment('fox', sentences, min_duration=0.05, max_duration=10.0)), 2)
+        self.assertEqual(len(server.find_matches_for_segment('quick brown', sentences, min_duration=0.5, max_duration=10.0)), 1)
+
+    def test_typographic_apostrophes_and_case_do_not_matter(self):
+        self.assertEqual(server.normalize_token('Don\u2019t,'), "don't")
+        self.assertEqual(server.normalize_token('\u201eStra\u00dfe\u201c'), 'strasse')
+        self.assertEqual(server.normalize_token('well\u2013known'), 'well-known')
+        sentences = [{'content': "I don't know", 'words': [
+            {'word': 'I', 'start': 0.0, 'end': 0.2}, {'word': "don't", 'start': 0.3, 'end': 0.6},
+            {'word': 'know.', 'start': 0.7, 'end': 1.0}]}]
+        self.assertEqual(len(server.find_matches_for_segment('i don\u2019t know', sentences)), 1)
+
+    def test_partial_matches_skip_short_sub_phrases_unless_asked(self):
+        sentences = self._sentences()
+        filtered = {m['segment'] for m in server.find_longest_matches('the quick brown fox', sentences, min_words=3)}
+        everything = {m['segment'] for m in server.find_longest_matches('the quick brown fox', sentences)}
+        self.assertEqual(filtered, {'the quick brown fox', 'the quick brown', 'quick brown fox'})
+        self.assertIn('fox', everything)
+        self.assertIn('the quick', everything)
+
+    def test_results_are_spread_over_the_source_files(self):
+        items = [{'file': name, 'match': index} for name in ('a', 'b', 'c') for index in range(3)][:-2]
+        mixed = server.interleave_by_file(items)
+        self.assertEqual([item['file'] for item in mixed], ['a', 'b', 'c', 'a', 'b', 'a', 'b'])
+        self.assertEqual(len(mixed), len(items))
+
+    def test_clip_bounds_are_clamped_to_the_file(self):
+        self.assertEqual(server.compute_clip_bounds(10.0, 11.0, 60.0), (9.55, 11.45))
+        self.assertEqual(server.compute_clip_bounds(0.2, 0.8, 60.0), (0.0, 1.25))
+        start, end = server.compute_clip_bounds(59.5, 59.9, 60.0)
+        self.assertEqual((round(start, 2), end), (59.05, 60.0))
+        with self.assertRaises(ValueError):
+            server.compute_clip_bounds(5.0, 6.0, 0.0)
+
+    def test_clip_names_depend_only_on_source_and_bounds(self):
+        first = server.clip_file_name('group', 'Library/a.mp4', 1.2345, 3.0)
+        self.assertEqual(first, server.clip_file_name('group', 'Library/a.mp4', 1.2345, 3.0))
+        self.assertNotEqual(first, server.clip_file_name('group', 'Library/a.mp4', 1.3, 3.0))
+        self.assertNotEqual(first, server.clip_file_name('group', 'Library/b.mp4', 1.2345, 3.0))
+
+
+@unittest.skipUnless(HAVE_FFMPEG, 'ffmpeg/ffprobe missing')
+class SearchExportTest(ServerTestCase):
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        if server is None:
+            return
+        cls.source = os.path.join(cls.library, 'talk.mp4')
+        subprocess.run([
+            'ffmpeg', '-v', 'error', '-y',
+            '-f', 'lavfi', '-i', 'testsrc2=size=320x180:rate=25:duration=12',
+            '-f', 'lavfi', '-i', 'sine=frequency=330:sample_rate=48000:duration=12',
+            '-c:v', 'libx264', '-preset', 'ultrafast', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-shortest', cls.source,
+        ], check=True)
+        words = [('hello', 0.2, 0.6), ('there', 0.7, 1.0), ('general', 1.1, 1.6),
+                 ('hello', 5.0, 5.4), ('there', 5.5, 5.8), ('friend', 5.9, 6.3),
+                 ('hello', 9.0, 9.4), ('again', 9.5, 9.9)]
+        transcript = [{'content': ' '.join(w for w, _, _ in words), 'start': 0.2, 'end': 9.9,
+                       'words': [{'word': w, 'start': a, 'end': b} for w, a, b in words]}]
+        with open(os.path.join(cls.library, 'talk.json'), 'w', encoding='utf-8') as handle:
+            json.dump(transcript, handle)
+
+    def _search(self, **body):
+        payload = {'files': [self.source], 'sentenceSearchCounter': 1, **body}
+        text = self.client.post('/search_longest_segments_stream', json=payload).get_data(as_text=True)
+        return [json.loads(line[6:]) for line in text.splitlines() if line.startswith('data: ')]
+
+    def test_search_exports_clips_with_bounds_and_padding_info(self):
+        events = self._search(sentence_groups=['hello there'])
+        self.assertTrue(events[-1]['done'])
+        result = next(event for event in events if event.get('files'))
+        self.assertEqual(result['phrase'], 'hello there')
+        self.assertEqual(result['total_matches'], 2)
+        first, second = result['files']
+        self.assertEqual((first['start'], first['end']), (0.2, 1.0))                 # matched order, not encode order
+        self.assertEqual((first['original_start'], first['lead_ms'], first['tail_ms']), (0.0, 200, 450))  # clamped at file start
+        self.assertEqual((second['lead_ms'], second['tail_ms'], second['duration_ms']), (450, 450, 1700))
+        for item in (first, second):
+            self.assertTrue(os.path.isfile(server.resolve_media_path(item['file'])))
+        folder = os.path.dirname(server.resolve_media_path(first['file']))
+        self.assertEqual([name for name in os.listdir(folder) if not name.endswith('.mp4')], [])
+
+    def test_a_clip_path_always_denotes_the_same_cut(self):
+        wide = next(e for e in self._search(sentence_groups=['hello'], maxResultsPerSegment=25) if e.get('files'))
+        narrow = next(e for e in self._search(sentence_groups=['hello'], maxResultsPerSegment=1) if e.get('files'))
+        by_path = {item['file']: (item['original_start'], item['original_end']) for item in wide['files']}
+        self.assertEqual(len(by_path), 3)
+        self.assertEqual(len(narrow['files']), 1)
+        self.assertEqual(by_path[narrow['files'][0]['file']],
+                         (narrow['files'][0]['original_start'], narrow['files'][0]['original_end']))
+        stamp = {path: os.path.getmtime(server.resolve_media_path(path)) for path in by_path}
+        again = next(e for e in self._search(sentence_groups=['hello']) if e.get('files'))
+        self.assertEqual({item['file'] for item in again['files']}, set(by_path))
+        self.assertEqual(stamp, {path: os.path.getmtime(server.resolve_media_path(path)) for path in by_path})  # reused
+
+    def test_commas_do_not_split_a_bare_sentence(self):
+        events = self._search(sentence='hello, there')
+        phrases = [event['phrase'] for event in events if event.get('files')]
+        self.assertEqual(phrases, ['hello, there'])
+
+    def test_files_outside_the_library_are_ignored(self):
+        outside = os.path.join(self.root, 'outside.mp4')
+        shutil.copy(self.source, outside)
+        shutil.copy(os.path.join(self.library, 'talk.json'), os.path.join(self.root, 'outside.json'))
+        events = self._search(sentence_groups=['hello'], files=[outside])
+        self.assertEqual([event for event in events if event.get('files')], [])
+        self.assertEqual(self.client.post('/get_sentences', json={'files': [outside]}).get_json(), {'sentences': []})
+
+    def test_skip_before_the_first_clip_yields_a_skipped_event(self):
+        search_id = 'test-skip'
+        with server.SKIP_LOCK:
+            server.SKIP_SEGMENTS[search_id] = {'hello there'}
+        try:
+            events = list(server.find_and_export_longest_matches_incremental(
+                'hello there', [self.source], 0, export_clips=True, search_id=search_id))
+        finally:
+            server.SKIP_SEGMENTS.pop(search_id, None)
+        self.assertEqual([event for event in events if 'phrase' in event],
+                         [{'phrase': 'hello there', 'files': [], 'word_count': 2, 'skipped': True}])
+
+    def test_cancel_stops_the_search(self):
+        search_id = 'test-cancel'
+        with server.CANCEL_LOCK:
+            server.CANCELLED_SEARCHES.add(search_id)
+        try:
+            with self.assertRaises(server.SearchCancelled):
+                list(server.find_and_export_longest_matches_incremental(
+                    'hello there', [self.source], 0, export_clips=True, search_id=search_id))
+        finally:
+            server.CANCELLED_SEARCHES.discard(search_id)
+
+    def test_skip_and_cancel_are_ignored_for_searches_that_are_not_running(self):
+        self.assertEqual(self.client.post('/cancel_search', json={'search_id': 'ended'}).status_code, 404)
+        self.assertEqual(self.client.post('/skip_segment', json={'search_id': 'ended', 'segment_phrase': 'x'}).status_code, 404)
+        self.assertEqual(self.client.post('/skip_segment', json={'search_id': 5, 'segment_phrase': 5}).status_code, 400)
+        self.assertNotIn('ended', server.CANCELLED_SEARCHES)
+        self.assertNotIn('ended', server.SKIP_SEGMENTS)
+
+    def test_failed_renders_are_reported_with_the_result(self):
+        original = server.render_preview_clip
+
+        def failing(source_path, clip_start, clip_end, output_path, should_abort=None):
+            raise RuntimeError('simulated encoder failure')
+
+        server.render_preview_clip = failing
+        try:
+            events = self._search(sentence_groups=['there friend'])
+        finally:
+            server.render_preview_clip = original
+        result = next(event for event in events if event.get('phrase') == 'there friend')
+        self.assertEqual((result['files'], result['failed'], result['first_error']), ([], 1, 'simulated encoder failure'))
+
+    def test_silence_search_streams_each_clip_once(self):
+        text = self.client.post('/search_silences_stream', json={'files': [self.source], 'minSilence': 2.0, 'maxSilence': 5.0}).get_data(as_text=True)
+        events = [json.loads(line[6:]) for line in text.splitlines() if line.startswith('data: ')]
+        clips = [item for event in events for item in event.get('files', [])]
+        self.assertEqual(len(clips), 2)
+        self.assertEqual(len({item['file'] for item in clips}), 2)
+        self.assertEqual(events[-1]['total_silences'], 2)
+        self.assertEqual(sorted(round(item['silence_end'] - item['silence_start'], 2) for item in clips), [2.7, 3.4])
+
+    def test_transcripts_are_cached_until_the_file_changes(self):
+        first = server.load_transcript_sentences(self.source)
+        self.assertIs(first, server.load_transcript_sentences(self.source))
+        path = os.path.join(self.library, 'talk.json')
+        data = json.load(open(path, encoding='utf-8'))
+        data[0]['words'].append({'word': 'extra', 'start': 10.5, 'end': 10.9})
+        with open(path, 'w', encoding='utf-8') as handle:
+            json.dump(data, handle)
+        try:
+            self.assertEqual(len(server.find_matches_for_segment('extra', server.load_word_index(self.source))), 1)
+        finally:
+            data[0]['words'].pop()
+            with open(path, 'w', encoding='utf-8') as handle:
+                json.dump(data, handle)
+
+
 if __name__ == '__main__':
     unittest.main()

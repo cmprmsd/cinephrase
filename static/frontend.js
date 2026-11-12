@@ -9,7 +9,6 @@ let clipPlayer = null;
 let mainStage = null;
 let floatingStage = null;
 const resultCards = new WeakMap();   // .phrase-container element -> card controller (see createResultCard)
-let searchCounter = 0;
 let sentenceSearchCounter = 0;
 let globalPhraseContainerIDCounter = 0;
 
@@ -79,199 +78,6 @@ function formatTrimmedLength(clipDurationMs, startTrimMs = 450, endTrimMs = 450)
     } else {
         return `${Math.round(playableDuration)}ms `;
     }
-}
-
-// Trigger a sentence search configured for a specific silence duration range
-// selected via the "Search silence" slider.
-function handleSearchSilence() {
-    if (!activeProject) {
-        return;
-    }
-
-    const selectedFiles = Array.isArray(activeProject.data?.selectedFiles) ? activeProject.data.selectedFiles : [];
-    if (!selectedFiles.length) {
-        return;
-    }
-
-    if (!elements.silenceRangeMinInput || !elements.silenceRangeMaxInput) {
-        return;
-    }
-
-    let minMs = parseInt(elements.silenceRangeMinInput.value, 10) || 0;
-    let maxMs = parseInt(elements.silenceRangeMaxInput.value, 10) || 0;
-    minMs = Math.max(0, Math.min(10000, minMs));
-    maxMs = Math.max(0, Math.min(10000, maxMs));
-    if (minMs > maxMs) {
-        maxMs = minMs;
-        elements.silenceRangeMaxInput.value = String(maxMs);
-    }
-
-    const minSilence = minMs / 1000;
-    const maxSilence = maxMs / 1000;
-
-    // For a focused "search silence" experience, search for pauses whose
-    // duration falls between [minSilence, maxSilence]. We set the threshold
-    // to 0 so all gaps are evaluated purely by silence duration.
-    const silenceWordThreshold = 0;
-
-    // Reflect in the existing numeric inputs so the backend uses them
-    if (elements.minSilenceInput) {
-        elements.minSilenceInput.value = String(minSilence);
-    }
-    if (elements.maxSilenceInput) {
-        elements.maxSilenceInput.value = String(maxSilence);
-    }
-    if (elements.silenceWordThresholdInput) {
-        elements.silenceWordThresholdInput.value = String(silenceWordThreshold);
-    }
-
-    // Persist these preferences to the active project
-    handleSilencePreferenceChange();
-
-    // Determine max results per segment once so both the backend and
-    // frontend grouping logic use the same cap.
-    let maxPerSegment = 25;
-    const maxInput = document.getElementById('maxResultsPerSegment');
-    if (maxInput) {
-        const parsed = parseInt(maxInput.value, 10);
-        if (Number.isInteger(parsed) && parsed > 0) {
-            maxPerSegment = parsed;
-        }
-    }
-
-    // Clear previous results before starting new search
-    if (elements.resultsContainer) {
-        elements.resultsContainer.innerHTML = '';
-    }
-
-    // Show loading state with cancel option
-    let abortController = new AbortController();
-    let reader = null;
-
-    showSearchLoading(`Searching silences between ${minSilence.toFixed(1)}s and ${maxSilence.toFixed(1)}s...`, () => {
-        console.log('[Client] ❌ CANCEL SILENCE SEARCH requested by user');
-        
-        // Send cancellation request to backend
-        if (abortController) {
-            fetch('/cancel_search', {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json'
-                },
-                body: JSON.stringify({ search_id: 'silence_search' })
-            }).catch(err => {
-                console.warn('Failed to send cancel request:', err);
-            });
-        }
-        
-        // Abort the fetch and close the stream
-        try {
-            abortController.abort();
-            if (reader) {
-                reader.cancel().catch(() => {}); // Ignore errors during cancellation
-            }
-        } catch (e) {
-            // Ignore errors during abort
-        }
-        hideSearchLoading();
-        console.log('[Client] ✓ Silence search cancelled, connection closed');
-    });
-
-    // Use SSE endpoint for incremental results
-    fetch('/search_silences_stream', {
-        method: 'POST',
-        headers: {
-            'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({
-            files: selectedFiles,
-            minSilence,
-            maxSilence,
-            maxResultsPerSegment: maxPerSegment
-        }),
-        signal: abortController.signal
-    })
-        .then(response => {
-            reader = response.body.getReader();
-            const decoder = new TextDecoder();
-            let buffer = '';
-
-            function readStream() {
-                return reader.read().then(({ done, value }) => {
-                    if (done) {
-                        hideSearchLoading();
-                        return;
-                    }
-
-                    buffer += decoder.decode(value, { stream: true });
-                    const lines = buffer.split('\n');
-                    buffer = lines.pop() || '';
-
-                    for (const line of lines) {
-                        if (!line.trim() || !line.startsWith('data: ')) {
-                            continue;
-                        }
-
-                        try {
-                            const jsonStr = line.substring(6); // Remove 'data: ' prefix
-                            const data = JSON.parse(jsonStr);
-
-                            if (data.done) {
-                                hideSearchLoading();
-                                const totalSilences = data.total_silences || 0;
-                                if (totalSilences === 0) {
-                                    showNoResults(
-                                        `No silences found between ${minSilence.toFixed(1)}s and ${maxSilence.toFixed(1)}s.`
-                                    );
-                                }
-                                return;
-                            }
-
-                            if (data.error) {
-                                hideSearchLoading();
-                                showNoResults(`Error: ${data.error}`);
-                                return;
-                            }
-
-                            // Process result (data contains phrase and files)
-                            if (data.phrase && data.files) {
-                                // For silence search, check if bucket already exists and update it
-                                const existingContainer = Array.from(elements.resultsContainer.children).find(
-                                    container => {
-                                        const title = container.querySelector('.phrase-title');
-                                        return title && title.textContent === data.phrase;
-                                    }
-                                );
-
-                                const existingCard = existingContainer ? resultCards.get(existingContainer) : null;
-                                if (existingCard) {
-                                    existingCard.addFiles(data.files);
-                                } else {
-                                    // Create new container for this bucket
-                                    updateDropdowns([data]);
-                                }
-                            }
-
-                        } catch (err) {
-                            console.error('[Client] Error parsing SSE data:', err, 'Line:', line);
-                        }
-                    }
-
-                    return readStream();
-                });
-            }
-
-            return readStream();
-        })
-        .catch(error => {
-            if (error.name === 'AbortError') {
-                console.log('[Client] Silence search was cancelled');
-                return;
-            }
-            hideSearchLoading();
-            console.error('[Client] Error searching silences:', error);
-            showNoResults('An error occurred while searching silences. Please try again.');
-        });
 }
 
 function generateId(prefix = 'id') {
@@ -430,9 +236,6 @@ function initializeSearchTabs() {
 function resetCorpusState() {
     sentences = [];
     combinedTranscriptions = {}; // Clear combined transcriptions
-    if (elements.suggestions) {
-        elements.suggestions.innerHTML = '';
-    }
     if (elements.loadSentencesButton) {
         elements.loadSentencesButton.textContent = CORPUS_DEFAULT_BUTTON_TEXT;
         elements.loadSentencesButton.disabled = false;
@@ -578,9 +381,6 @@ function cacheElements() {
     elements.saveSentenceButton = document.getElementById('saveSentenceButton');
     elements.projectSentenceList = document.getElementById('projectSentenceList');
     elements.loadSentencesButton = document.getElementById('loadSentencesButton');
-    elements.inputText = document.getElementById('inputText');
-    elements.suggestions = document.getElementById('suggestions');
-    elements.phraseInput = document.getElementById('phraseInput');
     elements.sentenceInput = document.getElementById('sentenceInput');
     elements.storyPromptInput = document.getElementById('storyPromptInput');
     elements.generateStoryButton = document.getElementById('generateStoryButton');
@@ -590,7 +390,6 @@ function cacheElements() {
     elements.llmResponseInput = document.getElementById('llmResponseInput');
     elements.processResponseButton = document.getElementById('processResponseButton');
     elements.cancelInsertResponseButton = document.getElementById('cancelInsertResponseButton');
-    elements.searchPhrasesButton = document.getElementById('searchPhrasesButton');
     elements.searchSentenceButton = document.getElementById('searchLongestSegmentsButton');
     elements.generateStoryButton = document.getElementById('generateStoryButton');
     elements.startOverButton = document.getElementById('startOverButton');
@@ -746,24 +545,6 @@ function bindEventListeners() {
         elements.loadSentencesButton.addEventListener('click', handleLoadSentences);
     }
 
-    if (elements.inputText) {
-        elements.inputText.addEventListener('input', updateAutocomplete);
-    }
-
-    if (elements.phraseInput) {
-        elements.phraseInput.addEventListener('input', () => {
-            updateProjectData(data => {
-                data.phraseInput = elements.phraseInput.value;
-            });
-        });
-        elements.phraseInput.addEventListener('keydown', event => {
-            if (event.key === 'Enter') {
-                event.preventDefault();
-                searchPhrases();
-            }
-        });
-    }
-
     // Initialize autocomplete container for sentence input
     if (elements.sentenceInput) {
         // Create autocomplete container
@@ -847,10 +628,6 @@ function bindEventListeners() {
                 hideSentenceAutocomplete();
             }
         });
-    }
-
-    if (elements.searchPhrasesButton) {
-        elements.searchPhrasesButton.addEventListener('click', searchPhrases);
     }
 
     if (elements.searchSentenceButton) {
@@ -970,7 +747,6 @@ function updateProjectControlsState() {
         'addToChosenButton',
         'removeFromChosenButton',
         'clearChosenButton',
-        'searchPhrasesButton',
         'searchSentenceButton',
         'startOverButton',
         'playAllButton',
@@ -978,7 +754,6 @@ function updateProjectControlsState() {
         'timelinePlayButton',
         'timelineMergeButton',
         'timelineClearButton',
-        'phraseInput',
         'sentenceInput'
     ];
 
@@ -1201,10 +976,6 @@ function applyProjectToUI(project) {
         elements.projectNameInput.value = project.name || '';
     }
 
-    if (elements.phraseInput) {
-        elements.phraseInput.value = data.phraseInput || '';
-    }
-
     if (elements.sentenceInput) {
         elements.sentenceInput.value = data.currentSentence || '';
     }
@@ -1288,9 +1059,6 @@ function applyProjectToUI(project) {
 function clearWorkspaceInputs() {
     if (elements.projectNameInput) {
         elements.projectNameInput.value = '';
-    }
-    if (elements.phraseInput) {
-        elements.phraseInput.value = '';
     }
     if (elements.sentenceInput) {
         elements.sentenceInput.value = '';
@@ -1993,29 +1761,32 @@ function showSearchLoading(message, onCancel) {
     if (!elements.resultsContainer) {
         return;
     }
-    
-    // Create loading indicator
+    hideSearchLoading();
+
     const loadingDiv = document.createElement('div');
     loadingDiv.id = 'searchLoadingIndicator';
     loadingDiv.className = 'search-loading';
-    loadingDiv.innerHTML = `
-        <div class="loading-spinner"></div>
-        <div style="display: flex; align-items: center; gap: 10px;">
-            <p style="margin: 0; flex: 1;">${message}</p>
-        </div>
-    `;
-    
-    // Add cancel button if callback provided
+    loadingDiv.setAttribute('role', 'status');
+    const spinner = document.createElement('div');
+    spinner.className = 'loading-spinner';
+    const messageContainer = document.createElement('div');
+    messageContainer.style.cssText = 'display: flex; align-items: center; gap: 10px;';
+    const text = document.createElement('p');
+    text.style.cssText = 'margin: 0; flex: 1;';
+    text.textContent = message;
+    messageContainer.appendChild(text);
+
     if (onCancel) {
-        const messageContainer = loadingDiv.querySelector('div:last-child');
         const cancelBtn = document.createElement('button');
+        cancelBtn.type = 'button';
         cancelBtn.className = 'button ghost-button';
         cancelBtn.textContent = 'Cancel Search';
         cancelBtn.style.cssText = 'padding: 4px 12px; font-size: 12px; min-width: auto;';
         cancelBtn.onclick = onCancel;
         messageContainer.appendChild(cancelBtn);
     }
-    
+
+    loadingDiv.append(spinner, messageContainer);
     elements.resultsContainer.appendChild(loadingDiv);
 }
 
@@ -2162,14 +1933,15 @@ function updateSearchLoadingMessage(message, segmentData) {
         skipBtn.title = 'Skip this segment immediately (no clips will be rendered)';
         skipBtn.style.cssText = 'padding: 4px 12px; font-size: 12px; min-width: auto;';
         skipBtn.onclick = () => {
-            // Extract segment text from progress message (between quotes)
-            const match = message.match(/'([^']+)'/);
-            if (!match || !window.currentSearchId) {
+            // The server sends the phrase with the progress event. (Cutting it out of the message between
+            // quotes breaks on apostrophes: "don't stop" became "don".)
+            const quoted = message.match(/'(.+)'/);
+            const segmentPhrase = segmentData.segment_phrase || (quoted ? quoted[1] : '');
+            if (!segmentPhrase || !window.currentSearchId) {
                 console.error('[Client] Cannot skip: missing segment text or search ID');
                 return;
             }
-            
-            const segmentPhrase = match[1];
+
             skipBtn.textContent = 'Skipping...';
             skipBtn.disabled = true;
             
@@ -2223,9 +1995,9 @@ function showNoResults(message) {
     const messageDiv = document.createElement('div');
     messageDiv.id = 'noResultsMessage';
     messageDiv.className = 'no-results-message';
-    messageDiv.innerHTML = `
-        <p>${message}</p>
-    `;
+    const text = document.createElement('p');
+    text.textContent = message;
+    messageDiv.appendChild(text);
     
     elements.resultsContainer.appendChild(messageDiv);
 }
@@ -2646,416 +2418,440 @@ function createWaveformVisualization({
     return container;
 }
 
-function searchPhrases() {
-    if (!activeProject || !elements.phraseInput) {
-        return;
-    }
+// ---------------------------------------------------------------------------------------------------------
+// Searching
+// ---------------------------------------------------------------------------------------------------------
 
-    const selectedFiles = Array.isArray(activeProject.data?.selectedFiles) ? activeProject.data.selectedFiles : [];
-    if (!selectedFiles.length) {
-        return;
-    }
-
-    const phrases = elements.phraseInput.value
-        .split(',')
-        .map(phrase => phrase.trim())
-        .filter(phrase => phrase.length > 0);
-
-    if (!phrases.length) {
-        return;
-    }
-
-    const silencePreferences = getSilencePreferences();
-    updateProjectData(data => {
-        data.phraseInput = elements.phraseInput.value;
-        data.silencePreferences = silencePreferences;
-    });
-
-    searchCounter += 1;
-
-    // Show loading indicator
-    showSearchLoading(`Searching for ${phrases.length} phrase${phrases.length > 1 ? 's' : ''}...`);
-
-    fetch('/search', {
-        method: 'POST',
-        headers: {
-            'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({
-            files: selectedFiles,
-            phrases,
-            searchCounter,
-            minSilence: silencePreferences.minSilence,
-            maxSilence: silencePreferences.maxSilence,
-            silenceWordThreshold: silencePreferences.silenceWordThreshold
-        })
-    })
-        .then(response => response.json())
-        .then(data => {
-            hideSearchLoading();
-            if (!data || data.length === 0) {
-                showNoResults('No matches found for any of the searched phrases.');
-            } else {
-            updateDropdowns(data);
+/**
+ * Read a text/event-stream response and call onEvent(data) for every `data: {json}` line.
+ * Reading stops when the stream ends or onEvent returns false.
+ */
+async function readEventStream(response, onEvent) {
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    try {
+        for (;;) {
+            const { done, value } = await reader.read();
+            buffer += decoder.decode(value || new Uint8Array(), { stream: !done });
+            const lines = buffer.split('\n');
+            buffer = done ? '' : lines.pop();
+            for (const line of lines) {
+                if (!line.startsWith('data: ')) {
+                    continue;
+                }
+                let data;
+                try {
+                    data = JSON.parse(line.slice(6));
+                } catch (error) {
+                    console.error('Malformed event from the server:', line);
+                    continue;
+                }
+                if (onEvent(data) === false) {
+                    return;
+                }
             }
-        })
-        .catch(error => {
-            hideSearchLoading();
-            const errorMessage = error.message || 'An error occurred while searching. Please try again.';
-            console.error('Error searching phrases:', errorMessage);
-            showNoResults(`Error: ${errorMessage}`);
-        });
+            if (done) {
+                return;
+            }
+        }
+    } finally {
+        reader.cancel().catch(() => { /* already closed */ });
+    }
+}
+
+// Only one search runs at a time: starting a new one (or "Clear results") ends the previous one, so results of
+// an older search can never arrive in the list of a newer one.
+let activeSearch = null;
+
+function beginSearch() {
+    cancelActiveSearch();
+    const search = {
+        controller: new AbortController(),
+        serverId: null,          // id the server reports with its progress events (needed for skip / cancel)
+        cancelled: false,
+        get isCurrent() {
+            return activeSearch === search && !search.cancelled;
+        }
+    };
+    activeSearch = search;
+    window.currentSearchId = null;
+    return search;
+}
+
+function cancelActiveSearch() {
+    const search = activeSearch;
+    if (!search) {
+        return;
+    }
+    activeSearch = null;
+    search.cancelled = true;
+    if (search.serverId) {
+        // Tell the server to stop rendering clips right away (closing the connection is only noticed later).
+        fetch('/cancel_search', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ search_id: search.serverId })
+        }).catch(() => { /* the search may already be over */ });
+    }
+    search.controller.abort();
+    hideSearchLoading();
+}
+
+function finishSearch(search) {
+    if (activeSearch === search) {
+        activeSearch = null;
+        hideSearchLoading();
+    }
+}
+
+function getMaxResultsPerSegment() {
+    const input = document.getElementById('maxResultsPerSegment');
+    const parsed = input ? parseInt(input.value, 10) : NaN;
+    const value = Number.isInteger(parsed) && parsed > 0 ? Math.min(parsed, 1000) : 25;
+    if (input && String(value) !== input.value) {
+        input.value = String(value);
+    }
+    return value;
+}
+
+const WORD_CHARACTER = '[\\p{L}\\p{N}]';
+
+/**
+ * Expand one search term with wildcards against the loaded corpus.
+ *   ball*    words that start with "ball" (a * stands for letters inside one word; "der ball*" works too)
+ *   ball**   from a word starting with "ball" to the end of its sentence
+ *   **ball   from the start of a sentence up to a word ending in "ball"
+ *   **ball** whole sentences containing "ball"
+ * Every expansion starts and ends on a word boundary, because the server matches whole words.
+ * Returns the unique expansions (at most `limit`), or null if the pattern is not supported.
+ */
+function expandWildcardTerm(term, limit) {
+    const results = [];
+    const seen = new Set();
+    const add = text => {
+        const cleaned = text.trim().replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, '');
+        const key = cleaned.toLowerCase().replace(/[^\p{L}\p{N}\s']/gu, '').replace(/\s+/g, ' ');
+        if (key && !seen.has(key)) {
+            seen.add(key);
+            results.push(cleaned);
+        }
+    };
+    const corpus = sentences.map(entry => entry && entry.current).filter(Boolean);
+
+    if (term.includes('**')) {
+        const leading = term.startsWith('**');
+        const trailing = term.endsWith('**');
+        const core = term.replace(/^\*\*/, '').replace(/\*\*$/, '').trim();
+        if (!core || core.includes('*') || (!leading && !trailing)) {
+            return null;
+        }
+        const escaped = escapeRegExp(core);
+        const pattern = leading && trailing
+            ? escaped
+            : leading
+                ? `${escaped}(?!${WORD_CHARACTER})`
+                : `(?<!${WORD_CHARACTER})${escaped}`;
+        const regex = new RegExp(pattern, 'iu');
+        for (const text of corpus) {
+            if (results.length >= limit) break;
+            const match = regex.exec(text);
+            if (!match) continue;
+            if (leading && trailing) {
+                add(text);
+            } else if (leading) {
+                add(text.slice(0, match.index + match[0].length));
+            } else {
+                add(text.slice(match.index));
+            }
+        }
+        return results;
+    }
+
+    // Single *: letters/digits (and inner apostrophes or hyphens) inside one word
+    const pattern = term.split('*').map(escapeRegExp).join(`(?:${WORD_CHARACTER}|['’-])*`);
+    const regex = new RegExp(`(?<!${WORD_CHARACTER})${pattern}(?!${WORD_CHARACTER})`, 'giu');
+    for (const text of corpus) {
+        if (results.length >= limit) break;
+        for (const match of text.matchAll(regex)) {
+            add(match[0]);
+            if (results.length >= limit) break;
+        }
+    }
+    return results;
+}
+
+/** Show a notice above/between the result cards (failed renders, a failed group) without ending the search. */
+function showResultNotice(message) {
+    if (!elements.resultsContainer) {
+        return;
+    }
+    const notice = document.createElement('div');
+    notice.className = 'result-notice';
+    notice.setAttribute('role', 'status');
+    notice.textContent = message;
+    const loading = document.getElementById('searchLoadingIndicator');
+    elements.resultsContainer.insertBefore(notice, loading);
 }
 
 function handleSentenceSearch() {
     if (!activeProject || !elements.sentenceInput) {
         return;
     }
-
     const rawSentence = elements.sentenceInput.value.trim();
     if (!rawSentence) {
         return;
     }
-    
-    // Get the max results per segment value
-    const maxResultsInput = document.getElementById('maxResultsPerSegment');
-    const maxResultsPerSegment = maxResultsInput ? parseInt(maxResultsInput.value, 10) : 25;
-    
-    // Function to expand wildcards by finding matching sentences
-    function expandWildcards(searchTerms) {
-        const expandedTerms = [];
-        
-        for (const term of searchTerms) {
-            // Check if term contains wildcards
-            if (term.includes('*')) {
-                const hasSingleWildcard = term.includes('*') && !term.includes('**');
-                const hasDoubleWildcard = term.includes('**');
-                
-                if (hasDoubleWildcard) {
-                    // ** matches any sequence of words (including spaces)
-                    // Check if it's wrapped (starts and ends with **)
-                    const isWrapped = term.startsWith('**') && term.endsWith('**');
-                    const hasLeading = term.startsWith('**') && !term.endsWith('**');
-                    const hasTrailing = !term.startsWith('**') && term.endsWith('**');
-                    
-                    if (isWrapped) {
-                        // **ball** - match full sentences containing "ball"
-                        const searchTerm = term.slice(2, -2); // Remove ** from both ends
-                        let pattern = searchTerm.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); // Escape special chars
-                        pattern = `.*${pattern}.*`; // Match anywhere in sentence
-                        const regex = new RegExp(pattern, 'i');
-                        
-                        const matchingSentences = sentences
-                            .filter(s => s.current && regex.test(s.current))
-                            .map(s => s.current)
-                            .slice(0, maxResultsPerSegment);
-                        
-                        if (matchingSentences.length > 0) {
-                            expandedTerms.push(...matchingSentences);
-                        }
-                    } else if (hasLeading) {
-                        // **ball - match up to "ball" in sentence (extract substring up to "ball")
-                        const searchTerm = term.slice(2); // Remove ** from beginning
-                        let pattern = searchTerm.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); // Escape special chars
-                        pattern = `.*${pattern}`; // Find "ball" anywhere in sentence
-                        const regex = new RegExp(pattern, 'i');
-                        
-                        const matchingSentences = sentences
-                            .filter(s => {
-                                if (!s.current) return false;
-                                
-                                const matches = regex.test(s.current);
-                                if (matches) {
-                                    // Find the position of the search term and extract up to there
-                                    const matchIndex = s.current.toLowerCase().indexOf(searchTerm.toLowerCase());
-                                    return matchIndex !== -1;
-                                }
-                                return false;
-                            })
-                            .map(s => {
-                                // Extract substring up to match position (including the search term)
-                                const matchIndex = s.current.toLowerCase().indexOf(searchTerm.toLowerCase());
-                                return s.current.substring(0, matchIndex + searchTerm.length);
-                            })
-                            .slice(0, maxResultsPerSegment);
-                        
-                        if (matchingSentences.length > 0) {
-                            expandedTerms.push(...matchingSentences);
-                        }
-                    } else if (hasTrailing) {
-                        // ball** - match from "ball" onwards in sentence (extract substring from "ball")
-                        const searchTerm = term.slice(0, -2); // Remove ** from end
-                        let pattern = searchTerm.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); // Escape special chars
-                        pattern = `.*${pattern}`; // Find "ball" anywhere in sentence
-                        const regex = new RegExp(pattern, 'i');
-                        
-                        const matchingSentences = sentences
-                            .filter(s => {
-                                if (!s.current) return false;
-                                
-                                const matches = regex.test(s.current);
-                                if (matches) {
-                                    // Find the position of the search term and extract from there onwards
-                                    const matchIndex = s.current.toLowerCase().indexOf(searchTerm.toLowerCase());
-                                    return matchIndex !== -1;
-                                }
-                                return false;
-                            })
-                            .map(s => {
-                                // Extract substring from match position onwards
-                                const matchIndex = s.current.toLowerCase().indexOf(searchTerm.toLowerCase());
-                                return s.current.substring(matchIndex);
-                            })
-                            .slice(0, maxResultsPerSegment);
-                        
-                        if (matchingSentences.length > 0) {
-                            expandedTerms.push(...matchingSentences);
-                        }
-                    }
-                } else if (hasSingleWildcard) {
-                    // * matches within a single word (no spaces) - complete words only
-                    // For ball* we want words like "ballsaal", "ballspiel" but not "ballen"
-                    let pattern = term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); // Escape special chars
-                    // Replace escaped * with [^\\s]*
-                    pattern = pattern.replace(/\\\*/g, '[^\\s]*');
-                    // Add word boundaries to match complete words only
-                    pattern = `\\b${pattern}\\b`;
-                    const regex = new RegExp(pattern, 'i');
-                    
-                    const matchingSentences = sentences
-                        .filter(s => {
-                            if (!s.current) return false;
-                            
-                            // For single wildcard, extract individual words and check if any match the pattern
-                            const words = s.current.split(/\s+/);
-                            return words.some(word => regex.test(word));
-                        })
-                        .flatMap(s => {
-                            // For single wildcard, return just the matching words, not the full sentence
-                            const words = s.current.split(/\s+/);
-                            return words.filter(word => regex.test(word));
-                        })
-                        .slice(0, maxResultsPerSegment);
-                    
-                    if (matchingSentences.length > 0) {
-                        expandedTerms.push(...matchingSentences);
-                    }
-                } else {
-                    // No wildcards, keep original term
-                    expandedTerms.push(term);
-                }
-            } else {
-                // No wildcards, keep original term
-                expandedTerms.push(term);
-            }
-        }
-        
-        return expandedTerms;
-    }
-    
-    // Split into semicolon-separated groups and keep non-empty trimmed ones
-    let sentenceGroups = rawSentence
-        .split(';')
-        .map(part => part.trim())
-        .filter(part => part.length > 0);
-        
-    if (sentenceGroups.length === 0) {
-        return;
-    }
-    
-    // Expand wildcards to find actual sentences
-    const originalGroups = [...sentenceGroups];
-    sentenceGroups = expandWildcards(sentenceGroups);
-    
-    if (sentenceGroups.length === 0) {
-        return;
+
+    cancelActiveSearch();
+    stopClipPlayback();
+    hideFloatingPreview();
+    if (elements.resultsContainer) {
+        elements.resultsContainer.innerHTML = '';
     }
 
     const selectedFiles = Array.isArray(activeProject.data?.selectedFiles) ? activeProject.data.selectedFiles : [];
     if (!selectedFiles.length) {
+        showNoResults('Add at least one video to the project (Media Library) before searching.');
         return;
     }
-    
-    // Clear previous results before starting new search
-    if (elements.resultsContainer) {
-        elements.resultsContainer.innerHTML = '';
+
+    // Groups are separated by semicolons; wildcards are expanded against the corpus
+    const maxResultsPerSegment = getMaxResultsPerSegment();
+    const sentenceGroups = [];
+    const seenGroups = new Set();
+    for (const term of rawSentence.split(';').map(part => part.trim()).filter(Boolean)) {
+        let expansions = [term];
+        if (term.includes('*')) {
+            if (!sentences.length) {
+                showNoResults('Wildcards (*) are looked up in the corpus: click "Load corpus" in the Media Library first.');
+                return;
+            }
+            expansions = expandWildcardTerm(term, maxResultsPerSegment);
+            if (expansions === null) {
+                showNoResults(`"${term}" is not a supported wildcard pattern. Use ball*, ball**, **ball or **ball**.`);
+                return;
+            }
+            if (!expansions.length) {
+                showNoResults(`Nothing in the corpus matches "${term}".`);
+                return;
+            }
+        }
+        expansions.forEach(group => {
+            const key = group.toLowerCase();
+            if (!seenGroups.has(key)) {
+                seenGroups.add(key);
+                sentenceGroups.push(group);
+            }
+        });
     }
-    
-    // Immediately jump to results on mobile when search is initiated
+    if (!sentenceGroups.length) {
+        return;
+    }
+
     if (isMobileLayout()) {
         switchMobileSection('results');
     }
 
-    // Get the checkbox values for partial matches
     const includePartialMatchesCheckbox = document.getElementById('includePartialMatches');
     const includePartialMatches = includePartialMatchesCheckbox ? includePartialMatchesCheckbox.checked : false;
     const allPartialMatchesCheckbox = document.getElementById('allPartialMatches');
     const allPartialMatches = allPartialMatchesCheckbox ? allPartialMatchesCheckbox.checked : false;
-    
+    const silencePreferences = getSilencePreferences();
+
     updateProjectData(data => {
         data.currentSentence = rawSentence;
-        data.silencePreferences = getSilencePreferences();
+        data.silencePreferences = silencePreferences;
         data.includePartialMatches = includePartialMatches;
         data.allPartialMatches = allPartialMatches;
         data.maxResultsPerSegment = maxResultsPerSegment;
     });
 
     sentenceSearchCounter += 1;
+    window.currentSentenceGroups = sentenceGroups;
+    const search = beginSearch();
+    const displaySentence = sentenceGroups.length > 3
+        ? `${sentenceGroups.slice(0, 3).join('; ')}; … (${sentenceGroups.length} phrases)`
+        : sentenceGroups.join('; ');
+    showSearchLoading(`Searching for "${displaySentence}"...`, cancelActiveSearch);
 
-    // Clear skipped segments from previous search
-    window.skippedSegments = new Set();
-    window.currentSearchId = null;  // Will be set from server progress messages
-    
-    // Create AbortController for cancellation
-    const abortController = new AbortController();
-    let reader = null;
-    
-    // Show loading indicator with cancel button
-    const displaySentence = sentenceGroups.join('; ');
-
-    showSearchLoading(`Searching for "${displaySentence}"...`, () => {
-        console.log('[Client] ❌ CANCEL SEARCH requested by user');
-        
-        // Send cancellation request to backend to stop rendering immediately
-        if (window.currentSearchId) {
-            fetch('/cancel_search', {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json'
-                },
-                body: JSON.stringify({
-                    search_id: window.currentSearchId
-                })
-            }).then(() => {
-                console.log('[Client] ✓ Cancellation request sent to server');
-            }).catch(err => {
-                console.warn('[Client] Failed to send cancellation request:', err);
-            });
+    let resultCount = 0;
+    const problems = [];
+    const onEvent = data => {
+        if (!search.isCurrent) {
+            return false;
         }
-        
-        // Abort the fetch and close the stream
-        try {
-            abortController.abort();
-            if (reader) {
-                reader.cancel().catch(() => {}); // Ignore errors during cancellation
+        if (data.done) {
+            return false;
+        }
+        if (data.error) {
+            // One group failed; the server continues with the next one.
+            console.error('Search error:', data.error);
+            problems.push(data.error);
+            showResultNotice(data.error);
+            return true;
+        }
+        if (data.progress) {
+            if (data.search_id) {
+                search.serverId = data.search_id;
+                window.currentSearchId = data.search_id;
             }
-        } catch (e) {
-            // Ignore errors during abort
+            updateSearchLoadingMessage(data.progress, data);
+            return true;
         }
-        hideSearchLoading();
-        console.log('[Client] ✓ Search cancelled, connection closed');
-    });
+        if (data.phrase) {
+            if (data.skipped) {
+                updateSearchLoadingMessage(`⏭️ Skipped: '${data.phrase}' (no clips rendered)`);
+                return true;
+            }
+            const files = Array.isArray(data.files) ? data.files : [];
+            if (data.failed) {
+                const notice = `${data.failed} of ${data.failed + files.length} clips for "${data.phrase}" could not be rendered: ${data.first_error || 'unknown error'}`;
+                problems.push(notice);
+                showResultNotice(notice);
+            }
+            if (files.length) {
+                resultCount += 1;
+                addSegmentResult(data);
+            }
+        }
+        return true;
+    };
 
-    // Use SSE endpoint for incremental results
     fetch('/search_longest_segments_stream', {
         method: 'POST',
-        headers: {
-            'Content-Type': 'application/json'
-        },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
             files: selectedFiles,
-            sentence: rawSentence,
             sentence_groups: sentenceGroups,
             sentenceSearchCounter,
-            minSilence: getSilencePreferences().minSilence,
-            maxSilence: getSilencePreferences().maxSilence,
-            silenceWordThreshold: getSilencePreferences().silenceWordThreshold,
-            includePartialMatches: includePartialMatches,
-            allPartialMatches: allPartialMatches,
-            maxResultsPerSegment: maxResultsPerSegment
+            minSilence: silencePreferences.minSilence,
+            maxSilence: silencePreferences.maxSilence,
+            silenceWordThreshold: silencePreferences.silenceWordThreshold,
+            includePartialMatches,
+            allPartialMatches,
+            maxResultsPerSegment
         }),
-        signal: abortController.signal
+        signal: search.controller.signal
     })
-        .then(response => {
-            reader = response.body.getReader();
-            const decoder = new TextDecoder();
-            let buffer = '';
-            let receivedAnyResult = false;
-
-            function processStream() {
-                return reader.read().then(({ done, value }) => {
-                    if (done) {
-                        if (!receivedAnyResult) {
-                            hideSearchLoading();
-                            showNoResults(`No matches found for "${displaySentence}".`);
-                        } else {
-                            hideSearchLoading();
-                        }
-                        return;
-                    }
-
-                    buffer += decoder.decode(value, { stream: true });
-                    const lines = buffer.split('\n');
-                    buffer = lines.pop(); // Keep incomplete line in buffer
-
-                    for (const line of lines) {
-                        if (line.startsWith('data: ')) {
-                            const data = JSON.parse(line.slice(6));
-                            
-                            if (data.done) {
-                                if (!receivedAnyResult) {
-                                    showNoResults(`No matches found for "${displaySentence}".`);
-                                }
-                                hideSearchLoading();
-                                return;
-                            }
-                            
-                            if (data.error) {
-                                console.error('Search error:', data.error);
-                                hideSearchLoading();
-                                if (!receivedAnyResult) {
-                                    showNoResults('An error occurred during search. Please try again.');
-                                }
-                                return;
-                            }
-                            
-                            // Handle progress updates
-                            if (data.progress) {
-                                console.log(`[Client] Received progress: ${data.segment_index}/${data.total_segments} - "${data.progress}"`);
-                                // Store search_id from progress messages
-                                if (data.search_id) {
-                                    window.currentSearchId = data.search_id;
-                                }
-                                updateSearchLoadingMessage(data.progress, data);
-                                // Don't return - continue processing other lines in this chunk
-                                continue;
-                            }
-                            
-                            // Received a segment result - add it incrementally
-                            if (data.phrase) {
-                                // Check if this segment was skipped on the server
-                                if (data.skipped) {
-                                    console.log(`[Client] ⏭️  Segment skipped by server: '${data.phrase.substring(0, 50)}...'`);
-                                    updateSearchLoadingMessage(`⏭️ Skipped: '${data.phrase}' (no clips rendered)`);
-                                    // Don't return - continue processing other lines in this chunk
-                                    continue;
-                                }
-                                
-                                console.log(`[Client] ✓ Received segment: '${data.phrase.substring(0, 50)}...' (${data.files ? data.files.length : 0} clips)`);
-                                receivedAnyResult = true;
-                                addSegmentResult(data);
-                                // Don't return - continue processing other lines in this chunk
-                                continue;
-                            }
-                        }
-                    }
-
-                    // After processing all lines in this chunk, continue with next chunk
-                    return processStream();
-                });
+        .then(async response => {
+            if (!response.ok) {
+                const failure = await response.json().catch(() => ({}));
+                throw new Error(failure.error || `the server answered with HTTP ${response.status}`);
             }
-
-            return processStream();
-        })
-        .catch(error => {
-            // Ignore abort errors and connection errors (user cancelled)
-            if (error.name === 'AbortError' || error.message.includes('aborted') || error.message.includes('input stream')) {
-                console.log('[Client] Search cancelled - error handled gracefully');
+            await readEventStream(response, onEvent);
+            if (!search.isCurrent) {
                 return;
             }
-            hideSearchLoading();
+            finishSearch(search);
+            if (!resultCount && !problems.length) {
+                showNoResults(`No matches found for "${displaySentence}".`);
+            }
+        })
+        .catch(error => {
+            if (!search.isCurrent) {
+                return;     // cancelled, or replaced by a newer search
+            }
+            finishSearch(search);
             console.error('[Client] ❌ Error searching sentence:', error);
-            showNoResults('An error occurred while searching. Please try again.');
+            showNoResults(`The search failed: ${error.message}`);
+        });
+}
+
+// Search for pauses between words whose length lies in the range of the "Search silence" slider
+function handleSearchSilence() {
+    if (!activeProject || !elements.silenceRangeMinInput || !elements.silenceRangeMaxInput) {
+        return;
+    }
+
+    cancelActiveSearch();
+    stopClipPlayback();
+    hideFloatingPreview();
+    if (elements.resultsContainer) {
+        elements.resultsContainer.innerHTML = '';
+    }
+
+    const selectedFiles = Array.isArray(activeProject.data?.selectedFiles) ? activeProject.data.selectedFiles : [];
+    if (!selectedFiles.length) {
+        showNoResults('Add at least one video to the project (Media Library) before searching.');
+        return;
+    }
+
+    let minMs = Math.max(0, Math.min(10000, parseInt(elements.silenceRangeMinInput.value, 10) || 0));
+    let maxMs = Math.max(0, Math.min(10000, parseInt(elements.silenceRangeMaxInput.value, 10) || 0));
+    if (minMs > maxMs) {
+        maxMs = minMs;
+        elements.silenceRangeMaxInput.value = String(maxMs);
+    }
+    const minSilence = minMs / 1000;
+    const maxSilence = maxMs / 1000;
+    const range = `between ${minSilence.toFixed(1)}s and ${maxSilence.toFixed(1)}s`;
+
+    if (isMobileLayout()) {
+        switchMobileSection('results');
+    }
+    const search = beginSearch();
+    showSearchLoading(`Searching silences ${range}...`, cancelActiveSearch);
+
+    let clipCount = 0;
+    let failure = null;
+    const onEvent = data => {
+        if (!search.isCurrent || data.done) {
+            return false;
+        }
+        if (data.error) {
+            failure = data.error;
+            return false;
+        }
+        if (data.phrase && Array.isArray(data.files)) {
+            clipCount += data.files.length;
+            // Buckets ("1-2s silences") grow while the search is streaming
+            const existing = Array.from(elements.resultsContainer.querySelectorAll('.phrase-container'))
+                .map(container => resultCards.get(container))
+                .find(card => card && card.phrase === data.phrase);
+            if (existing) {
+                existing.addFiles(data.files);
+            } else {
+                createResultCard(data);
+            }
+        }
+        return true;
+    };
+
+    fetch('/search_silences_stream', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            files: selectedFiles,
+            minSilence,
+            maxSilence,
+            maxResultsPerSegment: getMaxResultsPerSegment()
+        }),
+        signal: search.controller.signal
+    })
+        .then(async response => {
+            if (!response.ok) {
+                const body = await response.json().catch(() => ({}));
+                throw new Error(body.error || `the server answered with HTTP ${response.status}`);
+            }
+            await readEventStream(response, onEvent);
+            if (!search.isCurrent) {
+                return;
+            }
+            finishSearch(search);
+            if (failure) {
+                showNoResults(`Error: ${failure}`);
+            } else if (!clipCount) {
+                showNoResults(`No silences found ${range}.`);
+            }
+        })
+        .catch(error => {
+            if (!search.isCurrent) {
+                return;
+            }
+            finishSearch(search);
+            console.error('[Client] Error searching silences:', error);
+            showNoResults(`The silence search failed: ${error.message}`);
         });
 }
 
@@ -3115,18 +2911,14 @@ function handleGenerateStory() {
             debugMode: debugMode
         })
     })
-        .then(response => response.json())
-        .then(data => {
+        .then(async response => ({ ok: response.ok, status: response.status, data: await response.json().catch(() => ({})) }))
+        .then(({ ok, status, data }) => {
         hideSearchLoading();
-        
-        if (data.type === 'error') {
-            console.error('[Client] ❌ Error generating story:', data.error);
-            showNoResults(`Error: ${data.error}`);
-            return;
-        } else if (data.type === 'no_matches') {
-            console.log(`[Client] No matches found for: ${sentenceGroups.join('; ')}`);
-            hideSearchLoading();
-            showNoResults(`No matches found for: ${sentenceGroups.join('; ')}`);
+
+        // The server explains what went wrong (LLM unreachable, timeout, model missing, invalid answer).
+        if (!ok || data.error) {
+            console.error('[Client] ❌ Error generating story:', data.error || status);
+            showNoResults(`Error: ${data.error || `the server answered with HTTP ${status}`}`);
             return;
         }
 
@@ -3336,124 +3128,62 @@ function handleProcessInsertedResponse() {
     processStorySentences(sentenceQueries, selectedFiles, explanation);
 }
 
-function processStorySentences(sentenceQueries, selectedFiles, explanation) {
-    // Send the response to backend to process (reuse the generate_story endpoint logic)
-    // We'll create a simplified version that processes the response
-    console.log(`Processing ${sentenceQueries.length} sentences from inserted response...`);
-    
-    // Convert sentenceQueries to the format expected by displayStorySegments
-    // We need to search for each query and create segment results
-    // For now, let's create a simplified version that calls the search for each query
-    
+/**
+ * Story from a pasted LLM answer: look up every source segment (exact match, first hit) and show the result
+ * like a generated story. Segments that are not in the selected videos are listed instead of being dropped.
+ */
+async function processStorySentences(sentenceQueries, selectedFiles, explanation) {
     const allSegments = [];
-    let processedCount = 0;
-    
-    function processNext() {
-        if (processedCount >= sentenceQueries.length) {
-            hideSearchLoading();
-            if (allSegments.length > 0) {
-                displayStorySegments(allSegments, explanation);
-            } else {
-                showNoResults('No matches found for the inserted response.');
-            }
-            return;
-        }
-        
-        const [sentenceText, searchQueries] = sentenceQueries[processedCount];
-        processedCount++;
-        
-        // Search for ALL queries in the source_segments (not just the first one)
-        if (searchQueries.length > 0) {
-            let queryIndex = 0;
-            const searchId = `inserted-${processedCount}-${Date.now()}`;
-            
-            function searchNextQuery() {
-                if (queryIndex >= searchQueries.length) {
-                    // All queries for this sentence processed, move to next sentence
-                    setTimeout(processNext, 50);
-                    return;
-                }
-                
-                const searchQuery = searchQueries[queryIndex];
-                queryIndex++;
-                
-                fetch('/search_longest_segments_stream', {
+    const unmatched = [];
+    let requestCounter = 0;
+
+    for (const [sentenceText, searchQueries] of sentenceQueries) {
+        for (const searchQuery of searchQueries) {
+            requestCounter += 1;
+            let segment = null;
+            try {
+                const response = await fetch('/search_longest_segments_stream', {
                     method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json'
-                    },
+                    headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
-                        sentence: searchQuery,
+                        // One group, searched as a whole (commas included)
+                        sentence_groups: [searchQuery],
                         files: selectedFiles,
-                        sentenceSearchCounter: processedCount,
+                        sentenceSearchCounter: requestCounter,
                         includePartialMatches: false,
-                        maxResultsPerSegment: 1,
-                        exportClips: true,
-                        clipGroup: `story-${searchId}`
+                        maxResultsPerSegment: 1
                     })
-                })
-                .then(response => {
-                    if (!response.ok) {
-                        throw new Error(`HTTP error! status: ${response.status}`);
-                    }
-                    
-                    const reader = response.body.getReader();
-                    const decoder = new TextDecoder();
-                    let buffer = '';
-                    let foundMatch = false;
-                    
-                    function readStream() {
-                        return reader.read().then(({ done, value }) => {
-                            if (done) {
-                                // Move to next query (or next sentence if all queries done)
-                                searchNextQuery();
-                                return;
-                            }
-                            
-                            buffer += decoder.decode(value, { stream: true });
-                            const lines = buffer.split('\n');
-                            buffer = lines.pop() || '';
-                            
-                            for (const line of lines) {
-                                if (line.startsWith('data: ')) {
-                                    try {
-                                        const data = JSON.parse(line.slice(6));
-                                        if (data.files && data.files.length > 0 && !foundMatch) {
-                                            foundMatch = true;
-                                            const segmentData = {
-                                                phrase: searchQuery,
-                                                files: data.files,
-                                                created_sentence: sentenceText
-                                            };
-                                            allSegments.push(segmentData);
-                                        }
-                                    } catch (e) {
-                                        // Ignore parse errors
-                                    }
-                                }
-                            }
-                            
-                            return readStream();
-                        });
-                    }
-                    
-                    return readStream();
-                })
-                .catch(err => {
-                    console.error('Error searching:', err);
-                    // Continue to next query even if this one failed
-                    searchNextQuery();
                 });
+                if (!response.ok) {
+                    throw new Error(`HTTP ${response.status}`);
+                }
+                await readEventStream(response, data => {
+                    if (Array.isArray(data.files) && data.files.length > 0) {
+                        segment = { phrase: searchQuery, files: data.files, created_sentence: sentenceText };
+                        return false;
+                    }
+                    return !data.done;
+                });
+            } catch (error) {
+                console.error(`Story segment "${searchQuery}" could not be searched:`, error);
             }
-            
-            // Start searching queries for this sentence
-            searchNextQuery();
-        } else {
-            setTimeout(processNext, 50);
+            if (segment) {
+                allSegments.push(segment);
+            } else {
+                unmatched.push(searchQuery);
+            }
         }
     }
-    
-    processNext();
+
+    hideSearchLoading();
+    if (allSegments.length > 0) {
+        displayStorySegments(allSegments, explanation);
+    } else {
+        showNoResults('No matches found for the inserted response.');
+    }
+    if (unmatched.length) {
+        showResultNotice(`${unmatched.length} segment(s) of the story were not found in the selected videos: ${unmatched.map(text => `"${text}"`).join(', ')}`);
+    }
 }
 
 function displayDebugInfo(debugData) {
@@ -3542,7 +3272,10 @@ function displayStorySegments(segments, storyExplanation) {
         const explanationDiv = document.createElement('div');
         explanationDiv.className = 'story-explanation';
         explanationDiv.style.cssText = 'padding: 16px; margin-bottom: 16px; background: rgba(255,255,255,0.05); border-radius: 8px; font-style: italic;';
-        explanationDiv.innerHTML = `<strong>AI Story:</strong> ${storyExplanation}`;
+        // The explanation is LLM output (or pasted text): never insert it as HTML.
+        const label = document.createElement('strong');
+        label.textContent = 'AI Story:';
+        explanationDiv.append(label, ` ${storyExplanation}`);
         elements.resultsContainer.appendChild(explanationDiv);
     }
 
@@ -3551,20 +3284,14 @@ function displayStorySegments(segments, storyExplanation) {
         addSegmentResult(segmentData, index + 1);
     });
 
-    // Auto-add all segments to timeline
-    console.log(`[Client] Auto-adding ${segments.length} story segments to timeline`);
-    setTimeout(() => {
-        const containers = document.querySelectorAll('.phrase-container');
-        containers.forEach(container => {
-            handleAddContainerToTimeline(container);
-        });
-    }, 500);
+    // A story is meant to be watched in order: put its segments on the timeline right away
+    addAllMatchesToTimeline();
 }
 
 function handleStartOver() {
-    searchCounter = 0;
     sentenceSearchCounter = 0;
     globalPhraseContainerIDCounter = 0;
+    cancelActiveSearch();
     stopClipPlayback();
     hideFloatingPreview();
     if (mainStage) {
@@ -3724,8 +3451,10 @@ function describeMatch(file, phrase) {
         ? (ref.originalEnd - ref.originalStart) * 1000
         : Number.parseFloat(info.duration_ms);
     durationMs = Number.isFinite(durationMs) && durationMs > 0 ? durationMs : null;
-    const defaultTrim = silence ? 0 : DEFAULT_TRIM_MS;
-    const trims = clampTrims(defaultTrim, defaultTrim, durationMs || 0);
+    // The server reports how much padding surrounds the match: less than the default when the match sits at
+    // the very start or end of the video, where the default trim would cut into the words.
+    const padding = value => (silence ? 0 : (Number.isFinite(value) && value >= 0 ? value : DEFAULT_TRIM_MS));
+    const trims = clampTrims(padding(info.lead_ms), padding(info.tail_ms), durationMs || 0);
     return {
         ...ref,
         startTrim: trims.start,
@@ -4187,72 +3916,7 @@ async function loadSentences() {
         ? data.sentences.map(normalizeCorpusEntry).filter(Boolean)
         : [];
     buildCombinedTranscriptions(); // Build combined transcriptions after loading
-    updateAutocomplete();
     return sentences.length;
-}
-
-function updateAutocomplete() {
-    if (!elements.inputText || !elements.suggestions) {
-        return;
-    }
-
-    const inputValue = elements.inputText.value.trim();
-    const normalizedInput = inputValue.toLowerCase();
-    elements.suggestions.innerHTML = '';
-
-    if (!normalizedInput) {
-        return;
-    }
-
-    const MAX_SUGGESTIONS = 100;
-    let count = 0;
-
-    sentences.forEach(entry => {
-        if (count >= MAX_SUGGESTIONS) {
-            return;
-        }
-        if (!entry || !entry.currentNormalized) {
-            return;
-        }
-        // Use includes for contains matching (match anywhere in sentence)
-        if (!entry.currentNormalized.includes(normalizedInput)) {
-            return;
-        }
-        const suggestion = document.createElement('div');
-        suggestion.classList.add('suggestion-item');
-
-        const prevHtml = entry.prev ? `<span class="context">${escapeHtml(entry.prev)}</span> ` : '';
-        const nextHtml = entry.next ? ` <span class="context">${escapeHtml(entry.next)}</span>` : '';
-        const highlightedCurrent = highlightPrefixMatch(entry.current, inputValue);
-        
-        // Add source file info if available
-        let sourceHtml = '';
-        if (entry.source) {
-            const fileName = entry.source.split('/').pop() || entry.source;
-            sourceHtml = `<span class="suggestion-source">${fileName}</span>`;
-        }
-
-        suggestion.innerHTML = `${prevHtml}${highlightedCurrent}${nextHtml}${sourceHtml}`;
-        suggestion.addEventListener('click', () => selectSuggestion(entry.current));
-        elements.suggestions.appendChild(suggestion);
-        count++;
-    });
-}
-
-function selectSuggestion(sentence) {
-    if (!elements.inputText) {
-        return;
-    }
-    elements.inputText.value = sentence;
-    if (elements.suggestions) {
-        elements.suggestions.innerHTML = '';
-    }
-    if (elements.sentenceInput) {
-        elements.sentenceInput.value = sentence;
-        updateProjectData(data => {
-            data.currentSentence = sentence;
-        });
-    }
 }
 
 // Sentence autocomplete functions
@@ -6306,31 +5970,10 @@ function mergeTimeline() {
                 const failure = await response.json().catch(() => ({}));
                 throw new Error(failure.error || `HTTP error! status: ${response.status}`);
             }
-            const reader = response.body.getReader();
-            const decoder = new TextDecoder();
-            let buffer = '';
-            while (!finished) {
-                const { done, value } = await reader.read();
-                buffer += decoder.decode(value || new Uint8Array(), { stream: !done });
-                const lines = buffer.split('\n');
-                buffer = done ? '' : (lines.pop() || '');
-                for (const line of lines) {
-                    if (!line.startsWith('data: ')) {
-                        continue;
-                    }
-                    try {
-                        handleEvent(JSON.parse(line.substring(6)));
-                    } catch (error) {
-                        console.error('[Merge] Error parsing SSE data:', error, line);
-                    }
-                    if (finished) {
-                        break;
-                    }
-                }
-                if (done) {
-                    break;
-                }
-            }
+            await readEventStream(response, data => {
+                handleEvent(data);
+                return !finished;
+            });
             if (!finished) {
                 finish();
                 alert('Error merging videos: the server closed the connection before the merge finished.');

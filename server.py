@@ -12,11 +12,11 @@ import traceback
 import unicodedata
 import uuid
 from collections import OrderedDict
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import CancelledError, ThreadPoolExecutor, as_completed
 from datetime import datetime
 from fractions import Fraction
 from pathlib import Path
-from threading import Lock, RLock, Semaphore
+from threading import Event, Lock, RLock, Semaphore
 from typing import List, Optional, Sequence, Tuple
 
 from flask import Flask, jsonify, render_template, request, send_from_directory, Response, stream_with_context
@@ -42,6 +42,10 @@ SKIP_LOCK = Lock()
 # Track cancelled searches
 CANCELLED_SEARCHES = set()  # Format: set of search_id strings
 CANCEL_LOCK = Lock()
+
+
+class SearchCancelled(Exception):
+    """The user cancelled the running search."""
 
 # GPU encoder detection cache (initialized at startup)
 _GPU_ENCODER_CACHE = None
@@ -382,6 +386,17 @@ def write_projects(projects):
         write_json_store(PROJECTS_FILE, 'projects', projects)
 
 
+def library_files_only(files):
+    """Keep the client-supplied video paths that exist inside a library root (the strings are kept as sent)."""
+    if not isinstance(files, list):
+        return []
+    return [path for path in files if isinstance(path, str) and resolve_source_video(path)]
+
+
+def clamp_max_results(value):
+    return max(1, min(sanitize_int(value, 25), MAX_RESULTS_PER_SEGMENT_LIMIT))
+
+
 def request_json_object():
     """The request body as a dict ({} for missing, malformed or non-object JSON)."""
     data = request.get_json(silent=True)
@@ -598,8 +613,7 @@ OLLAMA_TIMEOUT = 120
 
 DEFAULT_CLIP_START_PADDING = 0.45
 DEFAULT_CLIP_END_PADDING = 0.45
-MAX_CLIPS_PER_SEGMENT = 25
-CLIP_METADATA_FILENAME = 'metadata.json'
+MAX_RESULTS_PER_SEGMENT_LIMIT = 1000
 
 # Merge output format. None = follow the timeline (most common source resolution / frame rate), so portrait or
 # 720p libraries are not cropped or upscaled. Overridden by --merge-resolution / --merge-fps.
@@ -609,10 +623,8 @@ MERGE_FPS = None
 
 @app.route("/get_sentences", methods=['POST'])
 def get_sentences():
-    payload = request.json or {}
-    selected_files = payload.get('files', [])
-    if not isinstance(selected_files, list):
-        selected_files = []
+    payload = request_json_object()
+    selected_files = library_files_only(payload.get('files'))
 
     corpus_entries = []
 
@@ -655,68 +667,22 @@ def get_files():
     return jsonify(file_list)
 
 
-@app.route('/search', methods=['POST'])
-def search():
-    data = request.json or {}
-    counter = sanitize_int(data.get('searchCounter'), 0)
-    selected_files = data.get('files', [])
-    phrases = data.get('phrases', [])
-    min_silence, max_silence = extract_silence_preferences(data)
-    silence_word_threshold = sanitize_int(data.get('silenceWordThreshold'), 2)
-    results = process_videos(
-        selected_files,
-        phrases,
-        counter,
-        min_silence=min_silence,
-        max_silence=max_silence,
-        silence_word_threshold=max(silence_word_threshold, 1)
-    )
-    return jsonify(results)
-
-
-@app.route('/search_longest_segments', methods=['POST'])
-def search_longest_segments():
-    data = request.json or {}
-    counter = sanitize_int(data.get('sentenceSearchCounter'), 0)
-    selected_files = data.get('files', [])
-    sentence = (data.get('sentence') or '').strip()
-    if not sentence:
-        return jsonify([])
-
-    min_silence, max_silence = extract_silence_preferences(data)
-    silence_word_threshold = sanitize_int(data.get('silenceWordThreshold'), 2)
-
-    matches = find_and_export_longest_matches(
-        sentence,
-        selected_files,
-        counter,
-        export_clips=True,
-        clip_group=generate_clip_group_name('sentence', sentence, selected_files),
-        min_silence=min_silence,
-        max_silence=max_silence,
-        silence_word_threshold=max(silence_word_threshold, 1)
-    )
-    print(f"Matches found: {matches}")
-    response = format_matches_response(matches)
-
-    return jsonify(response)
-
-
 @app.route('/skip_segment', methods=['POST'])
 def skip_segment():
     """
     Endpoint to signal that a segment should be skipped during processing.
     """
-    data = request.json or {}
+    data = request_json_object()
     search_id = data.get('search_id')
     segment_phrase = data.get('segment_phrase')
     
-    if not search_id or not segment_phrase:
+    if not isinstance(search_id, str) or not isinstance(segment_phrase, str) or not search_id or not segment_phrase:
         return jsonify({'error': 'Missing search_id or segment_phrase'}), 400
     
+    # Only running searches have an entry: flags for finished searches would never be cleaned up.
     with SKIP_LOCK:
         if search_id not in SKIP_SEGMENTS:
-            SKIP_SEGMENTS[search_id] = set()
+            return jsonify({'error': 'This search is not running any more'}), 404
         SKIP_SEGMENTS[search_id].add(segment_phrase)
     
     print(f"[Skip] ⏭️  Marked segment for skip: '{segment_phrase[:50]}...' (search_id: {search_id})")
@@ -728,12 +694,17 @@ def cancel_search():
     """
     Endpoint to signal that an entire search should be cancelled immediately.
     """
-    data = request.json or {}
+    data = request_json_object()
     search_id = data.get('search_id')
     
-    if not search_id:
+    if not isinstance(search_id, str) or not search_id:
         return jsonify({'error': 'Missing search_id'}), 400
     
+    # A cancel that arrives after its search has ended must not linger and abort a later search with the same id.
+    with SKIP_LOCK:
+        running = search_id in SKIP_SEGMENTS
+    if not running:
+        return jsonify({'error': 'This search is not running any more'}), 404
     with CANCEL_LOCK:
         CANCELLED_SEARCHES.add(search_id)
     
@@ -853,9 +824,10 @@ def generate_story_prompt():
     Generate the LLM prompt without calling Ollama.
     Returns the prompt that would be sent to the LLM.
     """
-    data = request.json or {}
-    prompt = data.get('prompt', '').strip()
-    selected_files = data.get('files', [])
+    data = request_json_object()
+    prompt = data.get('prompt') if isinstance(data.get('prompt'), str) else ''
+    prompt = prompt.strip()
+    selected_files = library_files_only(data.get('files'))
     max_segments = sanitize_int(data.get('maxSegments'), 10)
     
     if not prompt:
@@ -878,9 +850,10 @@ def generate_story():
     """
     import requests
     
-    data = request.json or {}
-    prompt = data.get('prompt', '').strip()
-    selected_files = data.get('files', [])
+    data = request_json_object()
+    prompt = data.get('prompt') if isinstance(data.get('prompt'), str) else ''
+    prompt = prompt.strip()
+    selected_files = library_files_only(data.get('files'))
     max_segments = sanitize_int(data.get('maxSegments'), 10)
     prefer_long_segments = data.get('preferLongSegments', True)
     debug_mode = data.get('debugMode', False)  # Enable debug logging
@@ -1161,25 +1134,25 @@ def search_longest_segments_stream():
     SSE endpoint that streams search results incrementally, one segment at a time.
     Handles multiple comma-separated search queries by searching each one separately.
     """
-    data = request.json or {}
+    data = request_json_object()
     counter = sanitize_int(data.get('sentenceSearchCounter'), 0)
-    selected_files = data.get('files', [])
-    
-    # Get the sentence groups if provided, otherwise fall back to single sentence
-    sentence_groups = data.get('sentence_groups', [])
-    if not sentence_groups:
-        sentence = (data.get('sentence') or '').strip()
-        if sentence:
-            sentence_groups = [s.strip() for s in sentence.split(',') if s.strip()]
-    
-    if not sentence_groups:
-        return Response('data: {"done": true}\n\n', mimetype='text/event-stream')
+    selected_files = library_files_only(data.get('files'))
+
+    # One search per group. The client splits its input on ';'; a bare `sentence` is searched as a whole
+    # (splitting it on commas cut story segments such as "Well, I think so" into fragments).
+    sentence_groups = data.get('sentence_groups')
+    if not isinstance(sentence_groups, list):
+        sentence_groups = [data.get('sentence')]
+    sentence_groups = [group.strip() for group in sentence_groups if isinstance(group, str) and group.strip()]
+
+    if not sentence_groups or not selected_files:
+        return Response('data: {"done": true, "total_segments": 0, "total_skipped": 0}\n\n', mimetype='text/event-stream')
 
     min_silence, max_silence = extract_silence_preferences(data)
     silence_word_threshold = sanitize_int(data.get('silenceWordThreshold'), 2)
-    include_partial_matches = data.get('includePartialMatches', False)
-    all_partial_matches = data.get('allPartialMatches', False)
-    max_results_per_segment = sanitize_int(data.get('maxResultsPerSegment'), 25)
+    include_partial_matches = bool(data.get('includePartialMatches', False))
+    all_partial_matches = bool(data.get('allPartialMatches', False))
+    max_results_per_segment = clamp_max_results(data.get('maxResultsPerSegment'))
     
     def generate():
         total_segment_count = 0
@@ -1193,9 +1166,12 @@ def search_longest_segments_stream():
             clip_group = generate_clip_group_name('sentence', sentence, selected_files)
             search_id = f"{counter}_{clip_group}"  # Unique ID for this search
             
-            # Clean up skip list for this search when starting
+            # Fresh skip/cancel state for this search (ids repeat after a page reload, so a cancel that
+            # arrived after the previous search with this id had ended must not abort this one)
             with SKIP_LOCK:
                 SKIP_SEGMENTS[search_id] = set()
+            with CANCEL_LOCK:
+                CANCELLED_SEARCHES.discard(search_id)
             
             if not include_partial_matches:
                 mode_str = "full match only"
@@ -1255,6 +1231,13 @@ def search_longest_segments_stream():
                 
                 print(f"[SSE] [{group_index}/{len(sentence_groups)}] ✓ Search completed - {segment_count} segments, {skipped_count} skipped")
                 
+            except SearchCancelled:
+                print(f"[SSE] ❌ Search cancelled by the user after {total_segment_count} segments")
+                try:
+                    yield f'data: {json.dumps({"done": True, "cancelled": True, "total_segments": total_segment_count, "total_skipped": total_skipped_count})}\n\n'
+                except (GeneratorExit, BrokenPipeError, ConnectionError):
+                    pass
+                return
             except Exception as e:
                 print(f"[SSE] ❌ Error in search for '{sentence}': {e}")
                 traceback.print_exc()
@@ -1281,19 +1264,17 @@ def search_silences_stream():
     """
     SSE endpoint that streams silence search results incrementally, one file at a time.
     """
-    data = request.json or {}
-    selected_files = data.get('files', [])
+    data = request_json_object()
+    selected_files = library_files_only(data.get('files'))
     if not selected_files:
-        return Response('data: {"done": true}\n\n', mimetype='text/event-stream')
+        return Response('data: {"done": true, "total_silences": 0}\n\n', mimetype='text/event-stream')
 
     min_silence = sanitize_float(data.get('minSilence'), 0.0)
     max_silence = sanitize_float(data.get('maxSilence'), 10.0)
     if max_silence < min_silence:
         max_silence = min_silence
 
-    max_results_per_segment = sanitize_int(data.get('maxResultsPerSegment'), 25)
-    if max_results_per_segment <= 0:
-        max_results_per_segment = 25
+    max_results_per_segment = clamp_max_results(data.get('maxResultsPerSegment'))
 
     print(f"[Silence SSE] Searching for silences between {min_silence:.3f}s and {max_silence:.3f}s across {len(selected_files)} file(s)")
 
@@ -1373,6 +1354,7 @@ def search_silences_stream():
 
         # Group silences by duration buckets for display
         buckets = {}
+        source_durations = {}
         for idx, entry in enumerate(all_silence_entries):
             filename = entry['file']
             silence_start = entry['silence_start']
@@ -1384,7 +1366,9 @@ def search_silences_stream():
                     print(f"[Silence SSE] Source video not found: {filename}")
                     continue
 
-                video_duration = get_video_duration(filename)
+                if filename not in source_durations:
+                    source_durations[filename] = get_video_duration(filename)
+                video_duration = source_durations[filename]
                 if video_duration is None:
                     print(f"[Silence SSE] Could not determine video duration for: {filename}")
                     continue
@@ -1395,36 +1379,17 @@ def search_silences_stream():
                     print(f"[Silence SSE] Invalid clip range for silence: start={clip_start}, end={clip_end}, video_duration={video_duration}")
                     continue
 
-                clip_filename = f"{clip_group_name}_{idx:05d}.mp4"
+                clip_filename = clip_file_name(clip_group_name, filename, clip_start, clip_end)
                 output_path = os.path.join(clip_output_dir, clip_filename)
-
-                # Use ffmpeg to export the silence region
-                ffmpeg_cmd = [
-                    'ffmpeg', '-y',
-                    '-ss', str(clip_start),
-                    '-i', filename,
-                    '-t', str(clip_end - clip_start),
-                    '-c:v', 'libx264',
-                    '-c:a', 'aac',
-                    '-ac', '2',  # Force stereo output (fixes mono and 5.1 issues)
-                    output_path
-                ]
-
-                process = subprocess.run(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                if process.returncode != 0:
-                    stderr = process.stderr.decode(errors='ignore') if process.stderr else ''
-                    print(f"[Silence SSE] FFmpeg failed for '{filename}' silence {idx}: {stderr}")
+                try:
+                    render_preview_clip(filename, clip_start, clip_end, output_path)
+                except RuntimeError as exc:
+                    print(f"[Silence SSE] Could not export silence {idx} of '{filename}': {exc}")
                     continue
 
-                if not os.path.exists(output_path):
-                    print(f"[Silence SSE] Exported clip not found at {output_path}")
-                    continue
+                relative_path = posixpath.join('temp', clip_output_dir_name, clip_filename)
+                clip_duration_ms = round((clip_end - clip_start) * 1000)
 
-                relative_path = posixpath.join('temp', clip_output_dir_name, os.path.basename(output_path))
-
-                # Get the actual duration of the exported clip
-                clip_duration_ms = get_video_duration_ms(output_path) if os.path.exists(output_path) else None
-                
                 # Determine bucket label
                 duration = gap
                 if duration < 1:
@@ -1460,11 +1425,11 @@ def search_silences_stream():
 
                 buckets[label]['files'].append(file_data)
 
-                # Stream this bucket as a result (only when first file is added, or periodically)
-                # Send update for this bucket
+                # Stream only the new clip: the client appends it to the bucket's card. (Re-sending the
+                # whole bucket after every clip was quadratic in the number of results.)
                 result = {
                     'phrase': label,
-                    'files': buckets[label]['files'].copy(),  # Send current state
+                    'files': [file_data],
                     'word_count': 0  # Silences don't have word count
                 }
                 
@@ -1489,65 +1454,18 @@ def search_silences_stream():
 
 
 
-def format_matches_response(matches):
-    if not matches:
-        return []
-
-    grouped_matches = {}
-    ordered_segments = []
-
-    def register_match(segment, file_reference, source_video=None, duration_ms=None):
-        if not segment or not file_reference:
-            return
-        if segment not in grouped_matches:
-            grouped_matches[segment] = []
-            ordered_segments.append(segment)
-        
-        # Create match object with source video info and duration
-        match_obj = {'file': file_reference}
-        if source_video:
-            match_obj['source_video'] = source_video
-        if duration_ms is not None:
-            match_obj['duration_ms'] = duration_ms
-        
-        # Avoid duplicates
-        if not any(m.get('file') == file_reference for m in grouped_matches[segment]):
-            grouped_matches[segment].append(match_obj)
-
-    def handle_entry(entry):
-        if isinstance(entry, dict):
-            register_match(entry.get('segment'), entry.get('file'), entry.get('source_video'), entry.get('duration_ms'))
-        elif isinstance(entry, (list, tuple, set)):
-            for nested_entry in entry:
-                handle_entry(nested_entry)
-
-    handle_entry(matches)
-
-    # Apply MAX_CLIPS_PER_SEGMENT limit per segment/phrase card
-    # This ensures each card shows up to 25 matches, but all segments are included
-    result = []
-    for segment in ordered_segments:
-        files = grouped_matches[segment]
-        # Sort by length (longest segments first) to prioritize better matches
-        segment_word_count = len(segment.split())
-        # Limit each segment to MAX_CLIPS_PER_SEGMENT matches
-        limited_files = files[:MAX_CLIPS_PER_SEGMENT]
-        result.append({
-            'phrase': segment, 
-            'files': limited_files,
-            'word_count': segment_word_count  # For potential frontend sorting
-        })
-    
-    # Sort results by segment length (longest first) for better UX
-    result.sort(key=lambda x: x.get('word_count', 0), reverse=True)
-    
-    return result
+# Phones type ’ and –, transcripts usually contain ' and -: treat them as the same character when matching.
+_TOKEN_PUNCTUATION = str.maketrans({
+    '\u2019': "'", '\u2018': "'", '\u02bc': "'", '\u00b4': "'", '`': "'",
+    '\u2010': '-', '\u2011': '-', '\u2012': '-', '\u2013': '-', '\u2014': '-',
+    '\u00ad': None,
+})
 
 
 def normalize_token(token):
     if not isinstance(token, str):
         return ''
-    normalized = unicodedata.normalize('NFKC', token).lower().strip()
+    normalized = unicodedata.normalize('NFKC', token).casefold().translate(_TOKEN_PUNCTUATION).strip()
     if not normalized:
         return ''
     normalized = re.sub(r'^[\W_]+', '', normalized)
@@ -1643,17 +1561,6 @@ def extract_silence_preferences(payload, default_min=0.0, default_max=10.0):
     return min_silence, max_silence
 
 
-def _collect_name_variants(video_path: Path) -> List[str]:
-    parts = video_path.name.split('.')
-    variants: List[str] = []
-    total = len(parts)
-    for index in range(total):
-        candidate = '.'.join(parts[: total - index])
-        if candidate and candidate not in variants:
-            variants.append(candidate)
-    return variants
-
-
 def _find_related_files(video_path: str, extensions: Sequence[str]) -> List[Path]:
     source_path = Path(video_path)
     parent = source_path.parent
@@ -1703,7 +1610,80 @@ def _load_json_transcript(path: Path) -> Optional[List[dict]]:
     return data
 
 
+class WordIndex:
+    """All timed words of a transcript in spoken order, plus a token -> positions lookup for matching."""
+
+    __slots__ = ('words', 'positions')
+
+    def __init__(self, sentences):
+        self.words = []
+        self.positions = {}
+        for sentence in sentences or []:
+            if not isinstance(sentence, dict):
+                continue
+            for word in sentence.get('words') or []:
+                if not isinstance(word, dict):
+                    continue
+                start_time = word.get('start')
+                end_time = word.get('end')
+                token = normalize_token(word.get('word', ''))
+                if token and start_time is not None and end_time is not None:
+                    self.positions.setdefault(token, []).append(len(self.words))
+                    self.words.append({
+                        'word': word.get('word', ''),
+                        'normalized_word': token,
+                        'start': start_time,
+                        'end': end_time
+                    })
+
+
+_TRANSCRIPT_CACHE = OrderedDict()   # video path -> (signature, sentences, WordIndex)
+_TRANSCRIPT_CACHE_LOCK = Lock()
+TRANSCRIPT_CACHE_FILES = 512
+
+
+def _transcript_signature(video_path):
+    """Identity of the JSON transcript next to a video (None while there is none)."""
+    json_path = Path(video_path).with_suffix('.json')
+    try:
+        stat = json_path.stat()
+    except OSError:
+        return None
+    return (str(json_path), stat.st_mtime_ns, stat.st_size)
+
+
+def _cached_transcript(video_path):
+    """(sentences, WordIndex) for a video, re-read only when its transcript file changes."""
+    signature = _transcript_signature(video_path)
+    with _TRANSCRIPT_CACHE_LOCK:
+        cached = _TRANSCRIPT_CACHE.get(video_path)
+        if cached and signature is not None and cached[0] == signature:
+            _TRANSCRIPT_CACHE.move_to_end(video_path)
+            return cached[1], cached[2]
+    sentences = _read_transcript_sentences(video_path)
+    if not sentences:
+        return None, None
+    index = WordIndex(sentences)
+    signature = _transcript_signature(video_path)   # a subtitle conversion may just have written the JSON
+    if signature is not None:
+        with _TRANSCRIPT_CACHE_LOCK:
+            _TRANSCRIPT_CACHE[video_path] = (signature, sentences, index)
+            _TRANSCRIPT_CACHE.move_to_end(video_path)
+            while len(_TRANSCRIPT_CACHE) > TRANSCRIPT_CACHE_FILES:
+                _TRANSCRIPT_CACHE.popitem(last=False)
+    return sentences, index
+
+
 def load_transcript_sentences(video_path: str) -> Optional[List[dict]]:
+    """Transcript segments of a video (cached; callers must not modify the returned list)."""
+    return _cached_transcript(video_path)[0]
+
+
+def load_word_index(video_path: str) -> Optional[WordIndex]:
+    return _cached_transcript(video_path)[1]
+
+
+def _read_transcript_sentences(video_path: str) -> Optional[List[dict]]:
     # First, try to find and load JSON files (preferred format)
     json_candidates = _find_related_files(video_path, ['.json'])
     for json_path in json_candidates:
@@ -1787,34 +1767,6 @@ def extract_sentences_from_segments(segments: Sequence[dict]) -> List[str]:
         sentences_list.append(sentence_text)
 
     return sentences_list
-
-
-def process_videos(selected_files, phrases, counter, min_silence=0.0, max_silence=10.0, silence_word_threshold=2):
-    results = []
-
-    for index, phrase in enumerate(phrases):
-        cleaned_phrase = phrase.strip()
-        if not cleaned_phrase:
-            continue
-
-        matches = find_and_export_longest_matches(
-            cleaned_phrase,
-            selected_files,
-            counter,
-            export_clips=True,
-            clip_group=generate_clip_group_name('phrase', cleaned_phrase, selected_files),
-            min_silence=min_silence,
-            max_silence=max_silence,
-            silence_word_threshold=silence_word_threshold
-        )
-
-        grouped_matches = format_matches_response(matches)
-        if not grouped_matches:
-            continue
-
-        results.extend(grouped_matches)
-
-    return results
 
 
 def _merge_output_name(titles):
@@ -1902,6 +1854,129 @@ def merge_videos_stream():
 
 
 
+# ---------------------------------------------------------------------------------------------------------
+# Preview clip export
+# ---------------------------------------------------------------------------------------------------------
+
+def compute_clip_bounds(match_start, match_end, video_duration):
+    """Padded clip bounds for a match, clamped to the file. Returns (clip_start, clip_end) in source seconds."""
+    clip_start = max(match_start - DEFAULT_CLIP_START_PADDING, 0.0)
+    clip_end = match_end + DEFAULT_CLIP_END_PADDING
+    clip_start = min(clip_start, max(video_duration - 0.1, 0.0))   # leave at least 0.1 s
+    clip_end = min(clip_end, video_duration)
+    if clip_end <= clip_start:
+        wanted = max(match_end - match_start, 0.0) + DEFAULT_CLIP_START_PADDING + DEFAULT_CLIP_END_PADDING
+        clip_end = min(clip_start + max(wanted, 0.1), video_duration)
+    if clip_start >= clip_end:
+        raise ValueError(f"Invalid clip range: start={clip_start}, end={clip_end}, video_duration={video_duration}")
+    return clip_start, clip_end
+
+
+def clip_file_name(clip_group_name, source, clip_start, clip_end):
+    """Name a clip after what it contains (source + bounds, millisecond precision).
+
+    A path therefore always denotes the same cut: repeating a search with other options cannot change what an
+    existing timeline entry shows, and an identical cut is rendered only once.
+    """
+    key = hashlib.md5(f'{source}|{clip_start:.3f}|{clip_end:.3f}'.encode('utf-8')).hexdigest()[:16]
+    return f'{clip_group_name}_{key}.mp4'
+
+
+GPU_FAILURE_MARKERS = (
+    'nvenc', 'no capable devices', 'incompatible client key', 'openencodesessionex failed', 'no device',
+    'failed to initialize', 'error while opening encoder', 'could not open encoder', 'encoder initialization',
+    'invalid parameter',
+)
+
+
+def _clip_export_command(source_path, clip_start, clip_end, fps, video_args, output_path):
+    return [
+        'ffmpeg', '-v', 'error', '-nostdin', '-y',
+        '-ss', f'{clip_start:.6f}', '-i', source_path, '-t', f'{clip_end - clip_start:.6f}',
+        *video_args,
+        '-c:a', 'aac', '-ac', '2',   # stereo: mono and 5.1 sources otherwise play wrong in browsers
+        '-r', str(fps),
+        '-f', 'mp4', output_path,
+    ]
+
+
+def render_preview_clip(source_path, clip_start, clip_end, output_path, should_abort=None):
+    """Cut ``[clip_start, clip_end)`` of a library video into a browser-playable preview clip.
+
+    Uses the GPU encoder while a slot is free (the slot is held for the whole encode, so --gpustreams is
+    honoured) and libx264 otherwise or when the GPU encode fails. The clip appears at ``output_path`` only when
+    it is complete. Raises RuntimeError with a readable message on failure.
+    """
+    if os.path.isfile(output_path) and os.path.getsize(output_path) > 0:
+        return
+    fps = get_video_fps(source_path) or 25
+    partial_path = f'{output_path}.{uuid.uuid4().hex}.partial'
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
+    def run(video_args):
+        command = _clip_export_command(source_path, clip_start, clip_end, fps, video_args, partial_path)
+        process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        try:
+            deadline = 300.0
+            while True:
+                try:
+                    _, stderr = process.communicate(timeout=0.25)
+                    return process.returncode, (stderr or b'').decode(errors='ignore')
+                except subprocess.TimeoutExpired:
+                    deadline -= 0.25
+                    if deadline <= 0 or (should_abort and should_abort()):
+                        process.kill()
+                        process.communicate()
+                        return -1, 'aborted' if deadline > 0 else 'ffmpeg timed out'
+        finally:
+            if process.poll() is None:
+                process.kill()
+
+    try:
+        gpu_encoder, gpu_args = get_gpu_encoder()
+        returncode, stderr = None, ''
+        if gpu_encoder and GPU_ENCODING_SEMAPHORE and GPU_ENCODING_SEMAPHORE.acquire(blocking=False):
+            try:
+                returncode, stderr = run(['-c:v', gpu_encoder, *(gpu_args or [])])
+                if returncode == 244 and 'nvenc' in gpu_encoder:
+                    # "Invalid parameter": some driver/ffmpeg combinations only accept the plain preset.
+                    returncode, stderr = run(['-c:v', gpu_encoder, '-preset', 'p4'])
+            finally:
+                GPU_ENCODING_SEMAPHORE.release()
+            if returncode not in (0, -1):
+                lowered = stderr.lower()
+                if returncode in (187, 244) or any(marker in lowered for marker in GPU_FAILURE_MARKERS):
+                    print(f"[GPU] {gpu_encoder} failed (code {returncode}): {stderr.strip()[-300:]}")
+                    disable_gpu_encoder()
+                returncode = None     # retry on the CPU below
+        if returncode is None:
+            returncode, stderr = run(['-c:v', 'libx264', '-preset', 'ultrafast'])
+        if returncode != 0 or not os.path.isfile(partial_path) or os.path.getsize(partial_path) == 0:
+            detail = stderr.strip().splitlines()[-1:] or ['ffmpeg produced no output']
+            raise RuntimeError(detail[0][:300])
+        os.replace(partial_path, output_path)
+    finally:
+        if os.path.exists(partial_path):
+            try:
+                os.remove(partial_path)
+            except OSError:
+                pass
+
+
+def interleave_by_file(items):
+    """Round-robin over the source files so a limited result list is spread across the selected videos."""
+    by_file = OrderedDict()
+    for item in items:
+        by_file.setdefault(item['file'], []).append(item)
+    mixed = []
+    queues = [list(group) for group in by_file.values()]
+    while queues:
+        for queue in queues:
+            mixed.append(queue.pop(0))
+        queues = [queue for queue in queues if queue]
+    return mixed
+
+
 def find_and_export_longest_matches_incremental(
     input_sentence,
     filenames,
@@ -1922,101 +1997,42 @@ def find_and_export_longest_matches_incremental(
     If include_partial_matches is False (default), only returns the full input_sentence match.
     If include_partial_matches is True, returns all sub-segments found.
     """
-    global_clip_counter = 0
     clip_output_dir = None
     clip_output_dir_name = None
     clip_group_name = clip_group or generate_clip_group_name('segment', input_sentence, filenames)
     silence_word_threshold = max(silence_word_threshold, 1)
-    skip_export = False
-    clip_metadata_path = None
-    cached_clip_files = []
-    cached_clip_index = 0
+    max_results_per_segment = max(1, max_results_per_segment)
 
     if export_clips:
+        # Clips are named after their content (see clip_file_name), so the folder is only ever added to.
         clip_output_dir_name = f'{clip_group_name}_clips'
         clip_output_dir = os.path.join(TEMP_DIR, clip_output_dir_name)
-        clip_metadata_path = os.path.join(clip_output_dir, CLIP_METADATA_FILENAME)
-        current_metadata = {
-            'version': 1,
-            'source_files': sorted(map(str, filenames)),
-            'input_sentence': input_sentence,
-            'max_results': max_results_per_segment
-        }
-        stored_metadata = None
-        if os.path.exists(clip_metadata_path):
-            try:
-                with open(clip_metadata_path, 'r', encoding='utf-8') as metadata_file:
-                    stored_metadata = json.load(metadata_file)
-            except (OSError, json.JSONDecodeError):
-                stored_metadata = None
+        os.makedirs(clip_output_dir, exist_ok=True)
 
-        if stored_metadata and stored_metadata.get('source_files') == current_metadata['source_files']:
-            skip_export = True
-            if os.path.isdir(clip_output_dir):
-                try:
-                    cached_clip_files = sorted(
-                        [
-                            name for name in os.listdir(clip_output_dir)
-                            if name.lower().endswith('.mp4')
-                        ]
-                    )
-                except OSError:
-                    cached_clip_files = []
-                if cached_clip_files:
-                    verified_clip_files = []
-                    for cached_name in cached_clip_files:
-                        cached_path = os.path.join(clip_output_dir, cached_name)
-                        if os.path.isfile(cached_path):
-                            verified_clip_files.append(cached_name)
-                    if len(verified_clip_files) != len(cached_clip_files):
-                        cached_clip_files = verified_clip_files
-                        if not cached_clip_files:
-                            skip_export = False
-                            shutil.rmtree(clip_output_dir, ignore_errors=True)
-            else:
-                skip_export = False
-                cached_clip_files = []
-        else:
-            if os.path.isdir(clip_output_dir):
-                shutil.rmtree(clip_output_dir)
-            os.makedirs(clip_output_dir, exist_ok=True)
+    def is_cancelled():
+        if not search_id:
+            return False
+        with CANCEL_LOCK:
+            return search_id in CANCELLED_SEARCHES
 
-        if skip_export:
-            required_count = min(len(cached_clip_files), max_results_per_segment)
-            if required_count == 0:
-                skip_export = False
-                shutil.rmtree(clip_output_dir, ignore_errors=True)
-                os.makedirs(clip_output_dir, exist_ok=True)
-                cached_clip_files = []
-            else:
-                cached_clip_files = cached_clip_files[:max_results_per_segment]
+    def is_skipped(segment):
+        if not search_id:
+            return False
+        with SKIP_LOCK:
+            return segment in SKIP_SEGMENTS.get(search_id, set())
 
     # First, search ALL files and collect ALL matches
     all_file_matches = []
     for filename in filenames:
-        sentences = load_transcript_sentences(filename)
-        # Skip files without valid transcript data
-        if not sentences:
-            continue
-        # Validate that we have actual transcript segments with content
-        if not isinstance(sentences, list) or len(sentences) == 0:
-            continue
-        # Check that at least one segment has actual content
-        has_valid_content = False
-        for segment in sentences:
-            if isinstance(segment, dict):
-                content = segment.get('content', '')
-                words = segment.get('words', [])
-                if (isinstance(content, str) and content.strip()) or (isinstance(words, list) and len(words) > 0):
-                    has_valid_content = True
-                    break
-        if not has_valid_content:
+        if is_cancelled():
+            raise SearchCancelled()
+        # Word index of the transcript (cached); files without word timings cannot be matched
+        sentences = load_word_index(filename)
+        if not sentences or not sentences.words:
             continue
 
-        # Optimize: if only full matches needed, only search for the full sentence
-        # This avoids searching all substrings like "aber", "das", etc.
         if not include_partial_matches:
-            # Only search for the exact full sentence, not all substrings
+            # Only the exact full sentence, not all sub-phrases
             matches = find_matches_for_segment(
                 input_sentence,
                 sentences,
@@ -2024,26 +2040,15 @@ def find_and_export_longest_matches_incremental(
                 max_duration=max_silence,
                 silence_word_threshold=silence_word_threshold
             )
-            # Wrap in the expected format (find_matches_for_segment already returns the right format)
-        elif not all_partial_matches:
-            # Include partial matches but filter out very short ones during search
-            # Only search for segments that are 3+ words or are the full sentence
-            matches = find_longest_matches_filtered(
-                input_sentence,
-                sentences,
-                min_silence=min_silence,
-                max_silence=max_silence,
-                silence_word_threshold=silence_word_threshold,
-                min_words=3  # Minimum word count for partial matches
-            )
         else:
-            # All partial matches - search everything
+            # Sub-phrases too; very short ones (< 3 words) only when "all partial matches" is on
             matches = find_longest_matches(
                 input_sentence,
                 sentences,
                 min_silence=min_silence,
                 max_silence=max_silence,
-                silence_word_threshold=silence_word_threshold
+                silence_word_threshold=silence_word_threshold,
+                min_words=1 if all_partial_matches else 3
             )
 
         if matches:
@@ -2208,1261 +2213,233 @@ def find_and_export_longest_matches_incremental(
                 print(f"Total matches found: {total_found} across {len(all_file_matches)} video(s)")
                 print(f"Processing {len(segment_groups)} unique segments (including all partial matches), max {max_results_per_segment} per segment")
     
-    # Use cached GPU encoder (detected at startup)
-    gpu_encoder, gpu_args = get_gpu_encoder()
-    
-    def render_single_clip(clip_data):
-        """
-        Render a single clip. Returns (success, output_path, error) tuple.
-        This function is designed to be called in parallel.
-        """
-        clip_idx, item, clip_filename, output_path = clip_data
-        filename = item['file']
+    duration_cache = {}
+
+    def plan_clip(index, item):
+        """Where to cut and where to put it. Raises ValueError/FileNotFoundError with a readable message."""
+        source = item['file']
         match = item['match']
-        
-        try:
-            # Validate file exists
-            if not os.path.exists(filename):
-                raise FileNotFoundError(f"Video file not found: {filename}")
-            
-            match_start = sanitize_float(match.get('start'), 0.0)
-            match_end = sanitize_float(match.get('end'), match_start)
-            
-            # Validate that we have valid start and end times
-            if match_start is None or match_end is None:
-                raise ValueError(f"Invalid time values: start={match.get('start')}, end={match.get('end')}")
-            
-            # Get video duration to clamp clip times
-            video_duration = get_video_duration(filename)
-            if video_duration is None:
-                raise ValueError(f"Could not determine video duration for: {filename}")
-            
-            clip_start = max(match_start - DEFAULT_CLIP_START_PADDING, 0.0)
-            clip_end = match_end + DEFAULT_CLIP_END_PADDING
-            
-            # Clamp clip_start and clip_end to video duration
-            clip_start = min(clip_start, video_duration - 0.1)  # Leave at least 0.1s
-            clip_end = min(clip_end, video_duration)
-            
-            if clip_end <= clip_start:
-                clip_duration = max(match_end - match_start, 0.0)
-                min_extension = DEFAULT_CLIP_START_PADDING + DEFAULT_CLIP_END_PADDING
-                clip_end = min(clip_start + max(clip_duration + min_extension, 0.1), video_duration)
-            
-            # Final validation
-            if clip_start >= clip_end:
-                raise ValueError(f"Invalid clip range: start={clip_start}, end={clip_end}, video_duration={video_duration}")
-            
-            # Get video fps for proper export
-            video_fps = get_video_fps(filename)
-            if video_fps is None:
-                video_fps = 25
-            
-            # Try to use GPU encoding if available, but respect the concurrent session limit
-            # Use a semaphore to limit GPU encoding to MAX_GPU_STREAMS concurrent sessions
-            # If GPU is not available or semaphore is full, fall back to CPU encoding
-            current_gpu_encoder, current_gpu_args = get_gpu_encoder()
-            use_gpu = False
-            
-            if current_gpu_encoder and GPU_ENCODING_SEMAPHORE:
-                # Try to acquire GPU semaphore (non-blocking check first)
-                if GPU_ENCODING_SEMAPHORE.acquire(blocking=False):
-                    use_gpu = True
-                # If semaphore not available, will use CPU encoding
-            
-            ffmpeg_cmd = ['ffmpeg', '-y']
-            
-            # For NVENC, we don't use -hwaccel cuda by default as it can cause error 244
-            # when the input format doesn't support CUDA decoding. NVENC encoding works
-            # fine without hardware-accelerated decoding - FFmpeg will decode on CPU and
-            # encode on GPU, which is still much faster than full CPU encoding.
-            # If needed, we can add -hwaccel cuda conditionally based on input format detection.
-            
-            ffmpeg_cmd.extend([
-                '-ss', str(clip_start),
-                '-i', filename,
-                '-t', str(clip_end - clip_start),
-                '-c:a', 'aac',
-                '-ac', '2',  # Force stereo output (fixes mono and 5.1 issues)
-                '-r', str(video_fps),
-            ])
-            
-            # Add video encoder (GPU or CPU)
-            try:
-                if use_gpu:
-                    ffmpeg_cmd.extend(['-c:v', current_gpu_encoder])
-                    ffmpeg_cmd.extend(current_gpu_args)
-                else:
-                    ffmpeg_cmd.extend(['-c:v', 'libx264', '-preset', 'ultrafast'])
-            finally:
-                # Always release the semaphore if we acquired it
-                if use_gpu and GPU_ENCODING_SEMAPHORE:
-                    GPU_ENCODING_SEMAPHORE.release()
-            
-            ffmpeg_cmd.append(output_path)
-            
-            # Run ffmpeg
-            result = subprocess.run(
-                ffmpeg_cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                timeout=300  # 5 minute timeout per clip
-            )
-            
-            if result.returncode != 0:
-                stderr = result.stderr.decode() if result.stderr else ''
-                
-                # Log detailed error information for debugging (for both 187 and 244)
-                if current_gpu_encoder and result.returncode in [187, 244]:
-                    error_name = "187 (Encoder Initialization)" if result.returncode == 187 else "244 (Invalid Parameter)"
-                    print(f"[GPU] Error {error_name} for {clip_filename}")
-                    print(f"[GPU] Encoder: {current_gpu_encoder}, Args: {current_gpu_args}")
-                    print(f"[GPU] FFmpeg command: {' '.join(ffmpeg_cmd)}")
-                    
-                    # Check for specific error types and provide helpful messages
-                    if 'incompatible client key' in stderr.lower():
-                        print(f"[GPU] ⚠️  DRIVER/SDK COMPATIBILITY ISSUE DETECTED")
-                        print(f"[GPU] The NVIDIA driver version is incompatible with FFmpeg's NVENC SDK.")
-                        print(f"[GPU] Solutions:")
-                        print(f"[GPU]   1. Update your NVIDIA driver to the latest version")
-                        print(f"[GPU]   2. Or recompile FFmpeg with a compatible NVENC SDK version")
-                        print(f"[GPU]   3. GPU encoding will be disabled and CPU encoding will be used")
-                    
-                    print(f"[GPU] Full error output:")
-                    print("=" * 80)
-                    print(stderr)
-                    print("=" * 80)
-                
-                # Check if it's a GPU-specific error
-                # Return codes 187 and 244 often indicate encoder initialization/parameter failures
-                if current_gpu_encoder and (result.returncode in [187, 244] or any(err.lower() in stderr.lower() for err in [
-                    'nvenc', 'No capable devices', 'incompatible client key', 
-                    'OpenEncodeSessionEx failed', 'No device', 'failed to initialize',
-                    'Error while opening encoder', 'Could not open encoder', 'encoder initialization',
-                    'Invalid parameter', 'invalid parameter'
-                ])):
-                    # Try to fix the issue by using simpler parameters instead of disabling GPU
-                    if result.returncode == 244 and 'nvenc' in current_gpu_encoder.lower():
-                        # Error 244 = Invalid parameter, try with minimal parameters
-                        print(f"[GPU] Attempting to fix error 244 by using minimal NVENC parameters for: {clip_filename}")
-                        ffmpeg_cmd_minimal = ['ffmpeg', '-y']
-                        
-                        # Try without -hwaccel cuda first (some inputs don't support it)
-                        ffmpeg_cmd_minimal.extend([
-                            '-ss', str(clip_start),
-                            '-i', filename,
-                            '-t', str(clip_end - clip_start),
-                            '-c:v', 'h264_nvenc',
-                            '-preset', 'p4',  # Use a more compatible preset
-                            '-c:a', 'aac',
-                            '-ac', '2',  # Force stereo output (fixes mono and 5.1 issues)
-                            '-r', str(video_fps),
-                            output_path
-                        ])
-                        
-                        result_minimal = subprocess.run(
-                            ffmpeg_cmd_minimal,
-                            stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE,
-                            timeout=300
-                        )
-                        
-                        if result_minimal.returncode == 0:
-                            print(f"[GPU] Successfully encoded with minimal parameters: {clip_filename}")
-                            return (True, output_path, None)
-                        else:
-                            stderr_minimal = result_minimal.stderr.decode() if result_minimal.stderr else ''
-                            print(f"[GPU] Minimal parameters also failed (code {result_minimal.returncode}): {stderr_minimal[-500:]}")
-                    
-                    # If we can't fix it, disable GPU and fall back to CPU
-                    disable_gpu_encoder()
-                    # Retry with CPU encoding
-                    print(f"[GPU] GPU encoding failed (code {result.returncode}), retrying with CPU: {clip_filename}")
-                    ffmpeg_cmd_cpu = [
-                        'ffmpeg', '-y',
-                        '-ss', str(clip_start),
-                        '-i', filename,
-                        '-t', str(clip_end - clip_start),
-                        '-c:v', 'libx264',
-                        '-preset', 'ultrafast',
-                        '-c:a', 'aac',
-                        '-ac', '2',  # Force stereo output (fixes mono and 5.1 issues)
-                        '-r', str(video_fps),
-                        output_path
-                    ]
-                    result = subprocess.run(
-                        ffmpeg_cmd_cpu,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.PIPE,
-                        timeout=300
-                    )
-                    if result.returncode != 0:
-                        stderr_cpu = result.stderr.decode() if result.stderr else ''
-                        raise RuntimeError(f"FFmpeg failed with return code {result.returncode}: {stderr_cpu[:500]}")
-                else:
-                    raise RuntimeError(f"FFmpeg failed with return code {result.returncode}: {stderr[:500]}")
-            
-            if not os.path.exists(output_path):
-                raise FileNotFoundError(f"Exported clip not found: {output_path}")
-            
-            return (True, output_path, None)
-        except Exception as e:
-            return (False, None, str(e))
-    
+        if not os.path.exists(source):
+            raise FileNotFoundError(f"Video file not found: {source}")
+        match_start = sanitize_float(match.get('start'), None)
+        match_end = sanitize_float(match.get('end'), match_start)
+        if match_start is None or match_end is None:
+            raise ValueError(f"Invalid time values: start={match.get('start')}, end={match.get('end')}")
+        if source not in duration_cache:
+            duration_cache[source] = get_video_duration(source)
+        video_duration = duration_cache[source]
+        if video_duration is None:
+            raise ValueError(f"Could not determine video duration for: {source}")
+        clip_start, clip_end = compute_clip_bounds(match_start, match_end, video_duration)
+        clip_filename = clip_file_name(clip_group_name, source, clip_start, clip_end)
+        return {
+            'index': index,
+            'source': source,
+            'clip_start': clip_start,
+            'clip_end': clip_end,
+            'output_path': os.path.join(clip_output_dir, clip_filename),
+            'result': {
+                'file': posixpath.join('temp', clip_output_dir_name, clip_filename),
+                'start': match_start,
+                'end': match_end,
+                'segment': match.get('segment'),
+                'source_video': source,
+                # Bounds of the exported clip in source time: the canonical definition of the clip.
+                'original_start': clip_start,
+                'original_end': clip_end,
+                'duration_ms': round((clip_end - clip_start) * 1000),
+                # How much padding surrounds the match (less than the default at the file start/end).
+                'lead_ms': max(0, round((match_start - clip_start) * 1000)),
+                'tail_ms': max(0, round((clip_end - match_end) * 1000)),
+            },
+        }
+
     # Process each segment and yield results incrementally
+    total_segments = len(sorted_segments)
     for segment_idx, segment in enumerate(sorted_segments, 1):
-        segment_matches = segment_groups[segment][:max_results_per_segment]
-        
-        progress_msg = f"Processing segment {segment_idx}/{len(sorted_segments)}: '{segment}' ({len(segment_matches)} matches)"
+        all_segment_matches = interleave_by_file(segment_groups[segment])
+        segment_matches = all_segment_matches[:max_results_per_segment]
+        word_count = len(segment.split())
+
+        progress_msg = f"Processing segment {segment_idx}/{total_segments}: '{segment}' ({len(segment_matches)} matches)"
         print(progress_msg)
-        
-        # Yield progress update FIRST so user can skip
+        # Progress first, so the user can skip the segment before any clip is rendered
         yield {
             'progress': progress_msg,
             'segment_index': segment_idx,
-            'total_segments': len(sorted_segments),
-            'segment_phrase': segment  # Include phrase so frontend can use it
+            'total_segments': total_segments,
+            'segment_phrase': segment
         }
-        
-        segment_results = []
-        segment_skipped = False  # Track if segment was skipped during processing
-        
-        # Check for skip/cancel before starting parallel rendering
-        if search_id:
-            with CANCEL_LOCK:
-                if search_id in CANCELLED_SEARCHES:
-                    print(f"[Generator] ❌ CANCELLED before clip processing - exiting immediately")
-                    raise GeneratorExit("Search cancelled by user")
-            
-            with SKIP_LOCK:
-                if segment in SKIP_SEGMENTS.get(search_id, set()):
-                    print(f"[Generator] ⏭️  SKIP detected before processing segment: '{segment}'")
+
+        if is_cancelled():
+            print("[Generator] ❌ CANCELLED before clip processing - exiting immediately")
+            raise SearchCancelled()
+        if is_skipped(segment):
+            print(f"[Generator] ⏭️  Segment {segment_idx}/{total_segments}: '{segment}' was skipped")
+            yield {'phrase': segment, 'files': [], 'word_count': word_count, 'skipped': True}
+            continue
+        if not export_clips or not clip_output_dir:
+            yield {'phrase': segment, 'files': [], 'word_count': word_count, 'total_matches': len(all_segment_matches)}
+            continue
+
+        plans, errors = [], []
+        for index, item in enumerate(segment_matches):
+            try:
+                plans.append(plan_clip(index, item))
+            except (ValueError, OSError) as exc:
+                errors.append(str(exc))
+
+        rendered = {}
+        segment_skipped = False
+        stop_rendering = Event()
+        executor = ThreadPoolExecutor(max_workers=get_max_workers())
+        try:
+            futures = {
+                executor.submit(render_preview_clip, plan['source'], plan['clip_start'], plan['clip_end'],
+                                plan['output_path'], stop_rendering.is_set): plan
+                for plan in plans
+            }
+            completed = 0
+            for future in as_completed(futures):
+                plan = futures[future]
+                completed += 1
+                try:
+                    future.result()
+                    rendered[plan['index']] = plan['result']
+                except CancelledError:
+                    pass
+                except Exception as exc:
+                    if not stop_rendering.is_set():
+                        errors.append(str(exc))
+                        print(f"Failed to render clip {plan['index'] + 1}/{len(segment_matches)}: {exc}")
+                if stop_rendering.is_set():
+                    continue
+                if is_cancelled():
+                    print("[Generator] ❌ CANCELLED during clip rendering")
+                    raise SearchCancelled()
+                if is_skipped(segment):
+                    print(f"[Generator] ⏭️  SKIP detected during clip rendering: '{segment}'")
                     segment_skipped = True
-        
-        if not segment_skipped and export_clips and clip_output_dir:
-            # Prepare clip data for parallel rendering
-            clip_tasks = []
-            for clip_idx, item in enumerate(segment_matches):
-                clip_filename = f"{clip_group_name}_{global_clip_counter + clip_idx:05d}.mp4"
-                output_path = os.path.join(clip_output_dir, clip_filename)
-                clip_tasks.append((clip_idx, item, clip_filename, output_path))
-            
-            # Render clips in parallel using both GPU and CPU
-            # GPU encoding is limited to 2 concurrent sessions (NVENC limit) via semaphore
-            # CPU encoding can use all remaining cores
-            # This allows 2 GPU + (cores-2) CPU tasks to run in parallel
-            max_workers = get_max_workers()  # Use all CPU cores
-            current_gpu_encoder, _ = get_gpu_encoder()
-            if current_gpu_encoder:
-                gpu_limit = get_max_gpu_workers()
-                print(f"[Parallel] Using hybrid encoding: {gpu_limit} GPU workers ({current_gpu_encoder}) + {max_workers - gpu_limit} CPU workers (libx264) = {max_workers} total workers")
-            else:
-                print(f"[Parallel] Using CPU encoding only, using {max_workers} concurrent workers")
-            
-            completed_count = 0
-            
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                # Submit all tasks
-                future_to_clip = {
-                    executor.submit(render_single_clip, task): task 
-                    for task in clip_tasks
+                    stop_rendering.set()
+                    for pending in futures:
+                        pending.cancel()
+                    continue
+                yield {
+                    'progress': f"Processing segment {segment_idx}/{total_segments}: '{segment}' ({completed}/{len(segment_matches)} matches)",
+                    'segment_index': segment_idx,
+                    'total_segments': total_segments,
+                    'segment_phrase': segment,
+                    'clip_index': completed,
+                    'total_clips': len(segment_matches)
                 }
-                
-                print(f"[Parallel] Submitted {len(future_to_clip)} clip rendering tasks with {max_workers} workers")
-                
-                # Process completed tasks as they finish
-                for future in as_completed(future_to_clip):
-                    # Check for cancel/skip periodically (but don't break - process all tasks)
-                    should_cancel = False
-                    if search_id:
-                        with CANCEL_LOCK:
-                            if search_id in CANCELLED_SEARCHES:
-                                should_cancel = True
-                                print(f"[Generator] ❌ CANCELLED during parallel rendering")
-                        
-                        if not should_cancel:
-                            with SKIP_LOCK:
-                                if segment in SKIP_SEGMENTS.get(search_id, set()):
-                                    should_cancel = True
-                                    segment_skipped = True
-                                    print(f"[Generator] ⏭️  SKIP detected during parallel rendering: '{segment}'")
-                    
-                    if should_cancel:
-                        # Cancel remaining tasks but continue processing already-started ones
-                        for f in future_to_clip:
-                            if not f.done():
-                                f.cancel()
-                    
-                    if segment_skipped and should_cancel:
-                        # Still process this task, but skip adding to results
-                        try:
-                            future.result()  # Wait for it to complete
-                        except:
-                            pass
-                        continue
-                    
-                    task = future_to_clip[future]
-                    clip_idx, item, clip_filename, output_path = task
-                    
-                    try:
-                        success, final_path, error = future.result()
-                        completed_count += 1
-                        
-                        # Yield progress update
-                        clip_progress_msg = f"Processing segment {segment_idx}/{len(sorted_segments)}: '{segment}' ({completed_count}/{len(segment_matches)} matches)"
-                        yield {
-                            'progress': clip_progress_msg,
-                            'segment_index': segment_idx,
-                            'total_segments': len(sorted_segments),
-                            'segment_phrase': segment,
-                            'clip_index': completed_count,
-                            'total_clips': len(segment_matches)
-                        }
-                        
-                        if success and final_path:
-                            relative_path = clip_filename
-                            match = item['match']  # Get match from item
-                            filename = item['file']
-                            
-                            # Calculate original clip boundaries (same as in render_single_clip)
-                            match_start = sanitize_float(match.get('start'), 0.0)
-                            match_end = sanitize_float(match.get('end'), match_start)
-                            if match_start is not None and match_end is not None:
-                                video_duration = get_video_duration(filename)
-                                if video_duration:
-                                    clip_start = max(match_start - DEFAULT_CLIP_START_PADDING, 0.0)
-                                    clip_end = match_end + DEFAULT_CLIP_END_PADDING
-                                    clip_start = min(clip_start, video_duration - 0.1)
-                                    clip_end = min(clip_end, video_duration)
-                                    if clip_end <= clip_start:
-                                        clip_duration = max(match_end - match_start, 0.0)
-                                        min_extension = DEFAULT_CLIP_START_PADDING + DEFAULT_CLIP_END_PADDING
-                                        clip_end = min(clip_start + max(clip_duration + min_extension, 0.1), video_duration)
-                                else:
-                                    clip_start = match_start
-                                    clip_end = match_end
-                            else:
-                                clip_start = match_start
-                                clip_end = match_end
-                            
-                            segment_results.append({
-                                'file': os.path.join('temp', clip_output_dir_name, relative_path),
-                                'start': match.get('start'),
-                                'end': match.get('end'),
-                                'segment': match.get('segment', segment),
-                                'source_video': filename,  # Use full path like sequential path
-                                'original_start': clip_start,  # Original segment start in seconds
-                                'original_end': clip_end  # Original segment end in seconds
-                            })
-                        else:
-                            print(f"Failed to render clip {clip_idx+1}/{len(segment_matches)}: {error}")
-                    except Exception as exc:
-                        completed_count += 1
-                        print(f"Exception rendering clip {clip_idx+1}/{len(segment_matches)}: {exc}")
-                
-                print(f"[Parallel] Completed {completed_count}/{len(segment_matches)} clips for segment '{segment}'")
-            
-            # Update global counter
-            global_clip_counter += len(segment_matches)
-        
-        # Legacy sequential rendering for non-export or skipped export
-        if segment_skipped or not export_clips or not clip_output_dir:
-            for clip_idx, item in enumerate(segment_matches):
-                # Check if entire search was cancelled
-                if search_id:
-                    with CANCEL_LOCK:
-                        if search_id in CANCELLED_SEARCHES:
-                            print(f"[Generator] ❌ CANCELLED during clip processing - exiting immediately")
-                            raise GeneratorExit("Search cancelled by user")
-                
-                # Check for skip before processing each clip
-                if search_id:
-                    with SKIP_LOCK:
-                        if segment in SKIP_SEGMENTS.get(search_id, set()):
-                            print(f"[Generator] ⏭️  SKIP detected during clip {clip_idx+1}/{len(segment_matches)} of segment: '{segment}'")
-                            segment_skipped = True
-                            break  # Exit clip loop immediately
-                
-                filename = item['file']
-                match = item['match']
-                
-                clip_filename = f"{clip_group_name}_{global_clip_counter:05d}.mp4"
-                relative_path = clip_filename
-                final_path = None
-                
-                if export_clips and clip_output_dir:
-                    if skip_export:
-                        if cached_clip_index < len(cached_clip_files):
-                            clip_filename = cached_clip_files[cached_clip_index]
-                            cached_clip_index += 1
-                            final_path = os.path.join(clip_output_dir, clip_filename)
-                            if not os.path.exists(final_path):
-                                skip_export = False
-                        else:
-                            skip_export = False
+        finally:
+            # Also reached when the client disconnects (GeneratorExit) or cancels: stop encoding right away.
+            stop_rendering.set()
+            executor.shutdown(wait=True, cancel_futures=True)
 
-                if not skip_export:
-                    clip_filename = f"{clip_group_name}_{global_clip_counter:05d}.mp4"
-                    output_path = os.path.join(clip_output_dir, clip_filename)
-                    try:
-                        # Validate file exists
-                        if not os.path.exists(filename):
-                            raise FileNotFoundError(f"Video file not found: {filename}")
-                        
-                        match_start = sanitize_float(match.get('start'), 0.0)
-                        match_end = sanitize_float(match.get('end'), match_start)
-                        
-                        # Validate that we have valid start and end times
-                        if match_start is None or match_end is None:
-                            raise ValueError(f"Invalid time values: start={match.get('start')}, end={match.get('end')}")
-                        
-                        # Get video duration to clamp clip times
-                        video_duration = get_video_duration(filename)
-                        if video_duration is None:
-                            raise ValueError(f"Could not determine video duration for: {filename}")
-                        
-                        clip_start = max(match_start - DEFAULT_CLIP_START_PADDING, 0.0)
-                        clip_end = match_end + DEFAULT_CLIP_END_PADDING
-                        
-                        # Clamp clip_start and clip_end to video duration
-                        clip_start = min(clip_start, video_duration - 0.1)  # Leave at least 0.1s
-                        clip_end = min(clip_end, video_duration)
-                        
-                        if clip_end <= clip_start:
-                            clip_duration = max(match_end - match_start, 0.0)
-                            min_extension = DEFAULT_CLIP_START_PADDING + DEFAULT_CLIP_END_PADDING
-                            clip_end = min(clip_start + max(clip_duration + min_extension, 0.1), video_duration)
-                        
-                        # Final validation
-                        if clip_start >= clip_end:
-                            raise ValueError(f"Invalid clip range: start={clip_start}, end={clip_end}, video_duration={video_duration}")
-                        
-                        # Validate clip_start and clip_end are valid numbers before export
-                        if clip_start is None or clip_end is None or not isinstance(clip_start, (int, float)) or not isinstance(clip_end, (int, float)):
-                            raise ValueError(f"Invalid clip times: clip_start={clip_start}, clip_end={clip_end}")
-                        
-                        # Ensure output directory exists
-                        os.makedirs(clip_output_dir, exist_ok=True)
-                        
-                        # Get video fps for proper export
-                        video_fps = get_video_fps(filename)
-                        if video_fps is None:
-                            print(f"Warning: Could not detect FPS for {filename}, using default 25")
-                            video_fps = 25
-                        
-                        # Use ffmpeg with Popen so we can check for skip and terminate if needed
-                        ffmpeg_cmd = [
-                            'ffmpeg', '-y',
-                            '-ss', str(clip_start),
-                            '-i', filename,
-                            '-t', str(clip_end - clip_start),
-                            '-c:v', 'libx264',
-                            '-c:a', 'aac',
-                            '-ac', '2',  # Force stereo output (fixes mono and 5.1 issues)
-                            '-r', str(video_fps),
-                            output_path
-                        ]
-                        
-                        # Start ffmpeg process
-                        process = subprocess.Popen(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                        
-                        # Poll process while checking for skip/cancel requests
-                        import time
-                        while process.poll() is None:  # While process is running
-                            # Check if entire search was cancelled
-                            if search_id:
-                                with CANCEL_LOCK:
-                                    if search_id in CANCELLED_SEARCHES:
-                                        print(f"[Generator] ❌ CANCELLED - Terminating ffmpeg for search: {search_id}")
-                                        process.terminate()
-                                        try:
-                                            process.wait(timeout=2)
-                                        except subprocess.TimeoutExpired:
-                                            process.kill()
-                                            process.wait()
-                                        # Clean up partial file
-                                        if os.path.exists(output_path):
-                                            try:
-                                                os.remove(output_path)
-                                            except OSError:
-                                                pass
-                                        # Set a flag to exit completely (not just this segment)
-                                        raise GeneratorExit("Search cancelled by user")
-                            
-                            # Check if segment was skipped
-                            if search_id:
-                                with SKIP_LOCK:
-                                    if segment in SKIP_SEGMENTS.get(search_id, set()):
-                                        print(f"[Generator] ⏭️  Terminating ffmpeg for skipped segment: '{segment}'")
-                                        process.terminate()
-                                        try:
-                                            process.wait(timeout=2)
-                                        except subprocess.TimeoutExpired:
-                                            process.kill()
-                                            process.wait()
-                                        # Clean up partial file
-                                        if os.path.exists(output_path):
-                                            try:
-                                                os.remove(output_path)
-                                            except OSError:
-                                                pass
-                                        segment_skipped = True
-                                        break
-                            time.sleep(0.1)  # Check every 100ms
-                        
-                        # If we skipped, break out of try block
-                        if segment_skipped:
-                            break
-                        
-                        # Check return code if process finished normally
-                        if process.returncode != 0:
-                            stderr = process.stderr.read().decode() if process.stderr else ''
-                            print(f"FFmpeg stderr: {stderr}")
-                            raise RuntimeError(f"FFmpeg failed with return code {process.returncode}")
-                        
-                        # Clean up any temp files created in the root directory
-                        root_dir = os.path.dirname(__file__)
-                        for temp_file in glob.glob(os.path.join(root_dir, "*TEMP_MPY*.mp3")):
-                            try:
-                                os.remove(temp_file)
-                            except OSError:
-                                pass
-                        
-                        # Also clean up temp files in the output directory
-                        for temp_file in glob.glob(os.path.join(clip_output_dir, "*TEMP_MPY*.mp3")):
-                            try:
-                                os.remove(temp_file)
-                            except OSError:
-                                pass
-                        
-                        final_path = output_path
-                        if not os.path.exists(final_path):
-                            raise FileNotFoundError(f"Exported clip not found: {output_path}")
-                    except Exception as exc:
-                        # If segment was skipped, break out
-                        if segment_skipped:
-                            break
-                        error_traceback = traceback.format_exc()
-                        print(f"Failed to export clip for segment '{match['segment']}' in {filename}: {exc}")
-                        print(f"Error details: {error_traceback}")
-                        # Try to get debug info safely
-                        try:
-                            debug_info = f"clip_start={clip_start}, clip_end={clip_end}, video_duration={video_duration}, match_start={match_start}, match_end={match_end}"
-                        except NameError:
-                            debug_info = "Some variables not available"
-                        print(f"Debug info: {debug_info}")
-                        # Don't skip the match - still add it to results even if export failed
-                        final_path = None
-
-                # Break out if segment was skipped
-                if segment_skipped:
-                    break
-                    
-                if final_path:
-                    relative_path = posixpath.join(
-                        'temp',
-                        clip_output_dir_name,
-                        os.path.basename(final_path)
-                    )
-                else:
-                    # If export failed, still use the intended filename so the match is shown
-                    relative_path = posixpath.join(
-                        'temp',
-                        clip_output_dir_name,
-                        clip_filename
-                    )
-            
-            # Get the actual duration of the exported clip
-            clip_duration_ms = None
-            if final_path and os.path.exists(final_path):
-                clip_duration_ms = get_video_duration_ms(final_path)
-            elif relative_path:
-                # Try to read from relative path (for cached clips)
-                full_path = os.path.join(os.getcwd(), relative_path.replace('/', os.sep))
-                if os.path.exists(full_path):
-                    clip_duration_ms = get_video_duration_ms(full_path)
-            
-            segment_result = {
-                'file': relative_path,
-                'source_video': filename,
-                'original_start': clip_start,  # Original segment start in seconds
-                'original_end': clip_end  # Original segment end in seconds
-            }
-            if clip_duration_ms is not None:
-                segment_result['duration_ms'] = clip_duration_ms
-            
-            segment_results.append(segment_result)
-            global_clip_counter += 1
-        
-        # If segment was skipped, yield skip notification instead of results
         if segment_skipped:
-            print(f"[Generator] ⏭️  Segment {segment_idx}/{len(sorted_segments)}: '{segment}' was skipped")
-            yield {
-                'phrase': segment,
-                'files': [],
-                'word_count': len(segment.split()),
-                'skipped': True
-            }
-        else:
-            # Yield this segment's result
-            segment_word_count = len(segment.split())
-            print(f"[Generator] ✓ Yielding segment {segment_idx}/{len(sorted_segments)}: '{segment}' with {len(segment_results)} clips")
-            yield {
-                'phrase': segment,
-                'files': segment_results,
-                'word_count': segment_word_count
-            }
-    
-    # Write metadata after all segments have been processed
-    if export_clips and clip_output_dir:
-        if global_clip_counter == 0 and not skip_export:
-            shutil.rmtree(clip_output_dir, ignore_errors=True)
-        elif not skip_export and clip_metadata_path:
-            try:
-                with open(clip_metadata_path, 'w', encoding='utf-8') as metadata_file:
-                    json.dump(current_metadata, metadata_file, indent=2)
-            except OSError as exc:
-                print(f"Failed to write clip metadata for '{clip_group_name}': {exc}")
+            yield {'phrase': segment, 'files': [], 'word_count': word_count, 'skipped': True}
+            continue
 
-
-def find_and_export_longest_matches(
-    input_sentence,
-    filenames,
-    counter,
-    export_clips=False,
-    clip_group=None,
-    min_silence=0.0,
-    max_silence=10.0,
-    silence_word_threshold=2
-):
-    all_matches = []
-    global_clip_counter = 0  # Counter for all clips across files
-    clip_output_dir = None
-    clip_output_dir_name = None
-    clip_group_name = clip_group or generate_clip_group_name('segment', input_sentence, filenames)
-    silence_word_threshold = max(silence_word_threshold, 1)
-    skip_export = False
-    clip_metadata_path = None
-    cached_clip_files = []
-    cached_clip_index = 0
-
-    if export_clips:
-        clip_output_dir_name = f'{clip_group_name}_clips'
-        clip_output_dir = os.path.join(TEMP_DIR, clip_output_dir_name)
-        clip_metadata_path = os.path.join(clip_output_dir, CLIP_METADATA_FILENAME)
-        current_metadata = {
-            'version': 1,
-            'source_files': sorted(map(str, filenames)),
-            'input_sentence': input_sentence,
-            'max_results': MAX_CLIPS_PER_SEGMENT
+        files = [rendered[index] for index in sorted(rendered)]     # stable order: as matched, not as encoded
+        print(f"[Generator] ✓ Yielding segment {segment_idx}/{total_segments}: '{segment}' with {len(files)} clips")
+        result = {
+            'phrase': segment,
+            'files': files,
+            'word_count': word_count,
+            'total_matches': len(all_segment_matches)
         }
-        stored_metadata = None
-        if os.path.exists(clip_metadata_path):
-            try:
-                with open(clip_metadata_path, 'r', encoding='utf-8') as metadata_file:
-                    stored_metadata = json.load(metadata_file)
-            except (OSError, json.JSONDecodeError):
-                stored_metadata = None
-
-        if stored_metadata and stored_metadata.get('source_files') == current_metadata['source_files']:
-            skip_export = True
-            if os.path.isdir(clip_output_dir):
-                try:
-                    cached_clip_files = sorted(
-                        [
-                            name for name in os.listdir(clip_output_dir)
-                            if name.lower().endswith('.mp4')
-                        ]
-                    )
-                except OSError:
-                    cached_clip_files = []
-                if cached_clip_files:
-                    verified_clip_files = []
-                    for cached_name in cached_clip_files:
-                        cached_path = os.path.join(clip_output_dir, cached_name)
-                        if os.path.isfile(cached_path):
-                            verified_clip_files.append(cached_name)
-                    if len(verified_clip_files) != len(cached_clip_files):
-                        cached_clip_files = verified_clip_files
-                        if not cached_clip_files:
-                            skip_export = False
-                            shutil.rmtree(clip_output_dir, ignore_errors=True)
-            else:
-                skip_export = False
-                cached_clip_files = []
-        else:
-            if os.path.isdir(clip_output_dir):
-                shutil.rmtree(clip_output_dir)
-            os.makedirs(clip_output_dir, exist_ok=True)
-
-        if skip_export:
-            required_count = min(len(cached_clip_files), MAX_CLIPS_PER_SEGMENT)
-            if required_count == 0:
-                skip_export = False
-                shutil.rmtree(clip_output_dir, ignore_errors=True)
-                os.makedirs(clip_output_dir, exist_ok=True)
-                cached_clip_files = []
-            else:
-                cached_clip_files = cached_clip_files[:MAX_CLIPS_PER_SEGMENT]
-
-    collected_matches = []
-
-    # First, search ALL files and collect ALL matches
-    all_file_matches = []
-    for filename in filenames:
-        sentences = load_transcript_sentences(filename)
-        # Skip files without valid transcript data
-        if not sentences:
-            continue
-        # Validate that we have actual transcript segments with content
-        if not isinstance(sentences, list) or len(sentences) == 0:
-            continue
-        # Check that at least one segment has actual content
-        has_valid_content = False
-        for segment in sentences:
-            if isinstance(segment, dict):
-                content = segment.get('content', '')
-                words = segment.get('words', [])
-                if (isinstance(content, str) and content.strip()) or (isinstance(words, list) and len(words) > 0):
-                    has_valid_content = True
-                    break
-        if not has_valid_content:
-            continue
-
-        matches = find_longest_matches(
-            input_sentence,
-            sentences,
-            min_silence=min_silence,
-            max_silence=max_silence,
-            silence_word_threshold=silence_word_threshold
-        )
-
-        if not matches:
-            print("No matches found for the input sentence in:", filename)
-            continue
-
-        if matches:
-            all_file_matches.append({'file': filename, 'matches': matches})
-            video_name = os.path.basename(filename)
-            print(f"Found {len(matches)} matches for '{input_sentence}' in {video_name}")
-    
-    # Collect ALL matches from all files to identify all segments
-    # But limit exports to MAX_CLIPS_PER_SEGMENT per unique segment
-    if all_file_matches:
-        # First, group all matches by segment across all files
-        segment_groups = {}
-        for entry in all_file_matches:
-            for match in entry['matches']:
-                segment = match.get('segment', '')
-                if segment not in segment_groups:
-                    segment_groups[segment] = []
-                segment_groups[segment].append({'file': entry['file'], 'match': match})
-        
-        # Now limit each segment to MAX_CLIPS_PER_SEGMENT for export
-        # Sort segments by length (longest first) for better ordering
-        sorted_segments = sorted(segment_groups.keys(), key=lambda s: len(s.split()), reverse=True)
-        
-        for segment in sorted_segments:
-            segment_matches = segment_groups[segment][:MAX_CLIPS_PER_SEGMENT]  # Limit per segment
-            
-            # Group back by file
-            file_match_dict = {}
-            for item in segment_matches:
-                filename = item['file']
-                if filename not in file_match_dict:
-                    file_match_dict[filename] = []
-                file_match_dict[filename].append(item['match'])
-            
-            # Add to collected_matches in the expected format
-            for filename, matches in file_match_dict.items():
-                collected_matches.append({'file': filename, 'matches': matches})
-        
-        # Calculate statistics
-        total_found = sum(len(segment_groups[seg]) for seg in segment_groups)
-        total_exported = sum(len(entry['matches']) for entry in collected_matches)
-        print(f"Total matches found: {total_found} across {len(all_file_matches)} video(s)")
-        print(f"Exporting {total_exported} clips ({len(segment_groups)} unique segments, max {MAX_CLIPS_PER_SEGMENT} per segment)")
-    
-    collected_total = sum(len(entry['matches']) for entry in collected_matches)
-
-    if export_clips and clip_output_dir:
-        if skip_export and len(cached_clip_files) < collected_total:
-            skip_export = False
-            shutil.rmtree(clip_output_dir, ignore_errors=True)
-            os.makedirs(clip_output_dir, exist_ok=True)
-            cached_clip_files = []
-        elif not skip_export and not os.path.isdir(clip_output_dir):
-            os.makedirs(clip_output_dir, exist_ok=True)
-        elif skip_export:
-            cached_clip_files = cached_clip_files[:collected_total]
-
-    # Prepare all clip tasks for parallel rendering
-    clip_tasks = []
-    clip_metadata = []  # Store metadata for each clip (filename, match, etc.)
-    
-    for entry in collected_matches:
-        filename = entry['file']
-        for match in entry['matches']:
-            clip_filename = f"{clip_group_name}_{global_clip_counter:05d}.mp4"
-            relative_path = clip_filename
-            final_path = None
-
-            if export_clips and clip_output_dir:
-                if skip_export:
-                    if cached_clip_index < len(cached_clip_files):
-                        clip_filename = cached_clip_files[cached_clip_index]
-                        cached_clip_index += 1
-                        final_path = os.path.join(clip_output_dir, clip_filename)
-                        if not os.path.exists(final_path):
-                            skip_export = False
-                    else:
-                        skip_export = False
-
-                if not skip_export:
-                    output_path = os.path.join(clip_output_dir, clip_filename)
-                    # Prepare task for parallel rendering
-                    clip_tasks.append((global_clip_counter, {
-                        'file': filename,
-                        'match': match
-                    }, clip_filename, output_path))
-                    clip_metadata.append({
-                        'clip_counter': global_clip_counter,
-                        'filename': filename,
-                        'match': match,
-                        'clip_filename': clip_filename,
-                        'relative_path': posixpath.join('temp', clip_output_dir_name, clip_filename)
-                    })
-                else:
-                    # Using cached clip
-                    clip_metadata.append({
-                        'clip_counter': global_clip_counter,
-                        'filename': filename,
-                        'match': match,
-                        'clip_filename': clip_filename,
-                        'relative_path': posixpath.join('temp', clip_output_dir_name, clip_filename),
-                        'cached': True,
-                        'final_path': final_path
-                    })
-            else:
-                # Not exporting clips, just metadata
-                clip_metadata.append({
-                    'clip_counter': global_clip_counter,
-                    'filename': filename,
-                    'match': match,
-                    'clip_filename': clip_filename,
-                    'relative_path': clip_filename
-                })
-            
-            global_clip_counter += 1
-    
-    # Render clips in parallel if we have tasks
-    if export_clips and clip_output_dir and clip_tasks:
-        # Ensure output directory exists
-        os.makedirs(clip_output_dir, exist_ok=True)
-        
-        # Use cached GPU encoder (detected at startup)
-        gpu_encoder, gpu_args = get_gpu_encoder()
-        
-        def render_single_clip_phrase(clip_data):
-            """Render a single clip for phrase search. Returns (success, output_path, error) tuple."""
-            clip_idx, item, clip_filename, output_path = clip_data
-            filename = item['file']
-            match = item['match']
-            
-            try:
-                # Validate file exists
-                if not os.path.exists(filename):
-                    raise FileNotFoundError(f"Video file not found: {filename}")
-                
-                match_start = sanitize_float(match.get('start'), 0.0)
-                match_end = sanitize_float(match.get('end'), match_start)
-                
-                # Validate that we have valid start and end times
-                if match_start is None or match_end is None:
-                    raise ValueError(f"Invalid time values: start={match.get('start')}, end={match.get('end')}")
-                
-                # Get video duration to clamp clip times
-                video_duration = get_video_duration(filename)
-                if video_duration is None:
-                    raise ValueError(f"Could not determine video duration for: {filename}")
-                
-                clip_start = max(match_start - DEFAULT_CLIP_START_PADDING, 0.0)
-                clip_end = match_end + DEFAULT_CLIP_END_PADDING
-                
-                # Clamp clip_start and clip_end to video duration
-                clip_start = min(clip_start, video_duration - 0.1)  # Leave at least 0.1s
-                clip_end = min(clip_end, video_duration)
-                
-                if clip_end <= clip_start:
-                    clip_duration = max(match_end - match_start, 0.0)
-                    min_extension = DEFAULT_CLIP_START_PADDING + DEFAULT_CLIP_END_PADDING
-                    clip_end = min(clip_start + max(clip_duration + min_extension, 0.1), video_duration)
-                
-                # Final validation
-                if clip_start >= clip_end:
-                    raise ValueError(f"Invalid clip range: start={clip_start}, end={clip_end}, video_duration={video_duration}")
-                
-                # Get video fps for proper export
-                video_fps = get_video_fps(filename)
-                if video_fps is None:
-                    video_fps = 25
-                
-                # Try to use GPU encoding if available, but respect the concurrent session limit
-                current_gpu_encoder, current_gpu_args = get_gpu_encoder()
-                use_gpu = False
-                
-                if current_gpu_encoder and GPU_ENCODING_SEMAPHORE:
-                    # Try to acquire GPU semaphore (non-blocking check first)
-                    if GPU_ENCODING_SEMAPHORE.acquire(blocking=False):
-                        use_gpu = True
-                
-                ffmpeg_cmd = ['ffmpeg', '-y']
-                ffmpeg_cmd.extend([
-                    '-ss', str(clip_start),
-                    '-i', filename,
-                    '-t', str(clip_end - clip_start),
-                    '-c:a', 'aac',
-                    '-ac', '2',  # Force stereo output (fixes mono and 5.1 issues)
-                    '-r', str(video_fps),
-                ])
-                
-                # Add video encoder (GPU or CPU)
-                try:
-                    if use_gpu:
-                        ffmpeg_cmd.extend(['-c:v', current_gpu_encoder])
-                        ffmpeg_cmd.extend(current_gpu_args)
-                    else:
-                        ffmpeg_cmd.extend(['-c:v', 'libx264', '-preset', 'ultrafast'])
-                finally:
-                    # Always release the semaphore if we acquired it
-                    if use_gpu and GPU_ENCODING_SEMAPHORE:
-                        GPU_ENCODING_SEMAPHORE.release()
-                
-                ffmpeg_cmd.append(output_path)
-                
-                # Run ffmpeg
-                result = subprocess.run(
-                    ffmpeg_cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    timeout=300  # 5 minute timeout per clip
-                )
-                
-                if result.returncode != 0:
-                    stderr = result.stderr.decode() if result.stderr else ''
-                    # If GPU encoding failed, retry with CPU
-                    if use_gpu and current_gpu_encoder:
-                        print(f"[GPU] GPU encoding failed (code {result.returncode}), retrying with CPU: {clip_filename}")
-                        ffmpeg_cmd_cpu = [
-                            'ffmpeg', '-y',
-                            '-ss', str(clip_start),
-                            '-i', filename,
-                            '-t', str(clip_end - clip_start),
-                            '-c:v', 'libx264',
-                            '-preset', 'ultrafast',
-                            '-c:a', 'aac',
-                            '-ac', '2',  # Force stereo output (fixes mono and 5.1 issues)
-                            '-r', str(video_fps),
-                            output_path
-                        ]
-                        result = subprocess.run(
-                            ffmpeg_cmd_cpu,
-                            stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE,
-                            timeout=300
-                        )
-                        if result.returncode != 0:
-                            stderr_cpu = result.stderr.decode() if result.stderr else ''
-                            raise RuntimeError(f"FFmpeg failed with return code {result.returncode}: {stderr_cpu[:500]}")
-                    else:
-                        raise RuntimeError(f"FFmpeg failed with return code {result.returncode}: {stderr[:500]}")
-                
-                if not os.path.exists(output_path):
-                    raise FileNotFoundError(f"Exported clip not found: {output_path}")
-                
-                return (True, output_path, None)
-            except Exception as e:
-                return (False, None, str(e))
-        
-        # Render clips in parallel
-        max_workers = get_max_workers()  # Use all CPU cores
-        current_gpu_encoder, _ = get_gpu_encoder()
-        if current_gpu_encoder:
-            gpu_limit = get_max_gpu_workers()
-            print(f"[Parallel] Using hybrid encoding: {gpu_limit} GPU workers ({current_gpu_encoder}) + {max_workers - gpu_limit} CPU workers (libx264) = {max_workers} total workers")
-        else:
-            print(f"[Parallel] Using CPU encoding only, using {max_workers} concurrent workers")
-        
-        print(f"[Parallel] Rendering {len(clip_tasks)} clips in parallel...")
-        
-        # Create a mapping from clip_idx to metadata index
-        clip_idx_to_metadata = {task[0]: idx for idx, task in enumerate(clip_tasks)}
-        
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            # Submit all tasks
-            future_to_clip = {
-                executor.submit(render_single_clip_phrase, task): task 
-                for task in clip_tasks
-            }
-            
-            # Process completed tasks
-            for future in as_completed(future_to_clip):
-                task = future_to_clip[future]
-                clip_idx = task[0]
-                metadata_idx = clip_idx_to_metadata[clip_idx]
-                
-                try:
-                    success, output_path, error = future.result()
-                    if success and output_path:
-                        clip_metadata[metadata_idx]['final_path'] = output_path
-                        clip_metadata[metadata_idx]['relative_path'] = posixpath.join(
-                            'temp',
-                            clip_output_dir_name,
-                            os.path.basename(output_path)
-                        )
-                    elif error:
-                        print(f"Failed to render clip {clip_idx}: {error}")
-                except Exception as e:
-                    print(f"Exception rendering clip {clip_idx}: {e}")
-    
-    # Build final results from metadata
-    for meta in clip_metadata:
-        if meta.get('cached') and meta.get('final_path'):
-            relative_path = posixpath.join(
-                'temp',
-                clip_output_dir_name,
-                os.path.basename(meta['final_path'])
-            )
-        else:
-            relative_path = meta['relative_path']
-        
-        # Get the actual duration of the exported clip
-        clip_duration_ms = None
-        final_path = meta.get('final_path')
-        if final_path and os.path.exists(final_path):
-            clip_duration_ms = get_video_duration_ms(final_path)
-        elif relative_path:
-            # Try to read from relative path (for cached clips)
-            full_path = os.path.join(os.getcwd(), relative_path.replace('/', os.sep))
-            if os.path.exists(full_path):
-                clip_duration_ms = get_video_duration_ms(full_path)
-        
-        match_data = {
-            'file': relative_path, 
-            'segment': meta['match']['segment'],
-            'source_video': meta['filename']
-        }
-        if clip_duration_ms is not None:
-            match_data['duration_ms'] = clip_duration_ms
-        
-        all_matches.append(match_data)
-
-    if export_clips and clip_output_dir:
-        if global_clip_counter == 0 and not skip_export:
-            shutil.rmtree(clip_output_dir, ignore_errors=True)
-        elif not skip_export and clip_metadata_path:
-            try:
-                with open(clip_metadata_path, 'w', encoding='utf-8') as metadata_file:
-                    json.dump(current_metadata, metadata_file, indent=2)
-            except OSError as exc:
-                print(f"Failed to write clip metadata for '{clip_group_name}': {exc}")
-
-    print(all_matches)
-    return all_matches
+        if errors:
+            result['failed'] = len(errors)
+            result['first_error'] = errors[0]
+        yield result
 
 
-def find_matches_for_segment(segment, sentences, min_duration=0.0, max_duration=10.0, silence_word_threshold=2):  # @jonny Hier 0.1 einsetzen und du siehst, dass die Blöcke winzig werden. Das Skript sollte die silences ignorieren für Segmente ab 2 Wörtern.
-    # Preprocess sentences into a flat list of usable word entries
-    all_words = []
-    for sentence in sentences:
-        for word in sentence.get('words', []):
-            start_time = word.get('start')
-            end_time = word.get('end')
-            normalized_word = normalize_token(word.get('word', ''))
-            if normalized_word and start_time is not None and end_time is not None:
-                all_words.append({
-                    'word': word.get('word', ''),
-                    'normalized_word': normalized_word,
-                    'start': start_time,
-                    'end': end_time
-                })
+def find_matches_for_segment(segment, sentences, min_duration=0.0, max_duration=10.0, silence_word_threshold=2):
+    """All occurrences of ``segment`` (a word sequence) in a transcript.
 
-    # Prepare the segment tokens for comparison
-    raw_segment_words = segment.split()
-    segment_words = []
-    for raw_word in raw_segment_words:
-        normalized = normalize_token(raw_word)
-        if normalized:
-            segment_words.append(normalized)
+    ``sentences`` is a WordIndex or the raw transcript segments. Phrases shorter than
+    ``silence_word_threshold`` words must be surrounded by silences within [min_duration, max_duration];
+    longer ones are returned regardless of the pauses around them.
+    """
+    index = sentences if isinstance(sentences, WordIndex) else WordIndex(sentences)
+    all_words = index.words
+    segment_words = [token for token in (normalize_token(raw_word) for raw_word in segment.split()) if token]
     word_count = len(segment_words)
-
-    if not segment_words or word_count == 0 or not all_words:
+    if not word_count or not all_words:
         return []
 
-    # Initialize a list to store all matches
     all_matches = []
-
     total_available = len(all_words)
+    # Only positions where the first word occurs can start a match (same order as a linear scan).
+    for i in index.positions.get(segment_words[0], ()):
+        if i + word_count > total_available:
+            break
+        if any(all_words[i + offset]['normalized_word'] != segment_words[offset] for offset in range(1, word_count)):
+            continue
+        start_time = all_words[i]['start']
+        end_time = all_words[i + word_count - 1]['end']
 
-    # Iterate through the flattened list of words
-    for i in range(total_available - word_count + 1):
-        window = all_words[i:i + word_count]
-        window_normalized = [word['normalized_word'] for word in window]
-        
-        if segment_words == window_normalized:
-            # Determine the start and end times of the segment
-            start_time = window[0]['start']
-            end_time = window[-1]['end']
+        # Silence before and after the segment
+        first_silence = start_time - all_words[i - 1]['end'] if i > 0 else start_time
+        if i + word_count < total_available:
+            second_silence = all_words[i + word_count]['start'] - end_time
+        else:
+            second_silence = max_duration
+        first_silence = max(first_silence, 0.0)
+        second_silence = max(second_silence, 0.0)
 
-            # Check for silence before and after the segment
-            if i > 0:
-                first_silence = start_time - all_words[i - 1]['end']
-            else:
-                first_silence = start_time
-
-            if i + word_count < total_available:
-                second_silence = all_words[i + word_count]['start'] - end_time
-            else:
-                second_silence = max_duration
-
-            first_silence = max(first_silence, 0.0)
-            second_silence = max(second_silence, 0.0)
-
-            if word_count < silence_word_threshold:
-                if min_duration <= first_silence <= max_duration and min_duration <= second_silence <= max_duration:
-                    print(f'The segment "{segment}" is surrounded by silences of {first_silence} and {second_silence} seconds.')
-                    all_matches.append({
-                        'segment': segment,
-                        'start': start_time,
-                        'end': end_time,
-                        'first_silence': first_silence,
-                        'second_silence': second_silence
-                    })
-                else:
-                    print(f'No match for "{segment}" as its is surrounded by silences of {first_silence} and {second_silence} seconds.')
-            else:
-                all_matches.append({
-                    'segment': segment,
-                    'start': start_time,
-                    'end': end_time,
-                    'first_silence': first_silence,
-                    'second_silence': second_silence
-                })
-
-    # Return all matches found
+        if word_count < silence_word_threshold and not (
+                min_duration <= first_silence <= max_duration and min_duration <= second_silence <= max_duration):
+            continue
+        all_matches.append({
+            'segment': segment,
+            'start': start_time,
+            'end': end_time,
+            'first_silence': first_silence,
+            'second_silence': second_silence
+        })
     return all_matches
 
 
-def find_longest_matches_filtered(
-    input_sentence,
-    sentences,
-    min_silence=0.0,
-    max_silence=10.0,
-    silence_word_threshold=2,
-    min_words=3
-):
-    """
-    Like find_longest_matches, but filters out segments shorter than min_words
-    (except for the full input sentence).
-    This avoids searching for very short partials like "das", "aber", etc.
-    """
-    # Split the input sentence into words
-    input_words = input_sentence.split()
-    # Initialize a list to store the matches
-    matches = []
-
-    total_words = len(input_words)
-    if total_words == 0:
-        return matches
-
-    seen_ranges = set()
-    silence_word_threshold = max(silence_word_threshold, 1)
-    
-    # Check substrings, but skip very short ones (unless it's the full sentence)
-    for i in range(total_words):
-        for j in range(i + 1, total_words + 1):
-            segment_words = input_words[i:j]
-            segment = " ".join(segment_words)
-            word_count = len(segment_words)
-
-            # Skip very short segments (unless it's the full input sentence)
-            if word_count < min_words and segment != input_sentence:
-                continue
-
-            segment_min_silence = min_silence if word_count < silence_word_threshold else 0.0
-
-            found_matches = find_matches_for_segment(
-                segment,
-                sentences,
-                min_duration=segment_min_silence,
-                max_duration=max_silence,
-                silence_word_threshold=silence_word_threshold
-            )
-
-            new_matches = []
-            for match in found_matches:
-                key = (match['start'], match['end'], segment)
-                if key in seen_ranges:
-                    continue
-                seen_ranges.add(key)
-                new_matches.append(match)
-
-            if new_matches:
-                matches.extend(new_matches)
-
-    return matches
-
-
-# @jonny bugged - forciert aktuell auch Pausen bei segments mit 2 Wörtern+
 def find_longest_matches(
     input_sentence,
     sentences,
     min_silence=0.0,
     max_silence=10.0,
-    silence_word_threshold=2
+    silence_word_threshold=2,
+    min_words=1
 ):
-    # Split the input sentence into words
+    """Matches of every contiguous sub-phrase of ``input_sentence`` (so "finanziellen belastungen" is found
+    even when "an den finanziellen belastungen durch" also matched). Sub-phrases shorter than ``min_words``
+    are skipped unless they are the whole input."""
     input_words = input_sentence.split()
-    # Initialize a list to store the matches
-    matches = []
-
     total_words = len(input_words)
     if total_words == 0:
-        return matches
+        return []
 
-    seen_ranges = set()
+    index = sentences if isinstance(sentences, WordIndex) else WordIndex(sentences)
     silence_word_threshold = max(silence_word_threshold, 1)
-    
-    # Check ALL possible substrings, not just longest non-overlapping ones
-    # This ensures we find "finanziellen belastungen" and "belastungen" 
-    # even if "an den finanziellen belastungen durch" was found
+    matches = []
+    seen_ranges = set()
     for i in range(total_words):
         for j in range(i + 1, total_words + 1):
             segment_words = input_words[i:j]
             segment = " ".join(segment_words)
             word_count = len(segment_words)
-
-            segment_min_silence = min_silence if word_count < silence_word_threshold else 0.0
-
-            found_matches = find_matches_for_segment(
+            if word_count < min_words and segment != input_sentence:
+                continue
+            for match in find_matches_for_segment(
                 segment,
-                sentences,
-                min_duration=segment_min_silence,
+                index,
+                min_duration=min_silence if word_count < silence_word_threshold else 0.0,
                 max_duration=max_silence,
                 silence_word_threshold=silence_word_threshold
-            )
-
-            new_matches = []
-            for match in found_matches:
+            ):
                 key = (match['start'], match['end'], segment)
-                if key in seen_ranges:
-                    continue
-                seen_ranges.add(key)
-                new_matches.append(match)
-
-            if new_matches:
-                matches.extend(new_matches)
-
+                if key not in seen_ranges:
+                    seen_ranges.add(key)
+                    matches.append(match)
     return matches
 
 
@@ -3641,22 +2618,6 @@ def get_waveform():
     return jsonify({'waveform': waveform, 'width': len(waveform), 'duration_ms': round(seconds * 1000.0, 3)})
 
 
-def export_padded_clip(source_path, start, end, output_path):
-    """Cut ``[start, end)`` of a library video into a preview clip (same settings as the search export)."""
-    fps = get_video_fps(source_path) or 25
-    command = [
-        'ffmpeg', '-v', 'error', '-nostdin', '-y',
-        '-ss', f'{start:.6f}', '-i', source_path, '-t', f'{end - start:.6f}',
-        '-c:v', 'libx264', '-preset', 'ultrafast',
-        '-c:a', 'aac', '-ac', '2', '-r', str(fps),
-        output_path,
-    ]
-    process = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=300)
-    if process.returncode != 0 or not os.path.isfile(output_path):
-        detail = process.stderr.decode(errors='ignore').strip().splitlines()[-1:] if process.stderr else []
-        raise RuntimeError(f"ffmpeg could not cut the clip: {' '.join(detail) or 'unknown error'}")
-
-
 @app.route('/ensure_clip', methods=['POST'])
 def ensure_clip():
     """Re-create a preview clip that vanished from temp/ (cache cleanup) from its source video and bounds."""
@@ -3673,14 +2634,7 @@ def ensure_clip():
     if not source_path or start is None or end is None or start < 0 or end <= start:
         return jsonify({'error': 'The clip is gone and its source video or bounds are unknown'}), 404
     try:
-        os.makedirs(os.path.dirname(clip_path), exist_ok=True)
-        partial_path = f'{clip_path}.{uuid.uuid4().hex}.partial.mp4'
-        try:
-            export_padded_clip(source_path, start, end, partial_path)
-            os.replace(partial_path, clip_path)
-        finally:
-            if os.path.exists(partial_path):
-                os.remove(partial_path)
+        render_preview_clip(source_path, start, end, clip_path)
     except (RuntimeError, OSError, subprocess.SubprocessError) as exc:
         print(f"[ensure_clip] {exc}")
         return jsonify({'error': str(exc)}), 500

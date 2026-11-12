@@ -1366,6 +1366,19 @@ textarea {
     padding: 16px;
 }
 
+/* Notices between result cards (failed renders, unmatched story segments) */
+.result-notice {
+    grid-column: 1 / -1;
+    padding: 10px 14px;
+    border-radius: var(--radius);
+    border: 1px solid rgba(242, 109, 120, 0.35);
+    background: rgba(242, 109, 120, 0.08);
+    color: var(--text);
+    font-size: 13px;
+    line-height: 1.4;
+    overflow-wrap: anywhere;
+}
+
 /* Clip stage: sample-accurate preview driven by static/clip-player.js */
 .clip-stage-host {
     width: 100%;
