@@ -417,6 +417,8 @@ function cacheElements() {
     elements.timelinePlayButton = document.getElementById('timelinePlayButton');
     elements.timelineMergeButton = document.getElementById('timelineMergeButton');
     elements.timelineClearButton = document.getElementById('timelineClearButton');
+    elements.timelineUndoButton = document.getElementById('timelineUndoButton');
+    elements.timelineRedoButton = document.getElementById('timelineRedoButton');
     elements.timelineRestoreButton = document.getElementById('timelineRestoreButton');
     elements.loopMergedVideo = document.getElementById('loopMergedVideo');
     elements.resultsContainer = document.getElementById('resultsContainer');
@@ -712,6 +714,12 @@ function bindEventListeners() {
 
     if (elements.timelineClearButton) {
         elements.timelineClearButton.addEventListener('click', clearTimeline);
+    }
+    if (elements.timelineUndoButton) {
+        elements.timelineUndoButton.addEventListener('click', undoTimeline);
+    }
+    if (elements.timelineRedoButton) {
+        elements.timelineRedoButton.addEventListener('click', redoTimeline);
     }
 
     if (elements.timelineRestoreButton) {
@@ -1049,6 +1057,7 @@ function applyProjectToUI(project) {
     renderProjectSentences(Array.isArray(data.sentences) ? data.sentences : []);
     renderFilePickers();
     resetCorpusState();
+    resetTimelineHistory();
     renderTimeline(data.timeline);
     updateProjectControlsState();
     setAutosaveStatus('All changes saved', 'ready');
@@ -2098,7 +2107,7 @@ function fetchWaveformData(ref) {
  * The clip length comes from the server together with the waveform (it is the length of the audio the preview
  * plays), so the handles, the picture and the sound share one time base.
  *
- * Callbacks: onTrimChange(start, end) on every change, onTrimRelease(start, end) when the user lets go
+ * Callbacks: onTrimChange(start, end, byUser) on every change, onTrimRelease(start, end) when the user lets go
  * (pointer up, or shortly after the last key press) - that is the moment to preview.
  * Keys on a focused handle: arrows 10 ms, Shift+arrows 1 ms, PageUp/PageDown 100 ms.
  */
@@ -2256,7 +2265,9 @@ function createWaveformVisualization({
         state.end = clamped.end;
         updateSelection();
         if (changed && onTrimChange && !silent) {
-            onTrimChange(state.start, state.end);
+            // Third argument: true when the user moved a handle, false when the trims were only corrected
+            // to fit the clip.
+            onTrimChange(state.start, state.end, moved !== null);
         }
         return changed;
     }
@@ -5392,6 +5403,7 @@ function setTimelineTrimValue(entryId, field, value) {
         const parsedValue = Number.parseInt(value, 10);
         safeValue = Number.isFinite(parsedValue) && parsedValue >= 0 ? parsedValue : 0;
     }
+    recordTimelineUndo(`${field}:${entryId}`);
     updateProjectData(data => {
         if (!Array.isArray(data.timeline)) {
             return;
@@ -5550,7 +5562,7 @@ function renderTimeline(entriesParam) {
             startTrim: trims.start,
             endTrim: trims.end,
             speed: currentSpeed,
-            onTrimChange: (startTrim, endTrim) => setEntryTrims(entry.id, startTrim, endTrim),
+            onTrimChange: (startTrim, endTrim, byUser) => setEntryTrims(entry.id, startTrim, endTrim, byUser),
             onTrimRelease: () => playTimelineItem(entry.id)
         });
         trimControls.appendChild(timelineWaveform);
@@ -5674,10 +5686,101 @@ function renderTimeline(entriesParam) {
     isRenderingTimeline = false;
 }
 
+// ---------------------------------------------------------------------------------------------------------
+// Timeline undo / redo (Ctrl+Z, Ctrl+Shift+Z or Ctrl+Y, and the buttons in the timeline header)
+// ---------------------------------------------------------------------------------------------------------
+
+const TIMELINE_UNDO_LIMIT = 100;
+const timelineHistory = { undo: [], redo: [], lastKey: null, lastAt: 0 };
+
+function resetTimelineHistory() {
+    timelineHistory.undo.length = 0;
+    timelineHistory.redo.length = 0;
+    timelineHistory.lastKey = null;
+    updateTimelineUndoButtons();
+}
+
+function updateTimelineUndoButtons() {
+    if (elements.timelineUndoButton) {
+        elements.timelineUndoButton.disabled = !timelineHistory.undo.length;
+    }
+    if (elements.timelineRedoButton) {
+        elements.timelineRedoButton.disabled = !timelineHistory.redo.length;
+    }
+}
+
+/**
+ * Remember the timeline as it is now, before a change. Changes with the same `key` in quick succession (the
+ * steps of one trim drag or one move of the speed slider) are one undo step.
+ */
+function recordTimelineUndo(key = null) {
+    if (!activeProject || isApplyingProject) {
+        return;
+    }
+    const now = performance.now();
+    if (key && timelineHistory.lastKey === key && now - timelineHistory.lastAt < 1500) {
+        timelineHistory.lastAt = now;
+        return;
+    }
+    timelineHistory.undo.push(JSON.stringify(getTimelineEntries()));
+    if (timelineHistory.undo.length > TIMELINE_UNDO_LIMIT) {
+        timelineHistory.undo.shift();
+    }
+    timelineHistory.redo.length = 0;
+    timelineHistory.lastKey = key;
+    timelineHistory.lastAt = now;
+    updateTimelineUndoButtons();
+}
+
+function restoreTimelineSnapshot(from, to) {
+    if (!activeProject || !from.length) {
+        return;
+    }
+    to.push(JSON.stringify(getTimelineEntries()));
+    const snapshot = JSON.parse(from.pop());
+    timelineHistory.lastKey = null;
+    stopClipPlayback();
+    updateProjectData(data => {
+        data.timeline = snapshot;
+    });
+    renderTimeline();
+    updateTimelineUndoButtons();
+}
+
+function undoTimeline() {
+    restoreTimelineSnapshot(timelineHistory.undo, timelineHistory.redo);
+}
+
+function redoTimeline() {
+    restoreTimelineSnapshot(timelineHistory.redo, timelineHistory.undo);
+}
+
+document.addEventListener('keydown', event => {
+    if (!(event.ctrlKey || event.metaKey) || event.altKey) {
+        return;
+    }
+    const key = event.key.toLowerCase();
+    if (key !== 'z' && key !== 'y') {
+        return;
+    }
+    // Text fields keep their own undo
+    const target = event.target;
+    if (target && (target.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName)) && target.type !== 'range' && target.type !== 'checkbox') {
+        return;
+    }
+    event.preventDefault();
+    if (key === 'y' || event.shiftKey) {
+        redoTimeline();
+    } else {
+        undoTimeline();
+    }
+});
+
 function updateTimeline(mutator, options) {
     if (!activeProject || typeof mutator !== 'function') {
         return;
     }
+    recordTimelineUndo();
     updateProjectData(data => {
         if (!Array.isArray(data.timeline)) {
             data.timeline = [];
@@ -5754,7 +5857,10 @@ function handleTimelineListClick(event) {
 }
 
 /** Store new trims for a timeline entry (the clip itself is never re-rendered for a trim). */
-function setEntryTrims(entryId, startTrim, endTrim) {
+function setEntryTrims(entryId, startTrim, endTrim, undoable = true) {
+    if (undoable) {
+        recordTimelineUndo(`trim:${entryId}`);
+    }
     updateProjectData(data => {
         const target = Array.isArray(data.timeline) ? data.timeline.find(item => item && item.id === entryId) : null;
         if (!target) {
@@ -5980,10 +6086,10 @@ function mergeTimeline() {
 }
 
 function clearTimeline() {
-    const count = getTimelineEntries().length;
-    if (!count || !confirm(`Remove all ${count} clips from the timeline?`)) {
+    if (!getTimelineEntries().length) {
         return;
     }
+    // No confirmation: Undo (Ctrl+Z) brings the clips back.
     stopClipPlayback();
     updateTimeline(entries => {
         entries.length = 0;
