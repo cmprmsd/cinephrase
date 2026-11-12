@@ -20,6 +20,7 @@ from threading import Lock, RLock, Semaphore
 from typing import List, Optional, Sequence, Tuple
 
 from flask import Flask, jsonify, render_template, request, send_from_directory, Response, stream_with_context
+from werkzeug.exceptions import HTTPException
 from videogrep import parse_transcript
 from srt_word_boundaries import convert_subtitles
 import render_pipeline
@@ -117,19 +118,35 @@ def disable_gpu_encoder():
     _GPU_ENCODER_CACHE = (None, None)
     print("[GPU] GPU encoder disabled due to runtime failures, switching to CPU")
 
+# Hardware H.264 encoders in order of preference, each with the argument sets to try (simplest first: some
+# driver/ffmpeg combinations reject the richer ones). HEVC and VAAPI are left out on purpose: browsers cannot
+# play HEVC preview clips reliably, and VAAPI needs a device/hwupload setup the export commands do not have.
+GPU_ENCODER_CANDIDATES = [
+    ('h264_nvenc', [
+        ['-preset', 'p4'],
+        ['-preset', 'p4', '-rc', 'vbr'],
+        ['-preset', 'p1', '-rc', 'cbr', '-b:v', '5M'],
+        ['-preset', 'p4', '-rc', 'constqp', '-qp', '23'],
+        ['-preset', 'p4', '-rc', 'vbr', '-cq', '23'],
+    ]),
+    ('h264_qsv', [['-preset', 'medium', '-global_quality', '23']]),
+    ('h264_amf', [['-quality', 'balanced', '-rc', 'vbr_peak', '-qmin', '18', '-qmax', '28']]),
+    ('h264_videotoolbox', [['-allow_sw', '1', '-b:v', '5M']]),
+]
+
+
 def detect_gpu_encoder():
     """
     Detect available GPU encoder for hardware acceleration.
     Returns tuple: (encoder_name, encoder_args) or (None, None) if no GPU available.
-    Tests each encoder to ensure it actually works before using it.
+    Every encoder ffmpeg lists is test-encoded: stock ffmpeg builds list encoders for hardware that is not there.
     """
     global _GPU_ENCODER_CACHE, _GPU_DISABLED
     if _GPU_DISABLED:
         return (None, None)
     if _GPU_ENCODER_CACHE is not None:
         return _GPU_ENCODER_CACHE
-    
-    # Try NVIDIA NVENC (most common)
+
     try:
         result = subprocess.run(
             ['ffmpeg', '-hide_banner', '-encoders'],
@@ -137,60 +154,19 @@ def detect_gpu_encoder():
             text=True,
             timeout=5
         )
-        if result.returncode == 0:
-            encoders = result.stdout + result.stderr
-            # Try NVIDIA NVENC with different parameter sets
-            # Start with minimal parameters and work up to more complex ones
-            if 'h264_nvenc' in encoders:
-                # Test with different parameter sets (some may work when others don't)
-                # Order matters: test simpler configs first
-                test_configs = [
-                    # Minimal - just preset (most compatible)
-                    (['-preset', 'p4']),
-                    # Preset + rate control
-                    (['-preset', 'p4', '-rc', 'vbr']),
-                    (['-preset', 'p1', '-rc', 'cbr', '-b:v', '5M']),
-                    (['-preset', 'p4', '-rc', 'constqp', '-qp', '23']),
-                    (['-preset', 'p4', '-rc', 'vbr', '-cq', '23']),
-                ]
-                for args in test_configs:
-                    if test_gpu_encoder('h264_nvenc', args):
-                        _GPU_ENCODER_CACHE = ('h264_nvenc', args)
-                        print(f"[GPU] Detected and verified NVIDIA NVENC encoder with args: {args}")
-                        return _GPU_ENCODER_CACHE
-                print("[GPU] NVIDIA NVENC detected but not functional, using CPU")
-            elif 'hevc_nvenc' in encoders:
-                if test_gpu_encoder('hevc_nvenc', ['-preset', 'p4', '-rc', 'vbr', '-cq', '23']):
-                    _GPU_ENCODER_CACHE = ('hevc_nvenc', ['-preset', 'p4', '-rc', 'vbr', '-cq', '23'])
-                    print("[GPU] Detected and verified NVIDIA HEVC NVENC encoder")
+        encoders = (result.stdout + result.stderr) if result.returncode == 0 else ''
+        for encoder_name, argument_sets in GPU_ENCODER_CANDIDATES:
+            if encoder_name not in encoders:
+                continue
+            for encoder_args in argument_sets:
+                if test_gpu_encoder(encoder_name, encoder_args):
+                    _GPU_ENCODER_CACHE = (encoder_name, encoder_args)
+                    print(f"[GPU] Detected and verified {encoder_name} with args: {encoder_args}")
                     return _GPU_ENCODER_CACHE
-            # Try Intel Quick Sync (QSV)
-            elif 'h264_qsv' in encoders:
-                if test_gpu_encoder('h264_qsv', ['-preset', 'medium', '-global_quality', '23']):
-                    _GPU_ENCODER_CACHE = ('h264_qsv', ['-preset', 'medium', '-global_quality', '23'])
-                    print("[GPU] Detected and verified Intel Quick Sync Video encoder")
-                    return _GPU_ENCODER_CACHE
-            # Try AMD VCE/VCN
-            elif 'h264_amf' in encoders:
-                if test_gpu_encoder('h264_amf', ['-quality', 'balanced', '-rc', 'vbr_peak', '-qmin', '18', '-qmax', '28']):
-                    _GPU_ENCODER_CACHE = ('h264_amf', ['-quality', 'balanced', '-rc', 'vbr_peak', '-qmin', '18', '-qmax', '28'])
-                    print("[GPU] Detected and verified AMD AMF encoder")
-                    return _GPU_ENCODER_CACHE
-            # Try VAAPI (Linux)
-            elif 'h264_vaapi' in encoders:
-                if test_gpu_encoder('h264_vaapi', ['-qp', '23']):
-                    _GPU_ENCODER_CACHE = ('h264_vaapi', ['-qp', '23'])
-                    print("[GPU] Detected and verified VAAPI encoder")
-                    return _GPU_ENCODER_CACHE
-            # Try VideoToolbox (macOS)
-            elif 'h264_videotoolbox' in encoders:
-                if test_gpu_encoder('h264_videotoolbox', ['-allow_sw', '1', '-b:v', '5M']):
-                    _GPU_ENCODER_CACHE = ('h264_videotoolbox', ['-allow_sw', '1', '-b:v', '5M'])
-                    print("[GPU] Detected and verified VideoToolbox encoder (macOS)")
-                    return _GPU_ENCODER_CACHE
-    except (subprocess.TimeoutExpired, FileNotFoundError, Exception) as e:
+            print(f"[GPU] {encoder_name} is listed by ffmpeg but not functional on this machine")
+    except Exception as e:
         print(f"[GPU] Could not detect GPU encoder: {e}")
-    
+
     _GPU_ENCODER_CACHE = (None, None)
     print("[GPU] No working GPU encoder found, using CPU (libx264)")
     return _GPU_ENCODER_CACHE
@@ -215,7 +191,6 @@ DEFAULT_PROJECT_STATE = {
 # works; "-preset p4" alone encodes at the encoder's small default bitrate).
 MERGE_GPU_QUALITY_ARGS = {
     'h264_nvenc': ['-preset', 'p5', '-rc', 'vbr', '-cq', '19', '-b:v', '0'],
-    'hevc_nvenc': ['-preset', 'p5', '-rc', 'vbr', '-cq', '21', '-b:v', '0'],
     'h264_qsv': ['-preset', 'medium', '-global_quality', '19'],
     'h264_amf': ['-quality', 'quality', '-rc', 'cqp', '-qp_i', '19', '-qp_p', '19'],
     'h264_videotoolbox': ['-allow_sw', '1', '-q:v', '60'],
@@ -582,6 +557,16 @@ def delete_collection(collection_id):
     return jsonify({'status': 'deleted', 'id': collection_id})
 
 
+@app.errorhandler(Exception)
+def handle_unexpected_error(error):
+    """API callers always get JSON: the frontend cannot show an HTML error page."""
+    if isinstance(error, HTTPException):
+        return jsonify({'error': error.description or error.name}), error.code
+    print(f"[Server] Unhandled error in {request.method} {request.path}: {error}")
+    traceback.print_exc()
+    return jsonify({'error': str(error) or error.__class__.__name__}), 500
+
+
 @app.route('/')
 def index():
     return render_template('index.html')
@@ -602,6 +587,14 @@ LIBRARY_ROOTS = [
                  #"/mnt/media/Youtube"
                  #"/home/user/Desktop/Source"
                  ]
+
+VIDEO_EXTENSIONS = ('.mp4', '.mkv', '.webm', '.mov', '.m4v', '.avi')
+
+# LLM used by "AI Story" (an Ollama server). Overridden by --ollama-url / --ollama-model or the environment
+# variables OLLAMA_URL / OLLAMA_MODEL.
+OLLAMA_URL = os.environ.get('OLLAMA_URL', 'http://dockerlxc.cmprmsd.local:11434/api/generate')
+OLLAMA_MODEL = os.environ.get('OLLAMA_MODEL', 'llama3.2:latest')
+OLLAMA_TIMEOUT = 120
 
 DEFAULT_CLIP_START_PADDING = 0.45
 DEFAULT_CLIP_END_PADDING = 0.45
@@ -654,10 +647,11 @@ def get_sentences():
 def get_files():
     file_list = []
     for root in LIBRARY_ROOTS:
-        for path, dirs, files in os.walk(root):
+        for path, dirs, files in os.walk(root, followlinks=True):
             for file in files:
-                if file.lower().endswith(('.mp4', '.mkv', '.webm')):  # Filter for video files
+                if file.lower().endswith(VIDEO_EXTENSIONS):
                     file_list.append(os.path.join(path, file))
+    file_list.sort(key=str.lower)
     return jsonify(file_list)
 
 
@@ -930,9 +924,9 @@ def generate_story():
     
     # Call Ollama API
     try:
-        ollama_url = "http://dockerlxc.cmprmsd.local:11434/api/generate"
+        ollama_url = OLLAMA_URL
         ollama_payload = {
-            "model": "llama3.2:latest",  # You can make this configurable
+            "model": OLLAMA_MODEL,
             "prompt": llm_prompt,
             "stream": False,
             "options": {
@@ -941,7 +935,7 @@ def generate_story():
             }
         }
         
-        response = requests.post(ollama_url, json=ollama_payload, timeout=120)
+        response = requests.post(ollama_url, json=ollama_payload, timeout=OLLAMA_TIMEOUT)
         response.raise_for_status()
         
         result = response.json()
@@ -1045,7 +1039,9 @@ def generate_story():
                         selected_files,  # Search across all selected files
                         story_counter,
                         export_clips=True,
-                        clip_group=generate_clip_group_name('story', sentence_text, selected_files),
+                        # One group per searched segment: with a shared group every segment of a
+                        # sentence was exported to the same clip file and all cards played the last one.
+                        clip_group=generate_clip_group_name('story', search_query, selected_files),
                         min_silence=0.0,
                         max_silence=10.0,
                         silence_word_threshold=2,
@@ -1137,9 +1133,22 @@ def generate_story():
         
         return jsonify(response_data)
         
+    except requests.exceptions.Timeout:
+        print(f"[Story] ❌ Ollama did not answer within {OLLAMA_TIMEOUT}s")
+        return jsonify({'error': f'The LLM at {OLLAMA_URL} did not answer within {OLLAMA_TIMEOUT} s. '
+                                 f'Try fewer source files or a faster model.'}), 504
+    except requests.exceptions.ConnectionError as e:
+        print(f"[Story] ❌ Cannot reach Ollama: {e}")
+        return jsonify({'error': f'Cannot reach the LLM server at {OLLAMA_URL}. Start Ollama or set '
+                                 f'--ollama-url / OLLAMA_URL.'}), 502
+    except requests.exceptions.HTTPError as e:
+        status = e.response.status_code if e.response is not None else 'unknown'
+        print(f"[Story] ❌ Ollama API error: {e}")
+        return jsonify({'error': f'The LLM server answered with HTTP {status}. Is the model "{OLLAMA_MODEL}" '
+                                 f'installed (ollama pull)?'}), 502
     except requests.exceptions.RequestException as e:
         print(f"[Story] ❌ Ollama API error: {e}")
-        return jsonify({'error': f'Failed to connect to Ollama: {str(e)}'}), 500
+        return jsonify({'error': f'LLM request failed: {str(e)}'}), 502
     except Exception as e:
         print(f"[Story] ❌ Error: {e}")
         traceback.print_exc()
@@ -1811,7 +1820,8 @@ def process_videos(selected_files, phrases, counter, min_silence=0.0, max_silenc
 def _merge_output_name(titles):
     """Timestamped, filesystem-safe file name built from the first words of the timeline."""
     words = ' '.join(str(title or '') for title in titles).replace('_', ' ').split()[:5]
-    name_part = re.sub(r'[^a-zA-Z0-9_-]', '_', '_'.join(words))
+    readable = unicodedata.normalize('NFKD', '_'.join(words).replace('ß', 'ss')).encode('ascii', 'ignore').decode('ascii')
+    name_part = re.sub(r'[^a-zA-Z0-9_-]', '_', readable)
     name_part = re.sub(r'_+', '_', name_part).strip('_')[:100] or 'merge'
     return f"{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}_{name_part}.mp4"
 
@@ -3539,15 +3549,20 @@ def resolve_cut_media(clip=None, source=None, original_start=None, original_end=
     start = _finite_number(original_start)
     end = _finite_number(original_end)
     if source_path and start is not None and end is not None and start >= 0 and end > start:
+        if end - start > MAX_CLIP_SECONDS:
+            raise ClipReferenceError(f'Clip bounds span more than {MAX_CLIP_SECONDS} seconds.')
         return source_path, start, end - start
     clip_path = resolve_media_path(clip)
     if clip_path and os.path.isfile(clip_path):
         info = cached_probe(clip_path)
         seconds = info.audio_duration or info.duration
-        if seconds and seconds > 0:
+        if seconds and 0 < seconds <= MAX_CLIP_SECONDS:
             return clip_path, 0.0, seconds
     raise ClipReferenceError('Clip media not found. The source video may have moved and the cached clip is gone.')
 
+
+# Clips are a few seconds long. The bound keeps a bogus request from decoding hours of audio into memory.
+MAX_CLIP_SECONDS = 600
 
 _PCM_CACHE = OrderedDict()
 _PCM_CACHE_LOCK = Lock()
@@ -3707,7 +3722,29 @@ if __name__ == '__main__':
         default='auto',
         help="Merged video frame rate, e.g. 30 or 30000/1001, or 'auto' for the most common source rate (default: auto)"
     )
+    parser.add_argument(
+        '--ollama-url',
+        type=str,
+        default=None,
+        help=f"Ollama generate endpoint for AI Story (default: env OLLAMA_URL or {OLLAMA_URL})"
+    )
+    parser.add_argument(
+        '--ollama-model',
+        type=str,
+        default=None,
+        help=f"Ollama model for AI Story (default: env OLLAMA_MODEL or {OLLAMA_MODEL})"
+    )
+    parser.add_argument(
+        '--debug',
+        action='store_true',
+        help='Run Flask in debug mode (auto-reload and the interactive debugger). Never use it on a public address.'
+    )
     args = parser.parse_args()
+
+    if args.ollama_url:
+        OLLAMA_URL = args.ollama_url
+    if args.ollama_model:
+        OLLAMA_MODEL = args.ollama_model
 
     # Merge output format
     try:
@@ -3734,11 +3771,13 @@ if __name__ == '__main__':
     MAX_GPU_STREAMS = max(1, args.gpustreams)  # Ensure at least 1
     print(f"[Startup] GPU streams limit set to: {MAX_GPU_STREAMS}")
     
-    # Add additional library paths from command line
-    if args.library_path:
-        for lib_path in args.library_path:
-            # Convert to absolute path and validate
-            abs_path = os.path.abspath(lib_path)
+    # Additional library paths are given relative to where the user started the server ...
+    extra_library_paths = [os.path.abspath(lib_path) for lib_path in args.library_path]
+    # ... while the default "Library" folder (and the paths stored in projects) are relative to the app, like
+    # data/ and temp/: make that true regardless of the directory the server was started from.
+    os.chdir(app.root_path)
+    if extra_library_paths:
+        for abs_path in extra_library_paths:
             if os.path.exists(abs_path):
                 if abs_path not in LIBRARY_ROOTS:
                     LIBRARY_ROOTS.append(abs_path)
@@ -3760,18 +3799,25 @@ if __name__ == '__main__':
     cpu_cores = get_max_workers()
     print(f"[Startup] Using {cpu_cores} CPU cores for parallel processing")
     
-    # Parse listener address
+    # Parse listener address: HOST, HOST:PORT, [IPv6]:PORT or a bare IPv6 address
     try:
-        if ':' in args.listen:
-            host, port = args.listen.rsplit(':', 1)
+        listen = args.listen.strip()
+        bracketed = re.fullmatch(r'\[([^\]]+)\](?::(\d+))?', listen)
+        if bracketed:
+            host, port = bracketed.group(1), int(bracketed.group(2) or 5000)
+        elif listen.count(':') == 1:
+            host, port = listen.split(':')
             port = int(port)
         else:
-            # If no port specified, assume default port 5000
-            host = args.listen
-            port = 5000
+            host, port = listen, 5000
+        if not host or not 1 <= port <= 65535:
+            raise ValueError(listen)
     except ValueError:
         print(f"[Startup] Error: Invalid listener format '{args.listen}'. Expected HOST:PORT (e.g., 0.0.0.0:8080)")
         sys.exit(1)
-    
+
+    if args.debug and host not in ('127.0.0.1', 'localhost', '::1'):
+        print("[Startup] WARNING: --debug exposes an interactive debugger to everyone who can reach "
+              f"{host}:{port}. Do not use it on a network you do not fully trust.")
     print(f"[Startup] Starting server on {host}:{port}")
-    app.run(debug=True, host=host, port=port)
+    app.run(debug=args.debug, use_reloader=args.debug, threaded=True, host=host, port=port)
