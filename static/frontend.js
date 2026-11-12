@@ -26,7 +26,7 @@ let autosaveFailed = false;     // the last save attempt did not reach the serve
 let isApplyingProject = false;
 
 const elements = {};
-const dragState = { type: null, data: null, originalItemPositions: null };
+const dragState = { type: null, data: null };
 
 // Sentence autocomplete state
 let sentenceAutocompleteContainer = null;
@@ -742,7 +742,6 @@ function bindEventListeners() {
         elements.timelineList.addEventListener('dragover', handleTimelineDragOver);
         elements.timelineList.addEventListener('dragleave', handleTimelineDragLeave);
         elements.timelineList.addEventListener('drop', handleTimelineDrop);
-        elements.timelineList.addEventListener('scroll', handleTimelineScrollDuringDrag);
     }
 }
 
@@ -4990,12 +4989,10 @@ function hideSentenceAutocomplete() {
 function resetDragState() {
     dragState.type = null;
     dragState.data = null;
-    dragState.previewTargetIndex = undefined;
-    dragState.originalItemPositions = null;
+    markTimelineDropTarget(null);
     if (elements.timelineList) {
         elements.timelineList.classList.remove('drag-active');
     }
-    document.querySelectorAll('.timeline-item.drag-over').forEach(item => item.classList.remove('drag-over'));
     document.querySelectorAll('.timeline-item.drag-source').forEach(item => item.classList.remove('drag-source'));
     document.querySelectorAll('.phrase-container.drag-source').forEach(item => item.classList.remove('drag-source'));
 }
@@ -5138,195 +5135,54 @@ function registerTimelineItemDrag(item, entry) {
 
         dragState.type = 'timelineItem';
         dragState.data = { id: entry.id };
-        dragState.sourceIndex = Array.from(elements.timelineList.querySelectorAll('.timeline-item')).indexOf(item);
         item.classList.add('drag-source');
         event.dataTransfer.effectAllowed = 'move';
         event.dataTransfer.setData('text/plain', entry.id);
-        
-        if (elements.timelineList) {
-            elements.timelineList.classList.add('drag-active');
-            // Store initial scroll position
-            dragStartScrollLeft = elements.timelineList.scrollLeft;
-            expectedScrollLeft = elements.timelineList.scrollLeft;
-        }
+        elements.timelineList.classList.add('drag-active');
     });
-    item.addEventListener('dragend', () => {
-        item.classList.remove('drag-source');
-        clearTimelineDragPreview();
-        resetDragState();
+    item.addEventListener('dragend', resetDragState);
+}
+
+/**
+ * Where a drop at the pointer inserts into the timeline: before the first card whose middle lies beyond the
+ * pointer, otherwise at the end. Cards are not shifted while dragging, so the preview and the drop always
+ * agree. The list is a row on wide screens and a column on narrow ones.
+ * Returns the insert position (0 … number of clips) and the card edge that shows it.
+ */
+function timelineDropTarget(event) {
+    const items = Array.from(elements.timelineList.querySelectorAll('.timeline-item'));
+    const vertical = getComputedStyle(elements.timelineList).flexDirection.startsWith('column');
+    const pointer = vertical ? event.clientY : event.clientX;
+    const next = items.find(item => {
+        const rect = item.getBoundingClientRect();
+        return pointer < (vertical ? rect.top + rect.height / 2 : rect.left + rect.width / 2);
     });
-    item.addEventListener('dragenter', event => handleTimelineItemDragEnter(event, item));
-    item.addEventListener('dragleave', event => handleTimelineItemDragLeave(event, item));
+    if (next) {
+        return { index: Number(next.dataset.index), marker: next, edge: 'drop-before' };
+    }
+    return { index: getTimelineEntries().length, marker: items[items.length - 1] || null, edge: 'drop-after' };
 }
 
-function handleTimelineItemDragEnter(event, item) {
-    // No longer used for preview - handled by dragover with position detection
-    if (!dragState.type || !activeProject) {
-        return;
-    }
-    event.preventDefault();
+/** Position a timeline clip ends up at when it is dropped at `insertIndex`, or -1 if that leaves it in place. */
+function timelineMovePosition(entryId, insertIndex) {
+    const from = getTimelineEntries().findIndex(entry => entry.id === entryId);
+    const to = insertIndex > from ? insertIndex - 1 : insertIndex;
+    return from === -1 || to === from ? -1 : to;
 }
 
-function handleTimelineItemDragLeave(event, item) {
-    // No longer used for preview - handled by dragover with position detection
-    if (!dragState.type) {
-        return;
-    }
-}
+let timelineDropMarker = null;
 
-// Track preview state
-let previewUpdatePending = false;
-let currentDragSourceIndex = -1;
-let lastComputedTarget = -1;
-let dragStartScrollLeft = 0; // Store scroll position at drag start
-let expectedScrollLeft = 0; // The scroll position we expect (ignoring auto-scroll)
-
-function updateTimelineDragPreviewByPosition(mouseX) {
-    if (!elements.timelineList || dragState.type !== 'timelineItem') {
-        return;
+function markTimelineDropTarget(target) {
+    const element = target ? target.marker : null;
+    const edge = target ? target.edge : null;
+    if (timelineDropMarker && (timelineDropMarker.element !== element || timelineDropMarker.edge !== edge)) {
+        timelineDropMarker.element.classList.remove(timelineDropMarker.edge);
+        timelineDropMarker = null;
     }
-    
-    const allItems = Array.from(elements.timelineList.querySelectorAll('.timeline-item'));
-    const sourceItem = allItems.find(item => item.dataset.id === dragState.data?.id);
-    
-    if (!sourceItem || allItems.length === 0) {
-        return;
+    if (element && !timelineDropMarker) {
+        element.classList.add(edge);
+        timelineDropMarker = { element, edge };
     }
-    
-    const originalPositions = dragState.originalItemPositions;
-    if (!originalPositions || originalPositions.length !== allItems.length) {
-        return;
-    }
-    
-    const sourceIndex = allItems.indexOf(sourceItem);
-    currentDragSourceIndex = sourceIndex;
-    
-    // Use the EXPECTED scroll position for calculations
-    // This ignores any browser auto-scroll caused by transforms
-    const containerRect = elements.timelineList.getBoundingClientRect();
-    const mouseContentPosition = mouseX - containerRect.left + expectedScrollLeft;
-    
-    const itemWidth = originalPositions[sourceIndex].width;
-    const gap = 12;
-    const shiftAmount = itemWidth + gap;
-    
-    // SIMPLE APPROACH: Compare mouse against VISUAL midpoints of each item
-    // Visual midpoint = original midpoint + any transform offset
-    // The transform offset depends on the CURRENT target (from previous frame)
-    
-    const currentTarget = lastComputedTarget >= 0 ? lastComputedTarget : sourceIndex;
-    
-    // Calculate the VISUAL midpoint for each non-source item based on current transforms
-    // An item shifts LEFT if: sourceIndex < currentTarget AND item is between source and target
-    // An item shifts RIGHT if: sourceIndex > currentTarget AND item is between target and source
-    
-    function getVisualMidpoint(itemIndex) {
-        const originalMidpoint = originalPositions[itemIndex].contentMidpoint;
-        
-        if (itemIndex === sourceIndex) {
-            return originalMidpoint; // Source doesn't shift
-        }
-        
-        let offset = 0;
-        if (sourceIndex < currentTarget) {
-            // Items between source+1 and target-1 have shifted LEFT
-            if (itemIndex > sourceIndex && itemIndex < currentTarget) {
-                offset = -shiftAmount;
-            }
-        } else if (sourceIndex > currentTarget) {
-            // Items between target and source-1 have shifted RIGHT
-            if (itemIndex >= currentTarget && itemIndex < sourceIndex) {
-                offset = shiftAmount;
-            }
-        }
-        
-        return originalMidpoint + offset;
-    }
-    
-    // Find target by checking which item's visual midpoint we've crossed
-    // The rule: if mouse is LEFT of an item's visual midpoint, insert BEFORE that item
-    let newTarget = allItems.length; // Default: insert at end
-    
-    for (let i = 0; i < allItems.length; i++) {
-        if (i === sourceIndex) continue; // Skip source
-        
-        const visualMidpoint = getVisualMidpoint(i);
-        
-        if (mouseContentPosition < visualMidpoint) {
-            newTarget = i;
-            break;
-        }
-    }
-    
-    // Update the target
-    lastComputedTarget = newTarget;
-    
-    // Apply transforms based on the NEW target
-    for (let i = 0; i < allItems.length; i++) {
-        const item = allItems[i];
-        if (i === sourceIndex) continue;
-        
-        item.classList.remove('drag-over');
-        
-        if (sourceIndex < newTarget) {
-            // Dragging RIGHT: items between source+1 and target-1 shift LEFT
-            if (i > sourceIndex && i < newTarget) {
-                item.style.transform = `translateX(-${shiftAmount}px)`;
-            } else {
-                item.style.transform = '';
-            }
-        } else if (sourceIndex > newTarget) {
-            // Dragging LEFT: items between target and source-1 shift RIGHT
-            if (i >= newTarget && i < sourceIndex) {
-                item.style.transform = `translateX(${shiftAmount}px)`;
-            } else {
-                item.style.transform = '';
-            }
-        } else {
-            item.style.transform = '';
-        }
-    }
-    
-    // Highlight the drop zone
-    if (newTarget !== sourceIndex) {
-        if (sourceIndex < newTarget && newTarget > 0) {
-            const highlightIndex = newTarget - 1;
-            if (allItems[highlightIndex] && highlightIndex !== sourceIndex) {
-                allItems[highlightIndex].classList.add('drag-over');
-            }
-        } else if (sourceIndex > newTarget) {
-            if (allItems[newTarget] && newTarget !== sourceIndex) {
-                allItems[newTarget].classList.add('drag-over');
-            }
-        }
-    }
-    
-    dragState.previewTargetIndex = newTarget;
-}
-
-function clearTimelineDragPreview() {
-    lastDragMouseX = 0;
-    previewUpdatePending = false;
-    currentDragSourceIndex = -1;
-    lastComputedTarget = -1;
-    dragStartScrollLeft = 0;
-    expectedScrollLeft = 0;
-    
-    if (!elements.timelineList) {
-        return;
-    }
-    
-    // Clear all visual feedback
-    const items = elements.timelineList.querySelectorAll('.timeline-item');
-    items.forEach(item => {
-        item.classList.remove('drag-over');
-        // Reset transforms with smooth transition
-        item.style.transform = '';
-        item.style.transition = 'transform 0.2s ease-out';
-    });
-    
-    // Clear preview state
-    dragState.previewTargetIndex = undefined;
 }
 
 function handleTimelineDragEnter(event) {
@@ -5334,270 +5190,51 @@ function handleTimelineDragEnter(event) {
         return;
     }
     event.preventDefault();
-    if (elements.timelineList) {
-        elements.timelineList.classList.add('drag-active');
-    }
+    elements.timelineList.classList.add('drag-active');
 }
-
-// Store last mouse X for scroll-during-drag updates
-let lastDragMouseX = 0;
 
 function handleTimelineDragOver(event) {
     if (!dragState.type || !activeProject) {
         return;
     }
     event.preventDefault();
+    const moving = dragState.type === 'timelineItem';
     if (event.dataTransfer) {
-        event.dataTransfer.dropEffect = dragState.type === 'timelineItem' ? 'move' : 'copy';
+        event.dataTransfer.dropEffect = moving ? 'move' : 'copy';
     }
-    
-    // Store mouse position for scroll updates
-    lastDragMouseX = event.clientX;
-    
-    // Update preview based on mouse position (throttled via requestAnimationFrame)
-    if (dragState.type === 'timelineItem' && !previewUpdatePending) {
-        previewUpdatePending = true;
-        requestAnimationFrame(() => {
-            updateTimelineDragPreviewByPosition(event.clientX);
-            previewUpdatePending = false;
-        });
-    }
-}
-
-// Handle scroll during drag - ALLOW scrolling but update expected position
-function handleTimelineScrollDuringDrag() {
-    if (dragState.type === 'timelineItem') {
-        // Update expected scroll position to match actual scroll
-        // This allows natural scrolling while maintaining accurate calculations
-        expectedScrollLeft = elements.timelineList.scrollLeft;
-        dragStartScrollLeft = elements.timelineList.scrollLeft;
-    }
-}
-
-// Simplified drag preview update with floating animation
-function updateTimelineDragPreviewByPosition(mouseX) {
-    if (!elements.timelineList || dragState.type !== 'timelineItem') {
-        return;
-    }
-    
-    const timelineRect = elements.timelineList.getBoundingClientRect();
-    const relativeX = mouseX - timelineRect.left + elements.timelineList.scrollLeft;
-    
-    // Find the closest drop position
-    const items = Array.from(elements.timelineList.querySelectorAll('.timeline-item'));
-    let closestIndex = 0;
-    let closestDistance = Infinity;
-    
-    items.forEach((item, index) => {
-        const rect = item.getBoundingClientRect();
-        const itemCenter = rect.left + rect.width / 2 - timelineRect.left + elements.timelineList.scrollLeft;
-        const distance = Math.abs(relativeX - itemCenter);
-        
-        if (distance < closestDistance) {
-            closestDistance = distance;
-            closestIndex = index;
-        }
-    });
-    
-    // Update preview target
-    dragState.previewTargetIndex = closestIndex;
-    
-    // Apply floating animation to create drop gap
-    const sourceIndex = dragState.sourceIndex;
-    items.forEach((item, index) => {
-        const itemElement = item;
-        
-        // Remove any existing transforms
-        itemElement.style.transform = '';
-        itemElement.style.transition = 'transform 0.2s ease-out';
-        
-        // Remove drag-over class from all items first
-        item.classList.remove('drag-over');
-        
-        // Apply floating effect based on drop position
-        if (index === closestIndex) {
-            item.classList.add('drag-over');
-            
-            // If source is before target, float items right to make space
-            if (sourceIndex < closestIndex) {
-                // Items at and after target float right
-                if (index >= closestIndex) {
-                    itemElement.style.transform = 'translateX(60px)';
-                }
-            } 
-            // If source is after target, float items left to make space  
-            else if (sourceIndex > closestIndex) {
-                // Items at and before target float left
-                if (index <= closestIndex) {
-                    itemElement.style.transform = 'translateX(-60px)';
-                }
-            }
-        }
-    });
+    const target = timelineDropTarget(event);
+    const staysInPlace = moving && timelineMovePosition(dragState.data.id, target.index) === -1;
+    markTimelineDropTarget(staysInPlace ? null : target);
 }
 
 function handleTimelineDragLeave(event) {
-    if (!dragState.type || !elements.timelineList) {
+    if (!dragState.type) {
         return;
     }
     const related = event.relatedTarget;
     if (!related || !elements.timelineList.contains(related)) {
         elements.timelineList.classList.remove('drag-active');
-        document.querySelectorAll('.timeline-item.drag-over').forEach(item => item.classList.remove('drag-over'));
-        clearTimelineDragPreview();
+        markTimelineDropTarget(null);
     }
 }
 
 function handleTimelineDrop(event) {
-    if (!dragState.type || !activeProject) {
-        clearTimelineDragPreview();
-        resetDragState();
-        return;
-    }
-    event.preventDefault();
-    
-    // Use preview target index if available (more accurate), otherwise calculate from event
-    const dropIndex = dragState.previewTargetIndex !== undefined 
-        ? dragState.previewTargetIndex 
-        : getTimelineDropIndex(event);
-    
-    console.log('Drop index:', dropIndex, 'Drag type:', dragState.type, 'Preview index:', dragState.previewTargetIndex);
-
-    if (dragState.type === 'searchClip' && dragState.data) {
-        const entry = createTimelineEntry(dragState.data);
-        if (entry) {
-            updateTimeline(entries => {
-                const index = Math.max(0, Math.min(dropIndex, entries.length));
-                entries.splice(index, 0, entry);
-            });
-        }
-    } else if (dragState.type === 'timelineItem' && dragState.data) {
-        const movingId = dragState.data.id;
-        const sourceIndex = dragState.sourceIndex;
-        if (movingId && sourceIndex !== undefined) {
-            updateTimeline(entries => {
-                console.log('Moving item from index:', sourceIndex, 'to index:', dropIndex);
-                
-                if (sourceIndex === -1 || sourceIndex >= entries.length) {
-                    console.warn('Invalid source index');
-                    return;
-                }
-                
-                // Clamp target index to valid range
-                let targetIndex = Math.max(0, Math.min(dropIndex, entries.length));
-                
-                // If dropping at the same position, do nothing
-                if (targetIndex === sourceIndex) {
-                    console.log('No move needed - same position');
-                    return;
-                }
-                
-                // Remove the item from its current position
-                const [item] = entries.splice(sourceIndex, 1);
-                
-                // Adjust target index if we removed an item before the target
-                if (sourceIndex < targetIndex) {
-                    targetIndex -= 1;
-                }
-                
-                console.log('Inserting at adjusted index:', targetIndex);
-                
-                // Insert at the target position
-                entries.splice(targetIndex, 0, item);
-            });
+    const { type, data } = dragState;
+    if (type && data && activeProject) {
+        event.preventDefault();
+        const insertIndex = timelineDropTarget(event).index;
+        if (type === 'searchClip') {
+            const entry = createTimelineEntry(data);
+            if (entry) {
+                updateTimeline(entries => {
+                    entries.splice(Math.min(insertIndex, entries.length), 0, entry);
+                });
+            }
+        } else if (type === 'timelineItem') {
+            moveTimelineEntryTo(data.id, timelineMovePosition(data.id, insertIndex));
         }
     }
-
-    clearTimelineDragPreview();
     resetDragState();
-}
-
-function getTimelineDropIndex(event) {
-    const entries = getTimelineEntries();
-    
-    if (!elements.timelineList) {
-        console.log('getTimelineDropIndex: No timeline list');
-        return entries.length;
-    }
-    
-    // Get all timeline items in DOM order
-    const allItems = Array.from(elements.timelineList.querySelectorAll('.timeline-item'));
-    
-    if (allItems.length === 0) {
-        console.log('getTimelineDropIndex: No items');
-        return 0;
-    }
-    
-    const mouseX = event.clientX;
-    let targetItem = null;
-    
-    // First try to find target via closest (works when dropping directly on an item)
-    targetItem = event.target.closest('.timeline-item');
-    
-    // If not found, find which item the cursor is visually over
-    if (!targetItem) {
-        for (const item of allItems) {
-            const rect = item.getBoundingClientRect();
-            // getBoundingClientRect accounts for CSS transforms, so this gives visual position
-            if (mouseX >= rect.left && mouseX <= rect.right) {
-                targetItem = item;
-                break;
-            }
-        }
-    }
-    
-    // If still not found, check if we're before first or after last
-    if (!targetItem) {
-        const firstRect = allItems[0].getBoundingClientRect();
-        const lastRect = allItems[allItems.length - 1].getBoundingClientRect();
-        
-        if (mouseX < firstRect.left) {
-            console.log('getTimelineDropIndex: Before first item, returning 0');
-            return 0;
-        } else if (mouseX > lastRect.right) {
-            console.log('getTimelineDropIndex: After last item, returning', entries.length);
-        return entries.length;
-    }
-        // If we're in the timeline area but not over any item, try to find closest item
-        console.log('getTimelineDropIndex: Not over any item, finding closest');
-        let closestItem = null;
-        let closestDistance = Infinity;
-        for (const item of allItems) {
-            const rect = item.getBoundingClientRect();
-            const centerX = rect.left + rect.width / 2;
-            const distance = Math.abs(mouseX - centerX);
-            if (distance < closestDistance) {
-                closestDistance = distance;
-                closestItem = item;
-            }
-        }
-        if (closestItem) {
-            targetItem = closestItem;
-        } else {
-            console.log('getTimelineDropIndex: No closest item found, defaulting to end');
-        return entries.length;
-    }
-    }
-    
-    // Get the array index from the target item's dataset
-    // This is the index in the entries array, not DOM position
-    const targetArrayIndex = parseInt(targetItem.dataset.index || '-1', 10);
-    
-    console.log('getTimelineDropIndex: Target item dataset.index:', targetItem.dataset.index, 'parsed:', targetArrayIndex);
-    
-    if (Number.isNaN(targetArrayIndex) || targetArrayIndex < 0) {
-        console.warn('getTimelineDropIndex: Invalid targetArrayIndex, returning end');
-        return entries.length;
-    }
-    
-    // Determine if we're dropping before or after this item
-    const rect = targetItem.getBoundingClientRect();
-    const isAfter = mouseX > rect.left + rect.width / 2;
-    
-    const result = isAfter ? targetArrayIndex + 1 : targetArrayIndex;
-    console.log('getTimelineDropIndex: mouseX:', mouseX, 'rect center:', rect.left + rect.width / 2, 'isAfter:', isAfter, 'result:', result);
-    
-    return result;
 }
 
 function getTimelineEntries() {
@@ -6317,20 +5954,23 @@ function clearTimeline() {
     });
 }
 
-function moveTimelineItem(entryId, direction) {
-    if (!activeProject) {
+/** Move a clip to position `target` of the timeline. Does nothing (no undo step, no save) if it is already there. */
+function moveTimelineEntryTo(entryId, target) {
+    const entries = getTimelineEntries();
+    const index = entries.findIndex(entry => entry.id === entryId);
+    if (!activeProject || index === -1 || target === index || target < 0 || target >= entries.length) {
         return;
     }
-    const offset = direction === 'up' ? -1 : 1;
-    updateTimeline(entries => {
-        const index = entries.findIndex(entry => entry.id === entryId);
-        const target = index + offset;
-        if (index === -1 || target < 0 || target >= entries.length) {
-            return;
-        }
-        const [moved] = entries.splice(index, 1);
-        entries.splice(target, 0, moved);
+    updateTimeline(list => {
+        list.splice(target, 0, list.splice(index, 1)[0]);
     });
+}
+
+function moveTimelineItem(entryId, direction) {
+    const index = getTimelineEntries().findIndex(entry => entry.id === entryId);
+    if (index !== -1) {
+        moveTimelineEntryTo(entryId, index + (direction === 'up' ? -1 : 1));
+    }
 }
 
 /** Clips of older versions are named by a running index (or "_trimmed_"): a later search could overwrite them. */
