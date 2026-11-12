@@ -192,6 +192,19 @@ class ClipEndpointsTest(ServerTestCase):
         self.assertEqual(self.client.post('/ensure_clip', json=self.reference).get_json()['status'], 'exists')
         self.assertAlmostEqual(server.cached_probe(clip_path).audio_duration, 1.75, delta=0.03)
 
+    def test_legacy_clips_can_be_rehomed_to_a_content_addressed_file(self):
+        legacy = {**self.reference, 'clip': 'temp/sentence-x_clips/sentence-x_00003.mp4'}
+        first = self.client.post('/ensure_clip', json={**legacy, 'canonical': True}).get_json()
+        self.assertEqual(first['status'], 'restored')
+        self.assertRegex(first['clip'], r'^temp/sentence-x_clips/sentence-x_[0-9a-f]{16}\.mp4$')
+        self.assertTrue(os.path.isfile(server.resolve_media_path(first['clip'])))
+        self.assertFalse(os.path.exists(server.resolve_media_path(legacy['clip'])))
+        again = self.client.post('/ensure_clip', json={**legacy, 'canonical': True}).get_json()
+        self.assertEqual((again['status'], again['clip']), ('exists', first['clip']))
+        # a fresh search for the same cut uses the very same file name
+        self.assertEqual(os.path.basename(first['clip']),
+                         server.clip_file_name('sentence-x', self.reference['source'], 1.25, 3.0))
+
     def test_merge_stream_renders_the_timeline(self):
         videos = [
             {'title': 'one', **self.reference, 'startTrim': 250, 'endTrim': 250, 'speed': 1},

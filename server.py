@@ -2668,26 +2668,40 @@ def get_waveform():
 
 @app.route('/ensure_clip', methods=['POST'])
 def ensure_clip():
-    """Re-create a preview clip that vanished from temp/ (cache cleanup) from its source video and bounds."""
-    data = request.get_json(silent=True) or {}
+    """Make sure a preview clip exists, re-cutting it from its source video and bounds if necessary.
+
+    With ``canonical`` the clip is (re)homed to its content-addressed name (see clip_file_name) and that path is
+    returned. Timeline entries made before clips were content-addressed point at index-named files that a
+    later search may have overwritten with other footage; this gives them a file that is theirs.
+    """
+    data = request_json_object()
     reference = _clip_reference_from(data)
     clip_path = resolve_media_path(reference['clip'])
     if not clip_path or not _is_inside(clip_path, TEMP_DIR) or not clip_path.lower().endswith('.mp4'):
         return jsonify({'error': 'Invalid clip path'}), 400
-    if os.path.isfile(clip_path):
-        return jsonify({'status': 'exists', 'clip': reference['clip']})
+    clip_reference = reference['clip']
     source_path = resolve_source_video(reference['source'])
     start = _finite_number(reference['original_start'])
     end = _finite_number(reference['original_end'])
-    if not source_path or start is None or end is None or start < 0 or end <= start:
+    has_bounds = bool(source_path) and start is not None and end is not None and start >= 0 and end > start
+
+    if data.get('canonical') and has_bounds:
+        folder = os.path.dirname(clip_path)
+        folder_name = os.path.basename(folder)
+        group = folder_name[:-len('_clips')] if folder_name.endswith('_clips') else 'clip'
+        clip_path = os.path.join(folder, clip_file_name(group, reference['source'], start, end))
+        clip_reference = posixpath.join('temp', os.path.relpath(clip_path, TEMP_DIR).replace(os.sep, '/'))
+
+    if os.path.isfile(clip_path):
+        return jsonify({'status': 'exists', 'clip': clip_reference})
+    if not has_bounds:
         return jsonify({'error': 'The clip is gone and its source video or bounds are unknown'}), 404
     try:
         render_preview_clip(source_path, start, end, clip_path)
     except (RuntimeError, OSError, subprocess.SubprocessError) as exc:
         print(f"[ensure_clip] {exc}")
         return jsonify({'error': str(exc)}), 500
-    return jsonify({'status': 'restored', 'clip': reference['clip']})
-
+    return jsonify({'status': 'restored', 'clip': clip_reference})
 
 
 if __name__ == '__main__':

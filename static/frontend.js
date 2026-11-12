@@ -6112,10 +6112,15 @@ function moveTimelineItem(entryId, direction) {
     });
 }
 
+/** Clips of older versions are named by a running index (or "_trimmed_"): a later search could overwrite them. */
+function isLegacyClipName(clipPath) {
+    return /_\d{5}\.mp4$|_trimmed_\d+_\d+\.mp4$/.test(clipPath || '');
+}
+
 /**
  * Preview clips live in temp/ and disappear when that folder is cleaned. Re-cut the missing ones from their
- * library sources (same paths, so nothing in the project changes). Single clips are also restored on demand
- * when they are played.
+ * library sources. Entries from older versions are moved to a clip file named after its content, so their
+ * picture can no longer be replaced by another search. Single clips are also restored on demand when played.
  */
 async function restoreMissingClips() {
     const button = elements.timelineRestoreButton;
@@ -6126,7 +6131,7 @@ async function restoreMissingClips() {
     const references = new Map();
     entries.forEach(entry => {
         const item = entryToItem(entry);
-        references.set(item.clip, item);
+        references.set(clipRefKey(item), item);
     });
 
     const label = button ? button.textContent : '';
@@ -6135,8 +6140,9 @@ async function restoreMissingClips() {
     }
     let restored = 0;
     const failed = [];
+    const moved = new Map();      // clip reference key -> new clip path
     let checked = 0;
-    for (const item of references.values()) {
+    for (const [key, item] of references) {
         checked += 1;
         if (button) {
             button.textContent = `Checking ${checked}/${references.size}…`;
@@ -6145,29 +6151,50 @@ async function restoreMissingClips() {
             const response = await fetch('/ensure_clip', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(makeClipRef(item))
+                body: JSON.stringify({ ...makeClipRef(item), canonical: isLegacyClipName(item.clip) })
             });
             const result = await response.json().catch(() => ({}));
             if (!response.ok) {
                 failed.push(`${item.title}: ${result.error || response.status}`);
-            } else if (result.status === 'restored') {
+                continue;
+            }
+            if (result.status === 'restored') {
                 restored += 1;
+            }
+            if (result.clip && result.clip !== item.clip) {
+                moved.set(key, result.clip);
             }
         } catch (error) {
             failed.push(`${item.title}: ${error.message}`);
         }
     }
+    if (moved.size) {
+        updateProjectData(data => {
+            (Array.isArray(data.timeline) ? data.timeline : []).forEach(entry => {
+                const clip = entry && moved.get(clipRefKey(entryToItem(entry)));
+                if (clip) {
+                    const trims = getEntryTrims(entry);
+                    entry.file = clip;
+                    entry.originalClipPath = clip;
+                    entry.rerendered = false;
+                    entry.startTrim = entry.displayStartTrim = trims.start;
+                    entry.endTrim = entry.displayEndTrim = trims.end;
+                }
+            });
+        });
+    }
     if (button) {
         button.disabled = false;
         button.textContent = label;
     }
-    if (restored || failed.length) {
+    if (restored || moved.size || failed.length) {
         waveformCache.clear();
         renderTimeline();
     }
     if (failed.length) {
         alert(`${restored} clip(s) restored, ${failed.length} could not be restored:\n\n${failed.slice(0, 10).join('\n')}`);
     } else {
-        setAutosaveStatus(restored ? `Restored ${restored} missing clip(s)` : 'All timeline clips are present', 'saved');
+        const changed = Math.max(restored, moved.size);
+        setAutosaveStatus(changed ? `Restored ${changed} clip(s)` : 'All timeline clips are present', 'ready');
     }
 }
