@@ -11,8 +11,10 @@ import sys
 import traceback
 import unicodedata
 import uuid
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
+from fractions import Fraction
 from pathlib import Path
 from threading import Lock, Semaphore
 from typing import List, Optional, Sequence, Tuple
@@ -20,6 +22,7 @@ from typing import List, Optional, Sequence, Tuple
 from flask import Flask, jsonify, render_template, request, send_from_directory, Response, stream_with_context
 from videogrep import parse_transcript
 from srt_word_boundaries import convert_subtitles
+import render_pipeline
 
 app = Flask(__name__)
 
@@ -531,6 +534,11 @@ DEFAULT_CLIP_START_PADDING = 0.45
 DEFAULT_CLIP_END_PADDING = 0.45
 MAX_CLIPS_PER_SEGMENT = 25
 CLIP_METADATA_FILENAME = 'metadata.json'
+
+# Merge output format. None = follow the timeline (most common source resolution / frame rate).
+# Overridden by --merge-resolution / --merge-fps.
+MERGE_RESOLUTION = (1920, 1080)
+MERGE_FPS = None
 
 
 @app.route("/get_sentences", methods=['POST'])
@@ -1724,408 +1732,89 @@ def process_videos(selected_files, phrases, counter, min_silence=0.0, max_silenc
     return results
 
 
+def _merge_output_name(titles):
+    """Timestamped, filesystem-safe file name built from the first words of the timeline."""
+    words = ' '.join(str(title or '') for title in titles).replace('_', ' ').split()[:5]
+    name_part = re.sub(r'[^a-zA-Z0-9_-]', '_', '_'.join(words))
+    name_part = re.sub(r'_+', '_', name_part).strip('_')[:100] or 'merge'
+    return f"{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}_{name_part}.mp4"
+
+
+def build_merge_segments(video_info):
+    """Turn the client's timeline payload into render segments (cut straight from the library sources)."""
+    segments = []
+    for index, video in enumerate(video_info):
+        if not isinstance(video, dict):
+            raise render_pipeline.RenderError(f'Timeline entry {index + 1} is malformed.')
+        title = str(video.get('title') or f'Clip {index + 1}')
+        try:
+            media, base, seconds = resolve_cut_media(**_clip_reference_from(video))
+        except ClipReferenceError:
+            raise render_pipeline.RenderError(
+                f'Clip {index + 1} ("{title}") has no media any more. Use "Restore missing clips" or remove it.')
+        start_trim = max(0.0, sanitize_float(video.get('startTrim'), 0.0)) / 1000.0
+        end_trim = max(0.0, sanitize_float(video.get('endTrim'), 0.0)) / 1000.0
+        duration = seconds - start_trim - end_trim
+        if duration < render_pipeline.MIN_SEGMENT_SECONDS:
+            raise render_pipeline.RenderError(
+                f'Clip {index + 1} ("{title}") is trimmed to nothing: {seconds * 1000:.0f} ms long, '
+                f'trims {start_trim * 1000:.0f} + {end_trim * 1000:.0f} ms.')
+        segments.append(render_pipeline.Segment(
+            media=media,
+            start=base + start_trim,
+            duration=duration,
+            speed=render_pipeline.clamp_speed(video.get('speed')),
+            title=title,
+        ))
+    return segments
+
+
 @app.route('/merge_videos_stream', methods=['POST'])
 def merge_videos_stream():
-    """SSE endpoint that streams merge progress updates."""
-    data = request.json
-    video_info = data['videos']
-    
+    """SSE endpoint: render the timeline sample-accurately and stream progress."""
+    data = request.get_json(silent=True) or {}
+    video_info = data.get('videos')
+    if not isinstance(video_info, list) or not video_info:
+        return jsonify({'error': 'No videos to merge'}), 400
+
     print(f"[Merge SSE] Received {len(video_info)} videos to merge")
-    
-    # Generate filename
-    from datetime import datetime
-    timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M')
-    
-    # Get all titles and join them, then take first 5 words
-    all_titles = " ".join([video['title'] for video in video_info])
-    words = all_titles.split()[:5]  # Take only first 5 words
-    name_part = "_".join(words)
-    
-    # Sanitize filename by removing/replacing problematic characters
-    import re
-    # Replace any character that's not alphanumeric, underscore, or hyphen with underscore
-    name_part = re.sub(r'[^a-zA-Z0-9_-]', '_', name_part)
-    # Replace multiple underscores with single underscore
-    name_part = re.sub(r'_+', '_', name_part)
-    # Remove leading/trailing underscores
-    name_part = name_part.strip('_')
-    
-    # Limit name part length to 100 chars (additional safety)
-    if len(name_part) > 100:
-        name_part = name_part[:100]
-    
-    filename = f"{timestamp}_{name_part}.mp4"
+    filename = _merge_output_name(video.get('title') if isinstance(video, dict) else '' for video in video_info)
     output_path = os.path.join(TEMP_DIR, filename)
-    
+
     def generate():
-        total_videos = len(video_info)
-        
         try:
-            # Stream progress updates during merge
-            for progress_update in merge_videos_with_progress(video_info, output_path):
-                try:
-                    yield f'data: {json.dumps(progress_update)}\n\n'
-                except (GeneratorExit, BrokenPipeError, ConnectionError):
-                    print(f"[Merge SSE] ❌ Client disconnected")
-                    return
-            
-            # Signal completion
-            yield f'data: {{"done": true, "merged_video": "temp/{filename}"}}\n\n'
-        except Exception as e:
-            print(f"[Merge SSE] ❌ Error during merge: {e}")
+            segments = build_merge_segments(video_info)
+            events = render_pipeline.render_timeline(
+                segments,
+                output_path,
+                TEMP_DIR,
+                resolution=MERGE_RESOLUTION,
+                fps=MERGE_FPS,
+                gpu_encoder=get_gpu_encoder(),
+                gpu_slots=GPU_ENCODING_SEMAPHORE,
+                on_gpu_failure=disable_gpu_encoder,
+                max_workers=get_max_workers(),
+            )
+            summary = {}
+            for progress_update in events:
+                summary = progress_update
+                yield f'data: {json.dumps(progress_update)}\n\n'
+            print(f"[Merge SSE] ✓ {filename}: {summary.get('duration_ms')} ms, {summary.get('frames')} frames, "
+                  f"{summary.get('width')}x{summary.get('height')} @ {summary.get('fps')} fps ({summary.get('encoder')})")
+            yield f'data: {json.dumps({"done": True, "merged_video": f"temp/{filename}"})}\n\n'
+        except (GeneratorExit, BrokenPipeError, ConnectionError):
+            print("[Merge SSE] ❌ Client disconnected")
+            raise
+        except render_pipeline.RenderError as exc:
+            print(f"[Merge SSE] ❌ {exc}")
+            yield f'data: {json.dumps({"error": str(exc)})}\n\n'
+        except Exception as exc:
+            print(f"[Merge SSE] ❌ Error during merge: {exc}")
             traceback.print_exc()
-            try:
-                yield f'data: {{"error": "{str(e)}"}}\n\n'
-            except (GeneratorExit, BrokenPipeError, ConnectionError):
-                return
-    
+            yield f'data: {json.dumps({"error": str(exc)})}\n\n'
+
     return Response(stream_with_context(generate()), mimetype='text/event-stream')
 
-
-def merge_videos_with_progress(videos, output_path):
-    """Generator version of merge_videos that yields progress updates."""
-    temp_files = []
-    total_videos = len(videos)
-    
-    # First pass: detect all video resolutions to determine target resolution
-    yield {'stage': 'detecting_resolutions', 'message': 'Detecting video resolutions...', 'progress': 0, 'total': total_videos}
-    
-    resolutions = []
-    for i, video in enumerate(videos):
-        video_path = video['video']
-        if video_path.startswith('temp/'):
-            input_path = os.path.join(app.root_path, video_path)
-        else:
-            input_path = os.path.join(app.root_path, 'static', video_path)
-        
-        if not os.path.exists(input_path):
-            continue
-            
-        # Get video resolution
-        probe_command = [
-            'ffprobe', '-v', 'error',
-            '-select_streams', 'v:0',
-            '-show_entries', 'stream=width,height',
-            '-of', 'default=noprint_wrappers=1:nokey=1',
-            input_path
-        ]
-        probe_result = subprocess.run(probe_command, capture_output=True, text=True)
-        if probe_result.returncode == 0:
-            lines = probe_result.stdout.strip().split('\n')
-            if len(lines) >= 2:
-                width = int(lines[0])
-                height = int(lines[1])
-                resolutions.append((width, height))
-    
-    # Determine target resolution (use most common, or first if all different)
-    if resolutions:
-        # Count occurrences
-        from collections import Counter
-        resolution_counts = Counter(resolutions)
-        target_resolution = resolution_counts.most_common(1)[0][0]
-        target_width, target_height = target_resolution
-        print(f"[Merge] Target resolution: {target_width}x{target_height} (most common: {resolution_counts[target_resolution]} videos)")
-    else:
-        # Fallback to 1920x1080 if we can't detect
-        target_width, target_height = 1920, 1080
-        print(f"[Merge] Using default target resolution: {target_width}x{target_height}")
-
-    for i, video in enumerate(videos):
-        # Handle both temp/ and static/ paths
-        video_path = video['video']
-        if video_path.startswith('temp/'):
-            input_path = os.path.join(app.root_path, video_path)
-        else:
-            input_path = os.path.join(app.root_path, 'static', video_path)
-        
-        # Validate file exists
-        if not os.path.exists(input_path):
-            raise FileNotFoundError(f"Video file not found: {input_path} (from path: {video_path})")
-        
-        start_trim = video['startTrim'] / 1000  # Convert ms to seconds
-        end_trim = video['endTrim'] / 1000
-        
-        # Check if video is already pre-rendered (has been re-rendered with custom trims)
-        # A video is considered pre-rendered if it's in temp/ and has matching trim metadata
-        is_prerendered = False
-        if video_path.startswith('temp/'):
-            # For temp files, check if they've been re-rendered with the current trims
-            # If the file is already in temp/, it's likely been re-rendered
-            is_prerendered = True
-            print(f"[Merge] Video {i+1}: Detected as pre-rendered (temp file)")
-        else:
-            # For non-temp files, check if trims are 0 (not yet re-rendered)
-            is_prerendered = (video['startTrim'] == 0 and video['endTrim'] == 0)
-            print(f"[Merge] Video {i+1}: Checking pre-rendered status: {is_prerendered}")
-        
-        print(f"[Merge] Video {i+1}: {video_path}, start_trim={start_trim}s, end_trim={end_trim}s, prerendered={is_prerendered}")
-        
-        # Yield progress update
-        video_title = video.get('title', f'Video {i+1}')
-        yield {
-            'stage': 'processing_videos',
-            'message': f'Processing: {video_title} ({i+1}/{total_videos})',
-            'progress': i,
-            'total': total_videos,
-            'current_video': video_title
-        }
-
-        temp_file = os.path.join(TEMP_DIR, f'temp_merge_{i}.mp4')
-        temp_files.append(temp_file)
-
-        # Use ffprobe to get the total duration of the video
-        duration_command = [
-            'ffprobe', '-v', 'error',
-            '-show_entries', 'format=duration',
-            '-of', 'default=noprint_wrappers=1:nokey=1',
-            input_path
-        ]
-        duration_result = subprocess.run(duration_command, capture_output=True, text=True)
-        
-        if duration_result.returncode != 0:
-            raise RuntimeError(f"Failed to get video duration: {duration_result.stderr}")
-        
-        duration_str = duration_result.stdout.strip()
-        if not duration_str:
-            raise ValueError(f"Empty duration result for video: {input_path}")
-        
-        total_duration = float(duration_str)
-
-        # Calculate the duration after applying both trims
-        # For pre-rendered videos, no trimming is applied
-        if is_prerendered:
-            output_duration = total_duration
-            print(f"[Merge] Video {i+1}: pre-rendered, using full duration={total_duration}s")
-        else:
-            # Duration = total_duration - start_trim - end_trim
-            output_duration = total_duration - start_trim - end_trim
-            print(f"[Merge] Video {i+1}: total_duration={total_duration}s, output_duration={output_duration}s")
-        
-        # Ensure duration is positive (only check for non-pre-rendered videos)
-        if not is_prerendered and output_duration <= 0:
-            raise ValueError(f"Invalid trim values: start_trim={start_trim}, end_trim={end_trim}, total_duration={total_duration}")
-        
-        # Ensure minimum duration for proper encoding (ffmpeg needs at least ~0.1s for video)
-        MIN_DURATION = 0.1
-        if not is_prerendered and output_duration < MIN_DURATION:
-            print(f"[Merge] Warning: Video {i+1} output duration ({output_duration}s) is very short. Adjusting to minimum {MIN_DURATION}s")
-            # Adjust start_trim to allow minimum duration if possible
-            if total_duration >= start_trim + MIN_DURATION:
-                start_trim = max(0, total_duration - MIN_DURATION - end_trim)
-                output_duration = total_duration - start_trim - end_trim
-                print(f"[Merge] Adjusted start_trim to {start_trim}s, new output_duration: {output_duration}s")
-            else:
-                # If video is too short, use the entire video
-                start_trim = 0
-                end_trim = 0
-                output_duration = total_duration
-                print(f"[Merge] Video too short, using entire video: {output_duration}s")
-
-        # Get current video resolution to check if scaling is needed
-        probe_command = [
-            'ffprobe', '-v', 'error',
-            '-select_streams', 'v:0',
-            '-show_entries', 'stream=width,height',
-            '-of', 'default=noprint_wrappers=1:nokey=1',
-            input_path
-        ]
-        probe_result = subprocess.run(probe_command, capture_output=True, text=True)
-        current_width, current_height = target_width, target_height
-        if probe_result.returncode == 0:
-            lines = probe_result.stdout.strip().split('\n')
-            if len(lines) >= 2:
-                current_width = int(lines[0])
-                current_height = int(lines[1])
-        
-        # Get speed (default 1.0 = 100%)
-        speed = video.get('speed', 1.0)
-        if speed is None or speed <= 0:
-            speed = 1.0
-        # Clamp speed to valid range (0.5 to 1.0)
-        speed = max(0.5, min(1.0, speed))
-        
-        # Trim and re-encode video segment
-        # For pre-rendered videos, just copy them directly to avoid timing issues
-        if is_prerendered:
-            print(f"[Merge] Video {i+1}: Pre-rendered, copying directly without re-encoding")
-            # Just copy the file directly
-            import shutil
-            shutil.copy2(input_path, temp_file)
-        else:
-            # Use -t before -i to limit INPUT duration (allows speed filter to extend output)
-            # Add -vsync cfr and -r to ensure consistent frame rate for short segments
-            # Scale to target resolution if needed
-            trim_command = ['ffmpeg', '-y']
-            
-            # Only add trimming parameters for non-pre-rendered videos
-            trim_command.extend([
-                '-ss', str(start_trim),
-                '-t', str(output_duration),  # Limit INPUT duration (before -i)
-            ])
-            
-            trim_command.extend(['-i', input_path])
-            
-            # Build video filter chain
-            video_filters = []
-            audio_filters = []
-            
-            # Calculate final output duration for logging
-            final_output_duration = output_duration / speed
-            
-            # Add speed adjustment if not 1.0
-            if speed != 1.0:
-                # For video: setpts=PTS/speed (e.g., 0.5 speed -> setpts=PTS/0.5 = PTS*2)
-                video_filters.append(f'setpts=PTS/{speed}')
-                # For audio: atempo=speed (atempo accepts 0.5 to 2.0)
-                audio_filters.append(f'atempo={speed}')
-                print(f"[Merge] Video {i+1}: Applying speed={speed} ({int(speed*100)}%), input={output_duration:.2f}s -> output={final_output_duration:.2f}s")
-            
-            # Add scale filter if resolution differs from target
-            # Use crop-to-fill instead of letterboxing to avoid black bars
-            if current_width != target_width or current_height != target_height:
-                # Scale up to cover target, then crop to exact size (no black bars)
-                video_filters.append(f'scale={target_width}:{target_height}:force_original_aspect_ratio=increase,crop={target_width}:{target_height}')
-                print(f"[Merge] Video {i+1}: Scaling from {current_width}x{current_height} to {target_width}x{target_height} (crop-to-fill)")
-            
-            # Apply video filters if any
-            if video_filters:
-                trim_command.extend(['-vf', ','.join(video_filters)])
-            
-            # Apply audio filters if any
-            if audio_filters:
-                trim_command.extend(['-af', ','.join(audio_filters)])
-            
-            trim_command.extend([
-                '-c:v', 'libx264',
-                '-preset', 'medium',  # Better quality (was ultrafast)
-                '-crf', '18',  # High quality (lower = better, 18 is visually lossless)
-                '-c:a', 'aac',
-                '-ac', '2',  # Force stereo output (fixes mono and 5.1 issues)
-                '-b:a', '192k',  # Higher audio bitrate for quality
-                '-vsync', 'cfr',  # Constant frame rate
-                '-r', '30',  # 30fps for smoother playback
-                '-pix_fmt', 'yuv420p',  # Ensure compatible pixel format
-                temp_file
-            ])
-            trim_result = subprocess.run(trim_command, capture_output=True, text=True)
-            if trim_result.returncode != 0:
-                # Clean up error message to prevent JSON parsing issues
-                clean_error = trim_result.stderr.replace('\n', ' ').replace('\r', ' ').strip()
-                raise RuntimeError(f"Failed to process video segment {i+1}: {clean_error}")
-        
-        # Verify the output file exists and has valid video/audio
-        if not os.path.exists(temp_file):
-            raise FileNotFoundError(f"Video file was not created: {temp_file}")
-        
-        # Check if file has video stream using ffprobe
-        probe_command = [
-            'ffprobe', '-v', 'error',
-            '-select_streams', 'v:0',
-            '-show_entries', 'stream=codec_type',
-            '-of', 'default=noprint_wrappers=1:nokey=1',
-            temp_file
-        ]
-        probe_result = subprocess.run(probe_command, capture_output=True, text=True)
-        if probe_result.returncode != 0 or 'video' not in probe_result.stdout.lower():
-            raise RuntimeError(f"Video {i+1} does not contain a valid video stream. FFmpeg output: {trim_result.stderr}")
-        
-        print(f"[Merge] ✓ Video {i+1} {'processed' if is_prerendered else 'trimmed'} successfully: {temp_file} ({output_duration}s)")
-        
-        # Yield progress after each video is processed
-        yield {
-            'stage': 'processing_videos',
-            'message': f'Completed: {video_title} ({i+1}/{total_videos})',
-            'progress': i + 1,
-            'total': total_videos,
-            'current_video': video_title
-        }
-
-    # Merge re-encoded segments
-    yield {'stage': 'merging', 'message': 'Merging all videos together...', 'progress': total_videos, 'total': total_videos}
-    
-    file_list_path = os.path.join(TEMP_DIR, 'file_list.txt')
-    print(f"[Merge] Writing file list with {len(temp_files)} files:")
-    with open(file_list_path, 'w') as file:
-        for idx, temp_file in enumerate(temp_files):
-            abs_path = os.path.abspath(temp_file)
-            file.write(f"file '{abs_path}'\n")
-            print(f"[Merge]   [{idx+1}] {abs_path}")
-            # Verify file exists
-            if not os.path.exists(temp_file):
-                raise FileNotFoundError(f"Temp file missing: {temp_file}")
-
-    # Use cached GPU encoder (detected at startup)
-    gpu_encoder, gpu_args = get_gpu_encoder()
-    
-    merge_command = ['ffmpeg', '-y']
-    
-    # For NVENC, we don't use -hwaccel cuda as it can cause error 244
-    # NVENC encoding works fine without hardware-accelerated decoding
-    
-    merge_command.extend([
-        '-f', 'concat',
-        '-safe', '0',
-        '-i', file_list_path,
-        '-c:a', 'aac',
-        '-ac', '2',  # Force stereo output (fixes mono and 5.1 issues)
-        '-b:a', '192k',  # Higher audio bitrate for quality
-        '-fps_mode', 'vfr',  # Variable frame rate to avoid frozen frames at segment boundaries
-        '-pix_fmt', 'yuv420p',  # Ensure compatible pixel format
-        # Normalize video parameters to prevent reconfiguration errors
-        '-vf', 'format=yuv420p,scale=1920:1080:force_original_aspect_ratio=increase,crop=1920:1080',
-        # Avoid frame duplication at segment boundaries
-        '-avoid_negative_ts', 'make_zero',
-        # Ensure smooth transitions without frame duplication
-        '-movflags', '+faststart'
-    ])
-    
-    # Add video encoder (GPU or CPU) with high quality settings
-    if gpu_encoder:
-        merge_command.extend(['-c:v', gpu_encoder])
-        merge_command.extend(gpu_args)
-    else:
-        merge_command.extend(['-c:v', 'libx264', '-preset', 'medium', '-crf', '18'])
-    
-    merge_command.append(output_path)
-    merge_result = subprocess.run(merge_command, capture_output=True, text=True)
-    if merge_result.returncode != 0:
-        print(f"[Merge] FFmpeg merge error output: {merge_result.stderr}")
-        # Clean up error message to prevent JSON parsing issues
-        clean_error = merge_result.stderr.replace('\n', ' ').replace('\r', ' ').strip()
-        raise RuntimeError(f"Failed to merge videos: {clean_error}")
-    
-    # Verify the merged file exists and has video
-    if not os.path.exists(output_path):
-        raise FileNotFoundError(f"Merged video file was not created: {output_path}")
-    
-    # Verify merged file has video stream
-    probe_command = [
-        'ffprobe', '-v', 'error',
-        '-select_streams', 'v:0',
-        '-show_entries', 'stream=codec_type',
-        '-of', 'default=noprint_wrappers=1:nokey=1',
-        output_path
-    ]
-    probe_result = subprocess.run(probe_command, capture_output=True, text=True)
-    if probe_result.returncode != 0 or 'video' not in probe_result.stdout.lower():
-        raise RuntimeError(f"Merged video does not contain a valid video stream. FFmpeg output: {merge_result.stderr}")
-    
-    print(f"[Merge] ✓ Successfully merged {len(temp_files)} video segments to: {output_path}")
-    
-    yield {'stage': 'complete', 'message': 'Merge completed successfully!', 'progress': total_videos + 1, 'total': total_videos + 1}
-
-    # Clean up temporary files
-    for temp_file in temp_files:
-        try:
-            if os.path.exists(temp_file):
-                os.remove(temp_file)
-        except OSError:
-            pass
-    try:
-        if os.path.exists(file_list_path):
-            os.remove(file_list_path)
-    except OSError:
-        pass
 
 
 def find_and_export_longest_matches_incremental(
@@ -3692,286 +3381,221 @@ def find_longest_matches(
     return matches
 
 
+# ---------------------------------------------------------------------------------------------------------
+# Clip references, preview audio, waveform and clip restore
+# ---------------------------------------------------------------------------------------------------------
+
+class ClipReferenceError(ValueError):
+    """The client referenced media that does not exist (any more) or lies outside the allowed folders."""
+
+
+def _is_inside(path, root):
+    """True if ``path`` lies below ``root`` after normalising ``..`` (symlinks inside the root stay allowed)."""
+    root = os.path.abspath(root)
+    path = os.path.abspath(path)
+    return path == root or path.startswith(root + os.sep)
+
+
+def resolve_media_path(reference):
+    """Map a client media reference ('temp/...' or a path below static/) to an absolute path, or None."""
+    if not isinstance(reference, str) or not reference.strip():
+        return None
+    cleaned = reference.replace('\\', '/').lstrip('/')
+    if cleaned.startswith('temp/'):
+        root, relative = TEMP_DIR, cleaned[len('temp/'):]
+    else:
+        root, relative = os.path.join(app.root_path, 'static'), cleaned
+    candidate = os.path.normpath(os.path.join(root, relative))
+    return candidate if relative and _is_inside(candidate, root) else None
+
+
+def resolve_source_video(reference):
+    """Map a source video reference (as returned by /get_files) to an existing file inside a library root."""
+    if not isinstance(reference, str) or not reference.strip():
+        return None
+    candidates = [reference, os.path.join(app.root_path, reference)]
+    for lib_root in LIBRARY_ROOTS:
+        candidates.append(os.path.join(lib_root, reference.lstrip('/\\')))
+    for candidate in candidates:
+        candidate = os.path.normpath(candidate)
+        if not os.path.isfile(candidate):
+            continue
+        if any(_is_inside(candidate, lib_root) or _is_inside(candidate, os.path.join(app.root_path, lib_root))
+               for lib_root in LIBRARY_ROOTS):
+            return candidate
+    return None
+
+
+def _finite_number(value):
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number == number and number not in (float('inf'), float('-inf')) else None
+
+
+_PROBE_CACHE = {}
+_PROBE_CACHE_LOCK = Lock()
+
+
+def cached_probe(path):
+    """probe_media() memoised on (path, mtime, size)."""
+    stat = os.stat(path)
+    key = (path, stat.st_mtime_ns, stat.st_size)
+    with _PROBE_CACHE_LOCK:
+        cached = _PROBE_CACHE.get(key)
+    if cached is None:
+        cached = render_pipeline.probe_media(path)
+        with _PROBE_CACHE_LOCK:
+            if len(_PROBE_CACHE) > 2048:
+                _PROBE_CACHE.clear()
+            _PROBE_CACHE[key] = cached
+    return cached
+
+
+def resolve_cut_media(clip=None, source=None, original_start=None, original_end=None):
+    """Resolve a client clip reference to ``(media_path, base_seconds, clip_seconds)``.
+
+    The library source plus the recorded bounds is the canonical definition of a clip: preview audio, waveform
+    and merge all cut from it, so they agree to the sample. The exported clip file in temp/ is only the fallback
+    (entries without bounds, or a source that has been moved).
+    """
+    source_path = resolve_source_video(source)
+    start = _finite_number(original_start)
+    end = _finite_number(original_end)
+    if source_path and start is not None and end is not None and start >= 0 and end > start:
+        return source_path, start, end - start
+    clip_path = resolve_media_path(clip)
+    if clip_path and os.path.isfile(clip_path):
+        info = cached_probe(clip_path)
+        seconds = info.audio_duration or info.duration
+        if seconds and seconds > 0:
+            return clip_path, 0.0, seconds
+    raise ClipReferenceError('Clip media not found. The source video may have moved and the cached clip is gone.')
+
+
+_PCM_CACHE = OrderedDict()
+_PCM_CACHE_LOCK = Lock()
+PCM_CACHE_MAX_BYTES = 192 * 1024 * 1024
+
+
+def cached_pcm(media, start, duration, speed=1.0):
+    """extract_pcm() with a small LRU so the waveform and the preview of one clip decode only once."""
+    stat = os.stat(media)
+    key = (media, stat.st_mtime_ns, stat.st_size, round(start * 1e6), round(duration * 1e6), round(speed * 1e4))
+    with _PCM_CACHE_LOCK:
+        pcm = _PCM_CACHE.get(key)
+        if pcm is not None:
+            _PCM_CACHE.move_to_end(key)
+            return pcm
+    pcm = render_pipeline.extract_pcm(media, start, duration, speed)
+    with _PCM_CACHE_LOCK:
+        _PCM_CACHE[key] = pcm
+        total = sum(len(value) for value in _PCM_CACHE.values())
+        while total > PCM_CACHE_MAX_BYTES and len(_PCM_CACHE) > 1:
+            _, evicted = _PCM_CACHE.popitem(last=False)
+            total -= len(evicted)
+    return pcm
+
+
+def _clip_reference_from(mapping):
+    """Read a clip reference from request args / JSON (accepts the legacy 'file_path' and 'video' keys)."""
+    return {
+        'clip': mapping.get('clip') or mapping.get('file_path') or mapping.get('video'),
+        'source': mapping.get('source') or mapping.get('sourceVideo') or mapping.get('source_video'),
+        'original_start': mapping.get('originalStart', mapping.get('original_start')),
+        'original_end': mapping.get('originalEnd', mapping.get('original_end')),
+    }
+
+
+@app.route('/clip_audio', methods=['GET'])
+def clip_audio():
+    """48 kHz stereo WAV of a clip for the sample-accurate (Web Audio) preview.
+
+    Without trims the whole clip is returned and the browser cuts it on the audio clock. With ``speed`` != 1 the
+    browser asks for the trimmed range so the server applies the same trim -> atempo chain the merge uses.
+    """
+    try:
+        media, base, seconds = resolve_cut_media(**_clip_reference_from(request.args))
+    except ClipReferenceError as exc:
+        return jsonify({'error': str(exc)}), 404
+    start_ms = max(0.0, sanitize_float(request.args.get('start_ms'), 0.0))
+    end_trim_ms = max(0.0, sanitize_float(request.args.get('end_trim_ms'), 0.0))
+    speed = render_pipeline.clamp_speed(request.args.get('speed'))
+    duration = seconds - (start_ms + end_trim_ms) / 1000.0
+    if duration < render_pipeline.MIN_SEGMENT_SECONDS:
+        return jsonify({'error': 'Trim values leave nothing to play'}), 400
+    try:
+        pcm = cached_pcm(media, base + start_ms / 1000.0, duration, speed)
+    except render_pipeline.RenderError as exc:
+        return jsonify({'error': str(exc)}), 500
+    response = Response(render_pipeline.pcm_to_wav(pcm), mimetype='audio/wav')
+    response.headers['Cache-Control'] = 'private, max-age=600'
+    return response
+
+
 @app.route('/get_waveform', methods=['POST'])
 def get_waveform():
-    """Extract audio waveform data from a video file."""
+    """Waveform envelope of exactly the audio the preview plays, plus its duration (the trim reference)."""
+    data = request.get_json(silent=True) or {}
     try:
-        data = request.json
-        file_path = data.get('file_path', '')
-        width = data.get('width', 800)  # Target width in pixels
-        
-        if not file_path:
-            return jsonify({'error': 'No file path provided'}), 400
-        
-        # Construct absolute path - check temp directory first, then static
-        if file_path.startswith('temp/'):
-            full_path = os.path.join(app.root_path, file_path)
-        else:
-            full_path = os.path.join(app.root_path, 'static', file_path)
-        
-        if not os.path.exists(full_path):
-            return jsonify({'error': f'File not found: {file_path}'}), 404
-        
-        # Extract waveform data
-        waveform_data = extract_audio_waveform(full_path, width)
-        
-        if waveform_data is None:
-            return jsonify({'error': 'Failed to extract waveform'}), 500
-        
-        return jsonify({
-            'waveform': waveform_data,
-            'width': len(waveform_data)
-        })
-    
-    except Exception as e:
-        print(f"Error in get_waveform: {e}")
-        traceback.print_exc()
-        return jsonify({'error': str(e)}), 500
+        media, base, seconds = resolve_cut_media(**_clip_reference_from(data))
+    except ClipReferenceError as exc:
+        return jsonify({'error': str(exc)}), 404
+    width = max(16, min(4000, sanitize_int(data.get('width'), 800)))
+    try:
+        pcm = cached_pcm(media, base, seconds, 1.0)
+    except render_pipeline.RenderError as exc:
+        return jsonify({'error': str(exc)}), 500
+    waveform = render_pipeline.waveform_peaks(pcm, width)
+    return jsonify({'waveform': waveform, 'width': len(waveform), 'duration_ms': round(seconds * 1000.0, 3)})
 
-@app.route('/rerender_clip', methods=['POST'])
-def rerender_clip():
-    """Re-render a clip with new trim values for precise playback."""
+
+def export_padded_clip(source_path, start, end, output_path):
+    """Cut ``[start, end)`` of a library video into a preview clip (same settings as the search export)."""
+    fps = get_video_fps(source_path) or 25
+    command = [
+        'ffmpeg', '-v', 'error', '-nostdin', '-y',
+        '-ss', f'{start:.6f}', '-i', source_path, '-t', f'{end - start:.6f}',
+        '-c:v', 'libx264', '-preset', 'ultrafast',
+        '-c:a', 'aac', '-ac', '2', '-r', str(fps),
+        output_path,
+    ]
+    process = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=300)
+    if process.returncode != 0 or not os.path.isfile(output_path):
+        detail = process.stderr.decode(errors='ignore').strip().splitlines()[-1:] if process.stderr else []
+        raise RuntimeError(f"ffmpeg could not cut the clip: {' '.join(detail) or 'unknown error'}")
+
+
+@app.route('/ensure_clip', methods=['POST'])
+def ensure_clip():
+    """Re-create a preview clip that vanished from temp/ (cache cleanup) from its source video and bounds."""
+    data = request.get_json(silent=True) or {}
+    reference = _clip_reference_from(data)
+    clip_path = resolve_media_path(reference['clip'])
+    if not clip_path or not _is_inside(clip_path, TEMP_DIR) or not clip_path.lower().endswith('.mp4'):
+        return jsonify({'error': 'Invalid clip path'}), 400
+    if os.path.isfile(clip_path):
+        return jsonify({'status': 'exists', 'clip': reference['clip']})
+    source_path = resolve_source_video(reference['source'])
+    start = _finite_number(reference['original_start'])
+    end = _finite_number(reference['original_end'])
+    if not source_path or start is None or end is None or start < 0 or end <= start:
+        return jsonify({'error': 'The clip is gone and its source video or bounds are unknown'}), 404
     try:
-        data = request.json
-        clip_path = data.get('clip_path', '')
-        source_video = data.get('source_video', '')
-        original_start = data.get('original_start', 0)  # Original segment start in seconds
-        original_end = data.get('original_end', 0)  # Original segment end in seconds
-        new_start_trim_ms = data.get('start_trim_ms', 0)  # New start trim in milliseconds
-        new_end_trim_ms = data.get('end_trim_ms', 0)  # New end trim in milliseconds
-        
-        if not clip_path or not source_video:
-            return jsonify({'error': 'Missing clip_path or source_video'}), 400
-        
-        # Find the source video file (support absolute, relative, and already-prefixed Library paths)
-        candidates = []
-        
-        # Exact path as provided
-        candidates.append(source_video)
-        
-        # If path is absolute, also try it normalized
-        if os.path.isabs(source_video):
-            candidates.append(os.path.normpath(source_video))
-        else:
-            # Relative to app root
-            candidates.append(os.path.join(app.root_path, source_video))
-        
-        # Try under each library root
-        for lib_root in LIBRARY_ROOTS:
-            candidates.append(os.path.join(lib_root, source_video.lstrip('/')))
-            # If the source already includes "Library/...", also try without that prefix once
-            if source_video.startswith(os.path.basename(lib_root)):
-                stripped = source_video[len(os.path.basename(lib_root)):].lstrip('/\\')
-                candidates.append(os.path.join(lib_root, stripped))
-        
-        # Deduplicate while preserving order
-        seen = set()
-        ordered_candidates = []
-        for path in candidates:
-            norm = os.path.normpath(path)
-            if norm not in seen:
-                seen.add(norm)
-                ordered_candidates.append(norm)
-        
-        source_path = next((p for p in ordered_candidates if os.path.exists(p)), None)
-        
-        if not source_path:
-            return jsonify({'error': f'Source video not found: {source_video}'}), 404
-        
-        # Calculate new clip boundaries
-        # original_start/end are in seconds, new trims are in milliseconds
-        new_clip_start = original_start + (new_start_trim_ms / 1000)
-        new_clip_end = original_end - (new_end_trim_ms / 1000)
-        clip_duration = new_clip_end - new_clip_start
-        
-        if clip_duration <= 0:
-            return jsonify({'error': 'Invalid trim values result in zero or negative duration'}), 400
-        
-        # Get video duration to validate
-        video_duration = get_video_duration(source_path)
-        if video_duration is None:
-            return jsonify({'error': 'Could not determine video duration'}), 500
-        
-        # Validate clip boundaries
-        new_clip_start = max(0.0, min(new_clip_start, video_duration))
-        new_clip_end = max(new_clip_start + 0.1, min(new_clip_end, video_duration))
-        clip_duration = new_clip_end - new_clip_start
-        
-        # Generate unique output filename
-        # clip_path is relative (e.g., "temp/clip_group_00001.mp4")
-        # Construct full path to original clip
-        if clip_path.startswith('temp/'):
-            clip_full_path = os.path.join(app.root_path, clip_path)
-        else:
-            clip_full_path = os.path.join(app.root_path, 'temp', clip_path)
-        
-        # Ensure the directory exists
-        clip_dir = os.path.dirname(clip_full_path)
-        os.makedirs(clip_dir, exist_ok=True)
-        
-        clip_basename = os.path.basename(clip_path)
-        name_without_ext = os.path.splitext(clip_basename)[0]
-        
-        # Strip any existing _trimmed_* suffixes to prevent accumulation
-        # Match pattern: _trimmed_<number>_<number> (can repeat)
-        import re
-        name_without_ext = re.sub(r'_trimmed_\d+_\d+(?:_trimmed_\d+_\d+)*$', '', name_without_ext)
-        
-        output_filename = f"{name_without_ext}_trimmed_{int(new_start_trim_ms)}_{int(new_end_trim_ms)}.mp4"
-        output_path = os.path.join(clip_dir, output_filename)
-        
-        # Get video fps
-        video_fps = get_video_fps(source_path)
-        if video_fps is None:
-            video_fps = 25
-        
-        # Use ffmpeg to re-render with new trim values
-        ffmpeg_cmd = [
-            'ffmpeg', '-y',
-            '-ss', str(new_clip_start),
-            '-i', source_path,
-            '-t', str(clip_duration),
-            '-c:v', 'libx264',
-            '-preset', 'ultrafast',  # Fast rendering for responsiveness
-            '-c:a', 'aac',
-            '-ac', '2',
-            '-r', str(video_fps),
-            output_path
-        ]
-        
-        process = subprocess.run(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
-        if process.returncode != 0:
-            stderr = process.stderr.decode(errors='ignore') if process.stderr else ''
-            return jsonify({'error': f'FFmpeg failed: {stderr}'}), 500
-        
-        if not os.path.exists(output_path):
-            return jsonify({'error': 'Rendered clip file was not created'}), 500
-        
-        # Return relative path (clips are always in temp/)
-        # Get the relative path from app.root_path
+        os.makedirs(os.path.dirname(clip_path), exist_ok=True)
+        partial_path = f'{clip_path}.{uuid.uuid4().hex}.partial.mp4'
         try:
-            relative_path = os.path.relpath(output_path, app.root_path).replace(os.sep, '/')
-            # Ensure it uses forward slashes and starts correctly
-            if not relative_path.startswith('temp/'):
-                # Extract temp/ part if it exists in the path
-                parts = relative_path.split('/')
-                if 'temp' in parts:
-                    temp_idx = parts.index('temp')
-                    relative_path = '/'.join(parts[temp_idx:])
-                else:
-                    # Fallback: construct manually
-                    relative_path = 'temp/' + os.path.basename(output_path)
-        except (ValueError, AttributeError):
-            # Fallback: construct path manually based on clip_path structure
-            if clip_path.startswith('temp/'):
-                # Extract the directory structure from original clip_path
-                clip_dir_part = os.path.dirname(clip_path).replace('\\', '/')
-                relative_path = f"{clip_dir_part}/{output_filename}".replace('\\', '/')
-            else:
-                relative_path = f"temp/{output_filename}"
-        
-        clip_duration_ms = get_video_duration_ms(output_path)
-        
-        return jsonify({
-            'clip_path': relative_path,
-            'duration_ms': clip_duration_ms
-        })
-    except Exception as e:
-        print(f"Error re-rendering clip: {e}")
-        traceback.print_exc()
-        return jsonify({'error': str(e)}), 500
+            export_padded_clip(source_path, start, end, partial_path)
+            os.replace(partial_path, clip_path)
+        finally:
+            if os.path.exists(partial_path):
+                os.remove(partial_path)
+    except (RuntimeError, OSError, subprocess.SubprocessError) as exc:
+        print(f"[ensure_clip] {exc}")
+        return jsonify({'error': str(exc)}), 500
+    return jsonify({'status': 'restored', 'clip': reference['clip']})
 
-
-def extract_audio_waveform(video_path, target_width=800):
-    """
-    Extract audio waveform data from a video file using ffmpeg.
-    Returns a list of normalized amplitude values (0.0 to 1.0).
-    Uses RMS (Root Mean Square) for more accurate representation.
-    """
-    try:
-        # Get video duration first
-        duration_cmd = [
-            'ffprobe', '-v', 'error',
-            '-show_entries', 'format=duration',
-            '-of', 'default=noprint_wrappers=1:nokey=1',
-            video_path
-        ]
-        duration_result = subprocess.run(duration_cmd, capture_output=True, text=True, timeout=10)
-        
-        if duration_result.returncode != 0:
-            print(f"Failed to get duration: {duration_result.stderr}")
-            return None
-        
-        duration = float(duration_result.stdout.strip())
-        
-        # Use higher sample rate for better accuracy
-        # At least 100 samples per pixel for accurate peak detection
-        sample_rate = max(8000, int(target_width / duration * 100))
-        
-        # Extract audio as 16-bit PCM mono
-        ffmpeg_cmd = [
-            'ffmpeg', '-i', video_path,
-            '-ac', '1',  # Mono
-            '-ar', str(sample_rate),  # Sample rate
-            '-f', 's16le',  # 16-bit PCM
-            '-'
-        ]
-        
-        result = subprocess.run(ffmpeg_cmd, capture_output=True, timeout=30)
-        
-        if result.returncode != 0:
-            print(f"FFmpeg error: {result.stderr.decode()}")
-            return None
-        
-        # Parse PCM data
-        import struct
-        audio_data = result.stdout
-        
-        # Convert bytes to 16-bit signed integers
-        num_samples = len(audio_data) // 2
-        samples = struct.unpack(f'{num_samples}h', audio_data)
-        
-        # Calculate RMS values for each pixel first (two-pass for auto-normalization)
-        samples_per_pixel = max(1, num_samples // target_width)
-        raw_rms_values = []
-        
-        for i in range(target_width):
-            start_idx = i * samples_per_pixel
-            end_idx = min(start_idx + samples_per_pixel, num_samples)
-            
-            if start_idx < num_samples:
-                chunk = samples[start_idx:end_idx]
-                if chunk:
-                    # Use RMS (Root Mean Square) for better audio representation
-                    rms = (sum(s * s for s in chunk) / len(chunk)) ** 0.5
-                    raw_rms_values.append(rms)
-                else:
-                    raw_rms_values.append(0.0)
-            else:
-                raw_rms_values.append(0.0)
-        
-        # Find peak RMS value for auto-normalization (fills waveform to full height)
-        peak_rms = max(raw_rms_values) if raw_rms_values else 1.0
-        
-        # Avoid division by zero and prevent over-amplification of near-silence
-        # Use at least 5% of theoretical max as floor
-        normalization_factor = max(peak_rms, 32768.0 * 0.05)
-        
-        # Normalize waveform to fill height based on actual peak amplitude
-        waveform = []
-        for rms in raw_rms_values:
-            # Normalize to 0.0-1.0 based on the clip's actual peak
-            normalized = rms / normalization_factor
-            # Clamp to 1.0 max
-            normalized = min(1.0, normalized)
-            waveform.append(normalized)
-        
-        return waveform
-    
-    except Exception as e:
-        print(f"Error extracting waveform: {e}")
-        traceback.print_exc()
-        return None
 
 
 if __name__ == '__main__':
@@ -3996,7 +3620,40 @@ if __name__ == '__main__':
         default='127.0.0.1:5000',
         help='Server listener address in format HOST:PORT (default: 127.0.0.1:5000, example: 0.0.0.0:8080)'
     )
+    parser.add_argument(
+        '--merge-resolution',
+        type=str,
+        default='1920x1080',
+        help="Merged video size as WIDTHxHEIGHT, or 'auto' for the most common source resolution (default: 1920x1080)"
+    )
+    parser.add_argument(
+        '--merge-fps',
+        type=str,
+        default='auto',
+        help="Merged video frame rate, e.g. 30 or 30000/1001, or 'auto' for the most common source rate (default: auto)"
+    )
     args = parser.parse_args()
+
+    # Merge output format
+    try:
+        if args.merge_resolution.strip().lower() == 'auto':
+            MERGE_RESOLUTION = None
+        else:
+            merge_width, merge_height = (int(part) for part in args.merge_resolution.lower().split('x'))
+            if merge_width < 16 or merge_height < 16 or merge_width % 2 or merge_height % 2:
+                raise ValueError('width and height must be even numbers >= 16')
+            MERGE_RESOLUTION = (merge_width, merge_height)
+        if args.merge_fps.strip().lower() == 'auto':
+            MERGE_FPS = None
+        else:
+            MERGE_FPS = Fraction(args.merge_fps.strip())
+            if not 1 <= MERGE_FPS <= 240:
+                raise ValueError('frame rate must be between 1 and 240')
+    except (ValueError, ZeroDivisionError) as exc:
+        print(f"[Startup] Error: invalid --merge-resolution/--merge-fps ({exc})")
+        sys.exit(1)
+    print(f"[Startup] Merge output: {'auto' if MERGE_RESOLUTION is None else 'x'.join(map(str, MERGE_RESOLUTION))} "
+          f"@ {'auto' if MERGE_FPS is None else MERGE_FPS} fps")
     
     # Set global GPU streams limit
     MAX_GPU_STREAMS = max(1, args.gpustreams)  # Ensure at least 1
